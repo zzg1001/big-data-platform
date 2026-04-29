@@ -1,53 +1,175 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import {
   Card,
   Table,
   Button,
   Modal,
-  Form,
-  Input,
-  Select,
   Space,
   Tag,
   message,
-  Popconfirm,
   Typography,
   Tooltip,
+  Tabs,
+  Input,
+  Descriptions,
+  Alert,
 } from 'antd'
 import {
-  PlusOutlined,
-  EditOutlined,
   DeleteOutlined,
   PlayCircleOutlined,
   PauseOutlined,
-  CloudUploadOutlined,
-  CodeOutlined,
+  ReloadOutlined,
+  ScheduleOutlined,
+  CheckCircleOutlined,
+  ExclamationCircleOutlined,
+  PlusOutlined,
+  EyeOutlined,
+  EditOutlined,
+  SyncOutlined,
+  RightOutlined,
+  LeftOutlined,
+  HolderOutlined,
 } from '@ant-design/icons'
-import Editor from '@monaco-editor/react'
-import { scheduleApi, datasourceApi } from '../services/api'
+import { syncScheduleApi } from '../services/api'
+import CronExpressionInput from '../components/CronExpressionInput'
 
 const { Title, Text } = Typography
-const { TextArea } = Input
+
+// 调度列表项（从 sync-schedules API）
+interface SyncScheduleItem {
+  id: number
+  name: string
+  description?: string
+  sync_task_id: number
+  cron_expression: string
+  is_enabled: boolean
+  dag_id?: string
+  airflow_status?: string
+  next_run_time?: string
+  last_run_time?: string
+  last_run_status?: string
+  // From sync_task
+  sync_task_name: string
+  source_table: string
+  target_table: string
+  sync_mode: string
+  last_sync_at?: string
+  last_sync_rows?: number
+  // Creator
+  creator_name?: string
+  created_at: string
+}
+
+// 可调度的同步任务（未创建调度的）
+interface AvailableSyncTask {
+  id: number
+  name: string
+  source_table: string
+  target_table: string
+  sync_mode: string
+}
 
 export default function Scheduler() {
-  const [schedules, setSchedules] = useState<any[]>([])
-  const [datasources, setDatasources] = useState<any[]>([])
+  const [schedules, setSchedules] = useState<SyncScheduleItem[]>([])
   const [loading, setLoading] = useState(false)
-  const [modalVisible, setModalVisible] = useState(false)
-  const [codeVisible, setCodeVisible] = useState(false)
-  const [editingId, setEditingId] = useState<number | null>(null)
-  const [dagCode, setDagCode] = useState('')
-  const [form] = Form.useForm()
+  const [statusFilter, setStatusFilter] = useState<string | undefined>(undefined)
+
+  // Add schedule modal
+  const [addModalVisible, setAddModalVisible] = useState(false)
+  const [availableTasks, setAvailableTasks] = useState<AvailableSyncTask[]>([])
+  const [leftSelected, setLeftSelected] = useState<number[]>([])
+  const [rightSelected, setRightSelected] = useState<number[]>([])
+  const [selectedTasks, setSelectedTasks] = useState<AvailableSyncTask[]>([])
+  const [addCronExpression, setAddCronExpression] = useState('0 2 * * *')
+  const [adding, setAdding] = useState(false)
+  const [cronPopoverOpen, setCronPopoverOpen] = useState(false)
+
+  // Enable modal (single schedule)
+  const [enableModalVisible, setEnableModalVisible] = useState(false)
+  const [selectedSchedule, setSelectedSchedule] = useState<SyncScheduleItem | null>(null)
+  const [enabling, setEnabling] = useState(false)
+
+  // Disable/Delete loading states
+  const [disabling, setDisabling] = useState<number | null>(null)
+  const [deleting, setDeleting] = useState<number | null>(null)
+
+  // View modal
+  const [viewModalVisible, setViewModalVisible] = useState(false)
+  const [viewSchedule, setViewSchedule] = useState<SyncScheduleItem | null>(null)
+
+  // Edit modal
+  const [editModalVisible, setEditModalVisible] = useState(false)
+  const [editSchedule, setEditSchedule] = useState<SyncScheduleItem | null>(null)
+  const [editName, setEditName] = useState('')
+  const [editDescription, setEditDescription] = useState('')
+  const [editCron, setEditCron] = useState('')
+  const [editing, setEditing] = useState(false)
+
+  // Batch selection
+  const [selectedIds, setSelectedIds] = useState<number[]>([])
+  const [batchDeleting, setBatchDeleting] = useState(false)
+
+  // Draggable popover
+  const [popoverPosition, setPopoverPosition] = useState({ x: 0, y: 0 })
+  const [isDragging, setIsDragging] = useState(false)
+  const dragOffset = useRef({ x: 0, y: 0 })
+  const popoverRef = useRef<HTMLDivElement>(null)
+
+  const handleDragStart = (e: React.MouseEvent) => {
+    e.preventDefault()
+    if (popoverRef.current) {
+      const rect = popoverRef.current.getBoundingClientRect()
+      dragOffset.current = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      }
+      // 如果是初始位置（居中），先设置为实际像素位置
+      if (popoverPosition.x === 0 && popoverPosition.y === 0) {
+        setPopoverPosition({
+          x: rect.left,
+          y: rect.top,
+        })
+      }
+      setIsDragging(true)
+    }
+  }
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (isDragging) {
+        setPopoverPosition({
+          x: e.clientX - dragOffset.current.x,
+          y: e.clientY - dragOffset.current.y,
+        })
+      }
+    }
+    const handleMouseUp = () => {
+      setIsDragging(false)
+    }
+    if (isDragging) {
+      document.addEventListener('mousemove', handleMouseMove)
+      document.addEventListener('mouseup', handleMouseUp)
+    }
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isDragging])
+
+  // Reset popover position when opening
+  const handleOpenCronPopover = () => {
+    setPopoverPosition({ x: 0, y: 0 })
+    setCronPopoverOpen(true)
+  }
 
   useEffect(() => {
     loadSchedules()
-    loadDatasources()
-  }, [])
+  }, [statusFilter])
 
   const loadSchedules = async () => {
     setLoading(true)
     try {
-      const res = await scheduleApi.list()
+      const res = await syncScheduleApi.list(statusFilter)
       setSchedules(res.data)
     } catch (error) {
       message.error('加载调度列表失败')
@@ -56,271 +178,920 @@ export default function Scheduler() {
     }
   }
 
-  const loadDatasources = async () => {
+  // Open add modal and load available tasks
+  const handleOpenAddModal = async () => {
     try {
-      const res = await datasourceApi.listAll()
-      setDatasources(res.data)
+      const res = await syncScheduleApi.getAvailableTasks()
+      setAvailableTasks(res.data)
+      setLeftSelected([])
+      setRightSelected([])
+      setSelectedTasks([])
+      setAddCronExpression('0 2 * * *')
+      setAddModalVisible(true)
     } catch (error) {
-      console.error('Failed to load datasources')
+      message.error('加载可用任务失败')
     }
   }
 
-  const handleCreate = () => {
-    setEditingId(null)
-    form.resetFields()
-    form.setFieldsValue({
-      cron_expression: '0 0 * * *',
-      alert_on_failure: true,
-    })
-    setModalVisible(true)
+  // Move tasks to right (selected)
+  const handleMoveRight = () => {
+    const tasksToMove = availableTasks.filter(t => leftSelected.includes(t.id))
+    setSelectedTasks([...selectedTasks, ...tasksToMove])
+    setAvailableTasks(availableTasks.filter(t => !leftSelected.includes(t.id)))
+    setLeftSelected([])
   }
 
-  const handleEdit = (record: any) => {
-    setEditingId(record.id)
-    form.setFieldsValue(record)
-    setModalVisible(true)
+  // Move tasks back to left
+  const handleMoveLeft = () => {
+    const tasksToMove = selectedTasks.filter(t => rightSelected.includes(t.id))
+    setAvailableTasks([...availableTasks, ...tasksToMove])
+    setSelectedTasks(selectedTasks.filter(t => !rightSelected.includes(t.id)))
+    setRightSelected([])
   }
 
-  const handleDelete = async (id: number) => {
+  // Toggle left selection
+  const handleLeftClick = (taskId: number) => {
+    if (leftSelected.includes(taskId)) {
+      setLeftSelected(leftSelected.filter(id => id !== taskId))
+    } else {
+      setLeftSelected([...leftSelected, taskId])
+    }
+  }
+
+  // Toggle right selection
+  const handleRightClick = (taskId: number) => {
+    if (rightSelected.includes(taskId)) {
+      setRightSelected(rightSelected.filter(id => id !== taskId))
+    } else {
+      setRightSelected([...rightSelected, taskId])
+    }
+  }
+
+  // Batch create schedules
+  const handleCreateSchedules = async (enableAfterCreate: boolean = false) => {
+    if (selectedTasks.length === 0) {
+      message.warning('请选择要调度的任务')
+      return
+    }
+    setAdding(true)
+    let success = 0
+    let fail = 0
+    const createdIds: number[] = []
+
+    for (const task of selectedTasks) {
+      try {
+        const res = await syncScheduleApi.create({
+          name: `${task.name}_调度`,
+          sync_task_id: task.id,
+          cron_expression: addCronExpression,
+        })
+        createdIds.push(res.data.id)
+        success++
+      } catch (error) {
+        fail++
+      }
+    }
+
+    // 如果需要上线
+    if (enableAfterCreate && createdIds.length > 0) {
+      let enableSuccess = 0
+      for (const id of createdIds) {
+        try {
+          await syncScheduleApi.enable(id)
+          enableSuccess++
+        } catch (error) {
+          // 上线失败不影响创建结果
+        }
+      }
+      if (enableSuccess > 0) {
+        message.success(`已创建并上线 ${enableSuccess} 个调度`)
+      }
+    } else if (fail === 0) {
+      message.success(`已创建 ${success} 个调度`)
+    } else {
+      message.warning(`成功 ${success} 个，失败 ${fail} 个`)
+    }
+
+    setAdding(false)
+    setAddModalVisible(false)
+    loadSchedules()
+  }
+
+  const handleOpenEnableModal = (schedule: SyncScheduleItem) => {
+    setSelectedSchedule(schedule)
+    setEnableModalVisible(true)
+  }
+
+  const handleEnable = async () => {
+    if (!selectedSchedule) return
+    setEnabling(true)
     try {
-      await scheduleApi.delete(id)
+      await syncScheduleApi.enable(selectedSchedule.id)
+      message.success('上线成功')
+      setEnableModalVisible(false)
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '上线失败')
+    } finally {
+      setEnabling(false)
+    }
+  }
+
+  const handleDisable = async (schedule: SyncScheduleItem) => {
+    setDisabling(schedule.id)
+    try {
+      await syncScheduleApi.disable(schedule.id)
+      message.success('下线成功')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '下线失败')
+    } finally {
+      setDisabling(null)
+    }
+  }
+
+  const handleDelete = async (schedule: SyncScheduleItem) => {
+    // 上线状态不可删除
+    if (schedule.is_enabled) {
+      message.warning('请先下线后再删除')
+      return
+    }
+    setDeleting(schedule.id)
+    try {
+      await syncScheduleApi.delete(schedule.id)
       message.success('删除成功')
       loadSchedules()
-    } catch (error) {
-      message.error('删除失败')
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '删除失败')
+    } finally {
+      setDeleting(null)
     }
   }
 
-  const handleSubmit = async () => {
-    try {
-      const values = await form.validateFields()
+  // View schedule detail
+  const handleView = (schedule: SyncScheduleItem) => {
+    setViewSchedule(schedule)
+    setViewModalVisible(true)
+  }
 
-      if (editingId) {
-        await scheduleApi.update(editingId, values)
-        message.success('更新成功')
-      } else {
-        await scheduleApi.create(values)
-        message.success('创建成功')
+  // Open edit modal
+  const handleOpenEditModal = (schedule: SyncScheduleItem) => {
+    setEditSchedule(schedule)
+    setEditName(schedule.name)
+    setEditDescription(schedule.description || '')
+    setEditCron(schedule.cron_expression)
+    setEditModalVisible(true)
+  }
+
+  // Save edit
+  const handleSaveEdit = async () => {
+    if (!editSchedule) return
+    if (!editName.trim()) {
+      message.warning('请输入调度名称')
+      return
+    }
+    setEditing(true)
+    try {
+      await syncScheduleApi.update(editSchedule.id, {
+        name: editName.trim(),
+        description: editDescription.trim() || undefined,
+        cron_expression: editCron,
+      })
+      message.success('修改成功')
+      setEditModalVisible(false)
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '修改失败')
+    } finally {
+      setEditing(false)
+    }
+  }
+
+  // Batch delete
+  const handleBatchDelete = async () => {
+    if (selectedIds.length === 0) return
+
+    setBatchDeleting(true)
+    let success = 0
+    let fail = 0
+
+    for (const id of selectedIds) {
+      try {
+        await syncScheduleApi.delete(id)
+        success++
+      } catch (error) {
+        fail++
       }
-
-      setModalVisible(false)
-      loadSchedules()
-    } catch (error: any) {
-      if (error.errorFields) return
-      message.error('操作失败')
     }
-  }
 
-  const handleGenerateDag = async (id: number) => {
-    try {
-      const res = await scheduleApi.generateDag(id)
-      setDagCode(res.data.dag_code)
-      setCodeVisible(true)
-      message.success('DAG代码生成成功')
-      loadSchedules()
-    } catch (error: any) {
-      message.error(error.response?.data?.detail || '生成失败')
-    }
-  }
+    setBatchDeleting(false)
+    setSelectedIds([])
 
-  const handleDeploy = async (id: number) => {
-    try {
-      await scheduleApi.deploy(id)
-      message.success('部署成功')
-      loadSchedules()
-    } catch (error: any) {
-      message.error(error.response?.data?.detail || '部署失败')
+    if (fail === 0) {
+      message.success(`已删除 ${success} 个调度`)
+    } else {
+      message.warning(`成功 ${success} 个，失败 ${fail} 个`)
     }
-  }
-
-  const handlePause = async (id: number) => {
-    try {
-      await scheduleApi.pause(id)
-      message.success('已暂停')
-      loadSchedules()
-    } catch (error) {
-      message.error('操作失败')
-    }
-  }
-
-  const handleResume = async (id: number) => {
-    try {
-      await scheduleApi.resume(id)
-      message.success('已恢复')
-      loadSchedules()
-    } catch (error) {
-      message.error('操作失败')
-    }
+    loadSchedules()
   }
 
   const columns = [
-    { title: '名称', dataIndex: 'name', key: 'name' },
-    { title: 'DAG ID', dataIndex: 'dag_id', key: 'dag_id' },
+    {
+      title: '调度名称',
+      dataIndex: 'name',
+      key: 'name',
+      ellipsis: { showTitle: false },
+      render: (name: string, record: SyncScheduleItem) => (
+        <Tooltip title={record.description ? `${name} - ${record.description}` : name}>
+          <Text strong style={{ fontSize: 13 }}>{name}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '同步任务',
+      dataIndex: 'sync_task_name',
+      key: 'sync_task_name',
+      ellipsis: { showTitle: false },
+      render: (name: string) => (
+        <Tooltip title={name}>
+          <span style={{ fontSize: 12 }}>{name}</span>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '创建人',
+      dataIndex: 'creator_name',
+      key: 'creator_name',
+      ellipsis: { showTitle: false },
+      render: (name: string) => (
+        <Tooltip title={name || '-'}>
+          <span>{name || '-'}</span>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '源表',
+      dataIndex: 'source_table',
+      key: 'source_table',
+      ellipsis: { showTitle: false },
+      render: (table: string) => (
+        <Tooltip title={table}>
+          <Tag style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block' }}>{table}</Tag>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '目标表',
+      dataIndex: 'target_table',
+      key: 'target_table',
+      ellipsis: { showTitle: false },
+      render: (table: string) => (
+        <Tooltip title={table}>
+          <Tag color="gold" style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block' }}>{table}</Tag>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '状态',
+      key: 'schedule_status',
+      width: 90,
+      render: (_: any, record: SyncScheduleItem) => (
+        record.is_enabled ? (
+          <Tag icon={<CheckCircleOutlined />} color="green">已上线</Tag>
+        ) : (
+          <Tag>未上线</Tag>
+        )
+      ),
+    },
     {
       title: 'Cron',
       dataIndex: 'cron_expression',
       key: 'cron',
-      render: (cron: string) => <Text code>{cron}</Text>,
+      ellipsis: { showTitle: false },
+      render: (cron: string) => cron ? (
+        <Tooltip title={cron}>
+          <Text code style={{ fontSize: 11 }}>{cron}</Text>
+        </Tooltip>
+      ) : '-',
     },
     {
-      title: '状态',
-      dataIndex: 'status',
-      key: 'status',
+      title: 'Airflow',
+      dataIndex: 'airflow_status',
+      key: 'airflow_status',
+      width: 90,
       render: (status: string) => {
-        const colors: any = {
-          draft: 'default',
-          active: 'green',
-          paused: 'orange',
-          failed: 'red',
+        if (!status) return '-'
+        const config: Record<string, { color: string; icon: any }> = {
+          active: { color: 'green', icon: <PlayCircleOutlined /> },
+          paused: { color: 'orange', icon: <PauseOutlined /> },
+          error: { color: 'red', icon: <ExclamationCircleOutlined /> },
         }
-        const labels: any = {
-          draft: '草稿',
-          active: '运行中',
-          paused: '已暂停',
-          failed: '失败',
-        }
-        return <Tag color={colors[status]}>{labels[status] || status}</Tag>
+        const c = config[status] || { color: 'default', icon: null }
+        return <Tag icon={c.icon} color={c.color}>{status}</Tag>
       },
     },
     {
-      title: '已部署',
-      dataIndex: 'is_deployed',
-      key: 'deployed',
-      render: (deployed: boolean) => (
-        <Tag color={deployed ? 'blue' : 'default'}>
-          {deployed ? '是' : '否'}
-        </Tag>
-      ),
+      title: '下次执行',
+      dataIndex: 'next_run_time',
+      key: 'next_run_time',
+      ellipsis: { showTitle: false },
+      render: (time: string) => {
+        if (!time) return '-'
+        const formatted = new Date(time).toLocaleString()
+        return (
+          <Tooltip title={formatted}>
+            <span style={{ fontSize: 12 }}>{formatted}</span>
+          </Tooltip>
+        )
+      },
+    },
+    {
+      title: '上次同步',
+      key: 'last_sync',
+      ellipsis: { showTitle: false },
+      render: (_: any, record: SyncScheduleItem) => {
+        if (!record.last_sync_at) return '-'
+        const formatted = new Date(record.last_sync_at).toLocaleString()
+        const tip = record.last_sync_rows !== undefined ? `${formatted} (${record.last_sync_rows} 行)` : formatted
+        return (
+          <Tooltip title={tip}>
+            <span style={{ fontSize: 12 }}>{formatted}</span>
+          </Tooltip>
+        )
+      },
     },
     {
       title: '操作',
       key: 'actions',
-      render: (_: any, record: any) => (
-        <Space>
-          <Tooltip title="生成DAG代码">
+      width: 140,
+      fixed: 'right' as const,
+      render: (_: any, record: SyncScheduleItem) => (
+        <Space size={2}>
+          <Tooltip title="查看">
             <Button
               type="link"
-              icon={<CodeOutlined />}
-              onClick={() => handleGenerateDag(record.id)}
+              size="small"
+              icon={<EyeOutlined />}
+              onClick={() => handleView(record)}
+              style={{ padding: '0 4px' }}
             />
           </Tooltip>
-          <Tooltip title="部署到Airflow">
+          <Tooltip title="编辑">
             <Button
               type="link"
-              icon={<CloudUploadOutlined />}
-              onClick={() => handleDeploy(record.id)}
-              disabled={!record.dag_code}
+              size="small"
+              icon={<EditOutlined />}
+              onClick={() => handleOpenEditModal(record)}
+              style={{ padding: '0 4px' }}
             />
           </Tooltip>
-          {record.status === 'active' ? (
-            <Tooltip title="暂停">
+          {record.is_enabled ? (
+            <Tooltip title="下线">
               <Button
                 type="link"
+                size="small"
                 icon={<PauseOutlined />}
-                onClick={() => handlePause(record.id)}
+                loading={disabling === record.id}
+                onClick={() => handleDisable(record)}
+                style={{ color: '#faad14', padding: '0 4px' }}
               />
             </Tooltip>
-          ) : record.is_deployed ? (
-            <Tooltip title="恢复">
+          ) : (
+            <Tooltip title="上线">
               <Button
                 type="link"
+                size="small"
                 icon={<PlayCircleOutlined />}
-                onClick={() => handleResume(record.id)}
+                onClick={() => handleOpenEnableModal(record)}
+                style={{ color: '#52c41a', padding: '0 4px' }}
               />
             </Tooltip>
-          ) : null}
-          <Button
-            type="link"
-            icon={<EditOutlined />}
-            onClick={() => handleEdit(record)}
-          />
-          <Popconfirm
-            title="确定删除该调度?"
-            onConfirm={() => handleDelete(record.id)}
-          >
-            <Button type="link" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
+          )}
+          <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
+            <Button
+              type="link"
+              size="small"
+              danger={!record.is_enabled}
+              disabled={record.is_enabled}
+              icon={<DeleteOutlined />}
+              loading={deleting === record.id}
+              onClick={() => handleDelete(record)}
+              style={{ padding: '0 4px' }}
+            />
+          </Tooltip>
         </Space>
       ),
     },
   ]
 
+  const onlineCount = schedules.filter((s) => s.is_enabled).length
+  const offlineCount = schedules.filter((s) => !s.is_enabled).length
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-        <Title level={4}>调度管理</Title>
-        <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>
-          新建调度
-        </Button>
+        <Space>
+          <Title level={4} style={{ margin: 0 }}>
+            <ScheduleOutlined style={{ marginRight: 8 }} />
+            调度管理
+          </Title>
+          <Tag color="green">{onlineCount} 已上线</Tag>
+          <Tag>{offlineCount} 未上线</Tag>
+        </Space>
+        <Space>
+          {selectedIds.length > 0 && (
+            <Button
+              danger
+              icon={<DeleteOutlined />}
+              loading={batchDeleting}
+              onClick={() => {
+                // 检查是否有已上线的
+                const enabledCount = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled).length
+                if (enabledCount > 0) {
+                  message.warning(`有 ${enabledCount} 个调度已上线，请先下线后再删除`)
+                  return
+                }
+                Modal.confirm({
+                  title: '确认删除',
+                  content: `确定要删除选中的 ${selectedIds.length} 个调度吗？`,
+                  okText: '删除',
+                  okType: 'danger',
+                  cancelText: '取消',
+                  onOk: handleBatchDelete,
+                })
+              }}
+            >
+              批量删除 ({selectedIds.length})
+            </Button>
+          )}
+          <Button icon={<ReloadOutlined />} onClick={loadSchedules}>
+            刷新
+          </Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={handleOpenAddModal}>
+            添加调度
+          </Button>
+        </Space>
       </div>
 
-      <Card>
+      <Card bodyStyle={{ padding: 0 }}>
+        <Tabs
+          activeKey={statusFilter || 'all'}
+          onChange={(key) => setStatusFilter(key === 'all' ? undefined : (key === 'online' ? 'enabled' : 'disabled'))}
+          items={[
+            { key: 'all', label: `全部 (${schedules.length})` },
+            { key: 'online', label: `已上线 (${onlineCount})` },
+            { key: 'offline', label: `未上线 (${offlineCount})` },
+          ]}
+          style={{ padding: '0 16px' }}
+        />
         <Table
           columns={columns}
           dataSource={schedules}
           rowKey="id"
           loading={loading}
+          size="small"
+          scroll={{ x: 'max-content' }}
+          tableLayout="auto"
+          rowSelection={{
+            selectedRowKeys: selectedIds,
+            onChange: (keys) => setSelectedIds(keys as number[]),
+          }}
+          pagination={{
+            showSizeChanger: true,
+            showQuickJumper: true,
+            showTotal: (total) => `共 ${total} 条`,
+          }}
         />
       </Card>
 
+      {/* Add Schedule Modal */}
       <Modal
-        title={editingId ? '编辑调度' : '新建调度'}
-        open={modalVisible}
-        onOk={handleSubmit}
-        onCancel={() => setModalVisible(false)}
-        width={700}
+        title={null}
+        closable={true}
+        open={addModalVisible}
+        onCancel={() => setAddModalVisible(false)}
+        width={900}
+        styles={{ body: { padding: '12px 16px' } }}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Space>
+              <Button size="small" onClick={() => setAddModalVisible(false)}>
+                取消
+              </Button>
+              <Button
+                type="primary"
+                size="small"
+                disabled={selectedTasks.length === 0}
+                style={{ borderRadius: 6 }}
+                onClick={handleOpenCronPopover}
+              >
+                <ScheduleOutlined /> 创建调度 ({selectedTasks.length})
+              </Button>
+            </Space>
+          </div>
+        }
       >
-        <Form form={form} layout="vertical">
-          <Form.Item name="name" label="名称" rules={[{ required: true }]}>
-            <Input placeholder="调度名称" />
-          </Form.Item>
-          <Form.Item name="description" label="描述">
-            <TextArea placeholder="调度描述" rows={2} />
-          </Form.Item>
-          <Form.Item
-            name="cron_expression"
-            label="Cron表达式"
-            rules={[{ required: true }]}
-            extra="例如: 0 0 * * * (每天0点)"
+        {/* 穿梭框 */}
+        <div style={{ display: 'flex', gap: 10, height: 420 }}>
+          {/* 左侧：可调度的同步任务列表 */}
+          <Card
+            title={
+              <Space size={4} style={{ fontSize: 12 }}>
+                <SyncOutlined />
+                可调度任务
+                <Tag style={{ margin: 0, fontSize: 10 }}>{availableTasks.length}</Tag>
+              </Space>
+            }
+            size="small"
+            style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+            styles={{ header: { minHeight: 36, padding: '0 12px' }, body: { flex: 1, overflow: 'auto', padding: 6 } }}
+            extra={
+              <Button
+                type="link"
+                size="small"
+                style={{ padding: '0 4px', fontSize: 12 }}
+                onClick={() => {
+                  if (leftSelected.length === availableTasks.length) {
+                    setLeftSelected([])
+                  } else {
+                    setLeftSelected(availableTasks.map(t => t.id))
+                  }
+                }}
+                disabled={availableTasks.length === 0}
+              >
+                {leftSelected.length === availableTasks.length && availableTasks.length > 0 ? '取消' : '全选'}
+              </Button>
+            }
           >
-            <Input placeholder="0 0 * * *" />
-          </Form.Item>
-          <Form.Item name="datasource_id" label="数据源">
-            <Select
-              placeholder="选择数据源"
-              allowClear
-              options={datasources.map((ds) => ({
-                value: ds.id,
-                label: `${ds.name} (${ds.type})`,
-              }))}
+            {availableTasks.length > 0 ? (
+              availableTasks.map((task) => (
+                <Tooltip
+                  key={task.id}
+                  title={<div><div>{task.name}</div><div>{task.source_table} → {task.target_table}</div></div>}
+                  placement="top"
+                >
+                  <div
+                    onClick={() => handleLeftClick(task.id)}
+                    style={{
+                      padding: '6px 10px',
+                      cursor: 'pointer',
+                      borderRadius: 4,
+                      marginBottom: 3,
+                      fontSize: 12,
+                      background: leftSelected.includes(task.id) ? '#e6f4ff' : '#fafafa',
+                      border: leftSelected.includes(task.id) ? '1px solid #91caff' : '1px solid transparent',
+                      transition: 'all 0.15s',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
+                    <Tag color="blue" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>{task.sync_mode}</Tag>
+                  </div>
+                </Tooltip>
+              ))
+            ) : (
+              <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
+                暂无可调度的任务
+              </div>
+            )}
+          </Card>
+
+          {/* 中间：操作按钮 */}
+          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
+            <Tooltip title="添加">
+              <Button
+                size="small"
+                icon={<RightOutlined />}
+                onClick={handleMoveRight}
+                disabled={leftSelected.length === 0}
+              />
+            </Tooltip>
+            <Button
+              size="small"
+              icon={<LeftOutlined />}
+              onClick={handleMoveLeft}
+              disabled={rightSelected.length === 0}
             />
-          </Form.Item>
-          <Form.Item name="sql_content" label="SQL">
-            <TextArea placeholder="要执行的SQL语句" rows={6} />
-          </Form.Item>
-          <Form.Item name="alert_email" label="告警邮箱">
-            <Input placeholder="告警通知邮箱" />
-          </Form.Item>
-        </Form>
+          </div>
+
+          {/* 右侧：已选任务 */}
+          <Card
+            title={
+              <Space size={4} style={{ fontSize: 12 }}>
+                <ScheduleOutlined style={{ color: '#52c41a' }} />
+                待创建调度
+                <Tag color="green" style={{ margin: 0, fontSize: 10 }}>{selectedTasks.length}</Tag>
+              </Space>
+            }
+            size="small"
+            style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+            styles={{ header: { minHeight: 36, padding: '0 12px' }, body: { flex: 1, overflow: 'auto', padding: 6 } }}
+            extra={
+              <Button
+                type="link"
+                size="small"
+                style={{ padding: '0 4px', fontSize: 12 }}
+                onClick={() => {
+                  if (rightSelected.length === selectedTasks.length) {
+                    setRightSelected([])
+                  } else {
+                    setRightSelected(selectedTasks.map(t => t.id))
+                  }
+                }}
+                disabled={selectedTasks.length === 0}
+              >
+                {rightSelected.length === selectedTasks.length && selectedTasks.length > 0 ? '取消' : '全选'}
+              </Button>
+            }
+          >
+            {selectedTasks.length > 0 ? (
+              selectedTasks.map((task) => (
+                <Tooltip
+                  key={task.id}
+                  title={<div><div>{task.name}</div><div>{task.source_table} → {task.target_table}</div></div>}
+                  placement="top"
+                >
+                  <div
+                    onClick={() => handleRightClick(task.id)}
+                    style={{
+                      padding: '6px 10px',
+                      cursor: 'pointer',
+                      borderRadius: 4,
+                      marginBottom: 3,
+                      fontSize: 12,
+                      background: rightSelected.includes(task.id) ? '#f6ffed' : '#fafafa',
+                      border: rightSelected.includes(task.id) ? '1px solid #b7eb8f' : '1px solid transparent',
+                      transition: 'all 0.15s',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
+                    <Tag color="blue" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>{task.sync_mode}</Tag>
+                  </div>
+                </Tooltip>
+              ))
+            ) : (
+              <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
+                从左侧选择任务添加
+              </div>
+            )}
+          </Card>
+        </div>
       </Modal>
 
+      {/* Draggable Cron Popover */}
+      {cronPopoverOpen && (
+        <>
+          {/* Backdrop */}
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 1049,
+            }}
+            onClick={() => setCronPopoverOpen(false)}
+          />
+          {/* Popover */}
+          <div
+            ref={popoverRef}
+            style={{
+              position: 'fixed',
+              ...(popoverPosition.x === 0 && popoverPosition.y === 0
+                ? {
+                    left: '50%',
+                    top: '50%',
+                    transform: 'translate(-50%, -50%)',
+                  }
+                : {
+                    left: popoverPosition.x,
+                    top: popoverPosition.y,
+                  }),
+              width: 360,
+              background: '#fff',
+              borderRadius: 12,
+              boxShadow: '0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12), 0 9px 28px 8px rgba(0, 0, 0, 0.05)',
+              zIndex: 1050,
+              overflow: 'hidden',
+            }}
+          >
+            {/* Header - Draggable */}
+            <div
+              onMouseDown={handleDragStart}
+              style={{
+                padding: '12px 16px',
+                borderBottom: '1px solid #f0f0f0',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                cursor: 'move',
+                userSelect: 'none',
+                background: '#fafafa',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <HolderOutlined style={{ color: '#bfbfbf', fontSize: 12 }} />
+                <Text strong style={{ fontSize: 14 }}>调度设置</Text>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  已选 {selectedTasks.length} 个任务
+                </Text>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <Button
+                  size="small"
+                  loading={adding}
+                  onClick={() => {
+                    setCronPopoverOpen(false)
+                    handleCreateSchedules(false)
+                  }}
+                  style={{
+                    height: 26,
+                    padding: '0 12px',
+                    borderRadius: 13,
+                    fontSize: 12,
+                    fontWeight: 400,
+                    border: '1px solid #d9d9d9',
+                    boxShadow: 'none',
+                  }}
+                >
+                  保存
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  loading={adding}
+                  onClick={() => {
+                    setCronPopoverOpen(false)
+                    handleCreateSchedules(true)
+                  }}
+                  style={{
+                    height: 26,
+                    padding: '0 12px',
+                    borderRadius: 13,
+                    fontSize: 12,
+                    fontWeight: 400,
+                    background: '#34c759',
+                    border: 'none',
+                    boxShadow: 'none',
+                  }}
+                >
+                  <PlayCircleOutlined style={{ fontSize: 11 }} /> 上线
+                </Button>
+              </div>
+            </div>
+            {/* Content */}
+            <div style={{ padding: 16 }}>
+              <CronExpressionInput
+                value={addCronExpression}
+                onChange={(v) => setAddCronExpression(v)}
+              />
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Enable Schedule Modal */}
       <Modal
-        title="DAG 代码"
-        open={codeVisible}
-        onCancel={() => setCodeVisible(false)}
-        width={900}
-        footer={null}
+        title={
+          <Space>
+            <ScheduleOutlined />
+            <span>上线调度 - {selectedSchedule?.name}</span>
+          </Space>
+        }
+        open={enableModalVisible}
+        onCancel={() => setEnableModalVisible(false)}
+        onOk={handleEnable}
+        confirmLoading={enabling}
+        okText="确定上线"
+        width={550}
       >
-        <Editor
-          height={500}
-          language="python"
-          value={dagCode}
-          options={{
-            readOnly: true,
-            minimap: { enabled: false },
-            fontSize: 13,
-          }}
+        <Alert
+          message="上线后将生成 Airflow DAG 并开始定时执行"
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
         />
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>调度信息：</Text>
+        </div>
+        <Space direction="vertical" style={{ marginBottom: 16, width: '100%' }}>
+          <Text>同步任务：<Tag color="blue">{selectedSchedule?.sync_task_name}</Tag></Text>
+          <Text>源表：<Tag>{selectedSchedule?.source_table}</Tag></Text>
+          <Text>目标表：<Tag color="gold">{selectedSchedule?.target_table}</Tag></Text>
+          <Text>Cron 表达式：<Text code>{selectedSchedule?.cron_expression}</Text></Text>
+        </Space>
+      </Modal>
+
+      {/* View Schedule Modal */}
+      <Modal
+        title={
+          <Space>
+            <EyeOutlined />
+            <span>调度详情</span>
+          </Space>
+        }
+        open={viewModalVisible}
+        onCancel={() => setViewModalVisible(false)}
+        footer={<Button onClick={() => setViewModalVisible(false)}>关闭</Button>}
+        width={650}
+      >
+        {viewSchedule && (
+          <Descriptions column={2} bordered size="small">
+            <Descriptions.Item label="调度名称" span={2}>{viewSchedule.name}</Descriptions.Item>
+            <Descriptions.Item label="描述" span={2}>{viewSchedule.description || '-'}</Descriptions.Item>
+            <Descriptions.Item label="同步任务">{viewSchedule.sync_task_name}</Descriptions.Item>
+            <Descriptions.Item label="同步模式">{viewSchedule.sync_mode}</Descriptions.Item>
+            <Descriptions.Item label="源表">{viewSchedule.source_table}</Descriptions.Item>
+            <Descriptions.Item label="目标表">{viewSchedule.target_table}</Descriptions.Item>
+            <Descriptions.Item label="Cron 表达式">
+              <Text code>{viewSchedule.cron_expression}</Text>
+            </Descriptions.Item>
+            <Descriptions.Item label="状态">
+              {viewSchedule.is_enabled ? (
+                <Tag icon={<CheckCircleOutlined />} color="green">已上线</Tag>
+              ) : (
+                <Tag>未上线</Tag>
+              )}
+            </Descriptions.Item>
+            <Descriptions.Item label="DAG ID">{viewSchedule.dag_id || '-'}</Descriptions.Item>
+            <Descriptions.Item label="Airflow 状态">{viewSchedule.airflow_status || '-'}</Descriptions.Item>
+            <Descriptions.Item label="下次执行">
+              {viewSchedule.next_run_time ? new Date(viewSchedule.next_run_time).toLocaleString() : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="上次执行">
+              {viewSchedule.last_run_time ? new Date(viewSchedule.last_run_time).toLocaleString() : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="上次同步">
+              {viewSchedule.last_sync_at ? new Date(viewSchedule.last_sync_at).toLocaleString() : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="同步行数">{viewSchedule.last_sync_rows ?? '-'}</Descriptions.Item>
+            <Descriptions.Item label="创建人">{viewSchedule.creator_name || '-'}</Descriptions.Item>
+            <Descriptions.Item label="创建时间">
+              {new Date(viewSchedule.created_at).toLocaleString()}
+            </Descriptions.Item>
+          </Descriptions>
+        )}
+      </Modal>
+
+      {/* Edit Schedule Modal */}
+      <Modal
+        title={
+          <Space>
+            <EditOutlined />
+            <span>编辑调度</span>
+          </Space>
+        }
+        open={editModalVisible}
+        onCancel={() => setEditModalVisible(false)}
+        onOk={handleSaveEdit}
+        confirmLoading={editing}
+        okText="保存"
+        width={600}
+      >
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>调度名称：</Text>
+        </div>
+        <Input
+          value={editName}
+          onChange={(e) => setEditName(e.target.value)}
+          placeholder="请输入调度名称"
+          style={{ marginBottom: 16 }}
+        />
+
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>描述：</Text>
+        </div>
+        <Input
+          value={editDescription}
+          onChange={(e) => setEditDescription(e.target.value)}
+          placeholder="请输入调度描述"
+          style={{ marginBottom: 16 }}
+        />
+
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>Cron 表达式：</Text>
+        </div>
+        <CronExpressionInput
+          value={editCron}
+          onChange={(v) => setEditCron(v)}
+        />
+
+        {editSchedule?.is_enabled && (
+          <Alert
+            message="已上线的调度修改 Cron 后需重新上线才能生效"
+            type="warning"
+            showIcon
+            style={{ marginTop: 16 }}
+          />
+        )}
       </Modal>
     </div>
   )

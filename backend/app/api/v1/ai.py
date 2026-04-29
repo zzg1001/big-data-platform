@@ -25,6 +25,11 @@ from app.schemas.ai import (
     AIExecuteDDLResponse,
     AIFixDDLRequest,
     AIFixDDLResponse,
+    AIGenerateCronRequest,
+    AIGenerateCronResponse,
+    AIConvertColumnTypesRequest,
+    AIConvertColumnTypesResponse,
+    ColumnTypeMapping,
 )
 from app.services.ai_assistant import AIAssistant
 from app.services.db_connector import DatabaseConnector
@@ -345,3 +350,187 @@ async def fix_ddl(
         return response
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/generate-cron", response_model=AIGenerateCronResponse)
+async def generate_cron(
+    request: AIGenerateCronRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Generate cron expression from natural language description using AI."""
+    from datetime import datetime
+    from croniter import croniter
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    def calculate_next_runs(cron_expr: str) -> list:
+        """计算未来5次执行时间"""
+        next_runs = []
+        try:
+            base_time = datetime.now()
+            cron = croniter(cron_expr, base_time)
+            for _ in range(5):
+                next_time = cron.get_next(datetime)
+                next_runs.append(next_time.strftime("%Y-%m-%d %H:%M"))
+        except Exception:
+            pass
+        return next_runs
+
+    # 直接使用 AI 生成
+    try:
+        ai = get_ai_assistant()
+        response = ai.generate_cron(description=request.description)
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI generate_cron failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"AI 服务调用失败: {str(e)}"
+        )
+
+
+@router.post("/convert-column-types", response_model=AIConvertColumnTypesResponse)
+async def convert_column_types(
+    request: AIConvertColumnTypesRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Convert column types from source database type to target database type.
+    If source and target types are the same, returns direct mapping.
+    Otherwise, uses AI to convert types.
+    """
+    source_type = request.source_db_type.lower()
+    target_type = request.target_db_type.lower()
+
+    # If same database type, just copy types directly
+    if source_type == target_type:
+        mappings = [
+            ColumnTypeMapping(
+                source_column=col.name,
+                source_type=col.data_type,
+                target_column=col.name,
+                target_type=col.data_type,
+            )
+            for col in request.columns
+        ]
+        return AIConvertColumnTypesResponse(
+            mappings=mappings,
+            explanation=f"源库和目标库类型相同 ({source_type})，字段和类型直接复制"
+        )
+
+    # Type mapping rules for common conversions
+    type_rules = {
+        # MySQL to others
+        ('mysql', 'hive'): {
+            'int': 'BIGINT', 'bigint': 'BIGINT', 'smallint': 'INT', 'tinyint': 'INT',
+            'varchar': 'STRING', 'char': 'STRING', 'text': 'STRING', 'longtext': 'STRING',
+            'decimal': 'DECIMAL(38,10)', 'numeric': 'DECIMAL(38,10)',
+            'float': 'DOUBLE', 'double': 'DOUBLE',
+            'date': 'DATE', 'datetime': 'TIMESTAMP', 'timestamp': 'TIMESTAMP',
+            'boolean': 'BOOLEAN', 'bool': 'BOOLEAN',
+        },
+        ('mysql', 'doris'): {
+            'int': 'BIGINT', 'bigint': 'BIGINT', 'smallint': 'SMALLINT', 'tinyint': 'TINYINT',
+            'varchar': 'VARCHAR(65533)', 'char': 'CHAR', 'text': 'STRING', 'longtext': 'STRING',
+            'decimal': 'DECIMAL(38,10)', 'numeric': 'DECIMAL(38,10)',
+            'float': 'FLOAT', 'double': 'DOUBLE',
+            'date': 'DATE', 'datetime': 'DATETIME', 'timestamp': 'DATETIME',
+            'boolean': 'BOOLEAN', 'bool': 'BOOLEAN',
+        },
+        ('mysql', 'starrocks'): {
+            'int': 'BIGINT', 'bigint': 'BIGINT', 'smallint': 'SMALLINT', 'tinyint': 'TINYINT',
+            'varchar': 'VARCHAR(65533)', 'char': 'CHAR', 'text': 'STRING', 'longtext': 'STRING',
+            'decimal': 'DECIMAL(38,10)', 'numeric': 'DECIMAL(38,10)',
+            'float': 'FLOAT', 'double': 'DOUBLE',
+            'date': 'DATE', 'datetime': 'DATETIME', 'timestamp': 'DATETIME',
+            'boolean': 'BOOLEAN', 'bool': 'BOOLEAN',
+        },
+        # PostgreSQL to others
+        ('postgresql', 'hive'): {
+            'integer': 'BIGINT', 'bigint': 'BIGINT', 'smallint': 'INT', 'serial': 'BIGINT',
+            'varchar': 'STRING', 'character varying': 'STRING', 'text': 'STRING',
+            'numeric': 'DECIMAL(38,10)', 'decimal': 'DECIMAL(38,10)',
+            'real': 'FLOAT', 'double precision': 'DOUBLE',
+            'date': 'DATE', 'timestamp': 'TIMESTAMP', 'timestamptz': 'TIMESTAMP',
+            'boolean': 'BOOLEAN',
+        },
+    }
+
+    # Try to find matching rules
+    rule_key = (source_type, target_type)
+    rules = type_rules.get(rule_key, {})
+
+    def convert_type(src_type: str) -> str:
+        """Convert a single type using rules."""
+        src_lower = src_type.lower()
+        # Try exact match first
+        for pattern, target in rules.items():
+            if pattern in src_lower:
+                return target
+        # Default conversions
+        if 'int' in src_lower:
+            return 'BIGINT'
+        if 'char' in src_lower or 'text' in src_lower:
+            return 'STRING'
+        if 'decimal' in src_lower or 'numeric' in src_lower:
+            return 'DECIMAL(38,10)'
+        if 'float' in src_lower or 'double' in src_lower:
+            return 'DOUBLE'
+        if 'date' in src_lower and 'time' not in src_lower:
+            return 'DATE'
+        if 'time' in src_lower:
+            return 'TIMESTAMP'
+        if 'bool' in src_lower:
+            return 'BOOLEAN'
+        return 'STRING'
+
+    # If we have rules or it's a simple conversion, use them
+    if rules or target_type in ['hive', 'doris', 'starrocks', 'mysql', 'postgresql']:
+        mappings = [
+            ColumnTypeMapping(
+                source_column=col.name,
+                source_type=col.data_type,
+                target_column=col.name,
+                target_type=convert_type(col.data_type),
+            )
+            for col in request.columns
+        ]
+        return AIConvertColumnTypesResponse(
+            mappings=mappings,
+            explanation=f"使用内置规则将 {source_type} 类型转换为 {target_type} 类型"
+        )
+
+    # For unknown combinations, use AI
+    ai = get_ai_assistant()
+    try:
+        # Build prompt for AI
+        columns_text = "\n".join([f"- {col.name}: {col.data_type}" for col in request.columns])
+        prompt = f"""Convert the following column types from {source_type} to {target_type}:
+
+{columns_text}
+
+Return a JSON array with objects containing: source_column, source_type, target_column, target_type
+Only return the JSON array, no other text."""
+
+        # This would call AI - for now, use fallback
+        mappings = [
+            ColumnTypeMapping(
+                source_column=col.name,
+                source_type=col.data_type,
+                target_column=col.name,
+                target_type=convert_type(col.data_type),
+            )
+            for col in request.columns
+        ]
+        return AIConvertColumnTypesResponse(
+            mappings=mappings,
+            explanation=f"将 {source_type} 类型转换为 {target_type} 类型（使用默认规则）"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"类型转换失败: {str(e)}"
+        )

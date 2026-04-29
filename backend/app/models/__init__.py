@@ -7,7 +7,8 @@ from app.models.query import Query, QueryHistory
 from app.models.schedule import Schedule, ScheduleLog
 from app.models.file import File
 from app.models.audit import AuditLog
-from app.models.sync_task import SyncTask, SyncLog
+from app.models.sync_task import SyncTask, SyncLog, ColumnMapping
+from app.models.sync_schedule import SyncSchedule
 
 __all__ = [
     "User",
@@ -25,4 +26,6 @@ __all__ = [
     "AuditLog",
     "SyncTask",
     "SyncLog",
+    "SyncSchedule",
+    "ColumnMapping",
 ]

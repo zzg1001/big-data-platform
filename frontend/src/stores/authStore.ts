@@ -17,7 +17,7 @@ interface AuthState {
   refreshToken: string | null
   isAuthenticated: boolean
   login: (username: string, password: string) => Promise<void>
-  logout: () => void
+  logout: () => Promise<void>
   refreshAccessToken: () => Promise<void>
 }
 
@@ -54,7 +54,13 @@ export const useAuthStore = create<AuthState>()(
         })
       },
 
-      logout: () => {
+      logout: async () => {
+        // Try to logout from server (invalidate session)
+        try {
+          await api.post('/api/v1/auth/logout')
+        } catch {
+          // Ignore errors, just clear local state
+        }
         delete api.defaults.headers.common['Authorization']
         set({
           user: null,
@@ -67,7 +73,14 @@ export const useAuthStore = create<AuthState>()(
       refreshAccessToken: async () => {
         const { refreshToken } = get()
         if (!refreshToken) {
-          get().logout()
+          // Clear local state without server call
+          delete api.defaults.headers.common['Authorization']
+          set({
+            user: null,
+            accessToken: null,
+            refreshToken: null,
+            isAuthenticated: false,
+          })
           return
         }
 
@@ -84,7 +97,14 @@ export const useAuthStore = create<AuthState>()(
             refreshToken: refresh_token,
           })
         } catch {
-          get().logout()
+          // Clear local state without server call (session may already be invalid)
+          delete api.defaults.headers.common['Authorization']
+          set({
+            user: null,
+            accessToken: null,
+            refreshToken: null,
+            isAuthenticated: false,
+          })
         }
       },
     }),

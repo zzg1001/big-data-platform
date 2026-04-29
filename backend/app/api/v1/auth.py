@@ -6,8 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import create_access_token, create_refresh_token, decode_token
+from app.core.redis import create_session, delete_session, extend_session
 from app.schemas.user import UserCreate, UserResponse, UserLogin, Token
 from app.services.user_service import UserService
+from app.api.deps import get_current_user
+from app.models.user import User
 
 router = APIRouter()
 
@@ -60,8 +63,14 @@ async def login(
             detail="User account is disabled",
         )
 
-    access_token = create_access_token(data={"sub": user.username})
-    refresh_token = create_refresh_token(data={"sub": user.username})
+    access_token, token_id = create_access_token(data={"sub": user.username, "uid": user.id})
+    refresh_token = create_refresh_token(data={"sub": user.username, "uid": user.id, "tid": token_id})
+
+    # Store session in Redis with 10-minute TTL
+    await create_session(user.id, token_id, {
+        "username": user.username,
+        "user_id": user.id,
+    })
 
     return Token(
         access_token=access_token,
@@ -93,11 +102,40 @@ async def refresh_token(
             detail="User not found or inactive",
         )
 
-    access_token = create_access_token(data={"sub": user.username})
-    new_refresh_token = create_refresh_token(data={"sub": user.username})
+    # Use the same token_id to maintain session continuity
+    old_token_id = payload.get("tid")
+    access_token, token_id = create_access_token(
+        data={"sub": user.username, "uid": user.id},
+        token_id=old_token_id
+    )
+    new_refresh_token = create_refresh_token(data={"sub": user.username, "uid": user.id, "tid": token_id})
+
+    # Extend session in Redis
+    await extend_session(user.id, token_id)
 
     return Token(
         access_token=access_token,
         refresh_token=new_refresh_token,
         token_type="bearer",
     )
+
+
+@router.post("/logout")
+async def logout(
+    current_user: User = Depends(get_current_user),
+):
+    """Logout and invalidate session."""
+    # The token_id is extracted in get_current_user, we need to get it from the request
+    # For now, we'll delete all sessions for the user
+    from app.core.redis import delete_all_user_sessions
+    await delete_all_user_sessions(current_user.id)
+    return {"message": "Logged out successfully"}
+
+
+@router.post("/heartbeat")
+async def heartbeat(
+    current_user: User = Depends(get_current_user),
+):
+    """Heartbeat endpoint to extend session TTL."""
+    # Session is automatically extended in get_current_user
+    return {"message": "Session extended"}

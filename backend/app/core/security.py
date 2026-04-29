@@ -3,6 +3,7 @@ Security utilities: JWT, password hashing, encryption.
 """
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
+import uuid
 
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -26,8 +27,8 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create a JWT access token."""
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, token_id: Optional[str] = None) -> tuple[str, str]:
+    """Create a JWT access token. Returns (token, token_id)."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
@@ -35,8 +36,11 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         expire = datetime.now(timezone.utc) + timedelta(
             minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
         )
-    to_encode.update({"exp": expire, "type": "access"})
-    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    # Generate unique token ID for session tracking
+    tid = token_id or str(uuid.uuid4())
+    to_encode.update({"exp": expire, "type": "access", "tid": tid})
+    token = jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return token, tid
 
 
 def create_refresh_token(data: dict) -> str:

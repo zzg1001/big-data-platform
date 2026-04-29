@@ -19,7 +19,6 @@ import {
   EyeOutlined,
   DeleteOutlined,
   ImportOutlined,
-  DownloadOutlined,
 } from '@ant-design/icons'
 import { fileApi, datasourceApi } from '../services/api'
 

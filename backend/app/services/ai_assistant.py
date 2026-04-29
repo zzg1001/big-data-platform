@@ -15,6 +15,7 @@ from app.schemas.ai import (
     AIDDLConvertResponse,
     DDLTypeMapping,
     AIFixDDLResponse,
+    AIGenerateCronResponse,
 )
 
 
@@ -413,4 +414,68 @@ Please analyze and provide a corrected DDL that will work on {target_db_type}.
                 fixed_ddl=fixed_ddl,
                 explanation=content,
                 changes=["Could not parse detailed changes from AI response"],
+            )
+
+    def generate_cron(self, description: str) -> AIGenerateCronResponse:
+        """Generate cron expression from natural language description."""
+        from datetime import datetime
+        from croniter import croniter
+
+        def calculate_next_runs(cron_expr: str) -> list:
+            """计算未来5次执行时间"""
+            next_runs = []
+            try:
+                base_time = datetime.now()
+                cron = croniter(cron_expr, base_time)
+                for _ in range(5):
+                    next_time = cron.get_next(datetime)
+                    next_runs.append(next_time.strftime("%Y-%m-%d %H:%M"))
+            except Exception:
+                pass
+            return next_runs
+
+        system_prompt = """你是一个 cron 表达式专家。将用户的自然语言描述转换为标准的 5 位 cron 表达式。
+
+cron 格式：分钟 小时 日 月 星期
+- 分钟: 0-59
+- 小时: 0-23
+- 日: 1-31 (L 表示最后一天)
+- 月: 1-12
+- 星期: 0-7 (0和7都是周日, 1是周一)
+
+特殊字符：
+- * 表示任意值
+- */n 表示每隔n
+- L 表示最后（用于日期字段表示月末）
+- 1-5 表示范围（周一到周五）
+- 1,3,5 表示列表
+
+请返回 JSON 格式：
+{
+    "cron_expression": "5位cron表达式",
+    "explanation": "用中文解释这个表达式的含义"
+}
+
+注意：理解用户的真实意图，灵活处理各种表达方式。"""
+
+        user_prompt = description
+        content = self._call_claude(system_prompt, user_prompt)
+
+        try:
+            json_content = self._extract_json(content)
+            data = json.loads(json_content)
+
+            cron_expr = data.get("cron_expression", "0 0 * * *")
+            explanation = data.get("explanation", "")
+
+            return AIGenerateCronResponse(
+                cron_expression=cron_expr,
+                explanation=explanation,
+                next_runs=calculate_next_runs(cron_expr),
+            )
+        except json.JSONDecodeError:
+            return AIGenerateCronResponse(
+                cron_expression="0 0 * * *",
+                explanation="解析失败，使用默认值：每天凌晨0点执行",
+                next_runs=calculate_next_runs("0 0 * * *"),
             )

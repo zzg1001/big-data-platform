@@ -39,6 +39,11 @@ export default function MainLayout() {
     navigate(key)
   }
 
+  const handleLogout = async () => {
+    await logout()
+    navigate('/login')
+  }
+
   const userMenuItems = [
     {
       key: 'profile',
@@ -49,10 +54,7 @@ export default function MainLayout() {
       key: 'logout',
       icon: <LogoutOutlined />,
       label: '退出登录',
-      onClick: () => {
-        logout()
-        navigate('/login')
-      },
+      onClick: handleLogout,
     },
   ]
 

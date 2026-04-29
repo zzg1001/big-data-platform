@@ -11,13 +11,8 @@ import {
   Empty,
   Modal,
   Tooltip,
-  Popconfirm,
-  Form,
   Input,
-  Radio,
-  Checkbox,
   Table,
-  Alert,
 } from 'antd'
 import {
   RightOutlined,
@@ -25,45 +20,24 @@ import {
   DatabaseOutlined,
   TableOutlined,
   GoldOutlined,
-  SettingOutlined,
   SyncOutlined,
   CheckCircleOutlined,
-  ClockCircleOutlined,
   DeleteOutlined,
   RobotOutlined,
   ThunderboltOutlined,
-  ScheduleOutlined,
-  FilterOutlined,
-  FieldTimeOutlined,
   PlusOutlined,
   ReloadOutlined,
-  EditOutlined,
   PlayCircleOutlined,
   FileTextOutlined,
   LoadingOutlined,
   ExclamationCircleOutlined,
   EyeOutlined,
+  SettingOutlined,
 } from '@ant-design/icons'
 import { datasourceApi, syncApi, configApi, warehouseApi, aiApi } from '../services/api'
 import Editor from '@monaco-editor/react'
 
 const { Text, Title } = Typography
-
-interface ColumnInfo {
-  name: string
-  data_type: string
-  is_nullable: boolean
-  is_primary_key: boolean
-}
-
-interface SyncConfig {
-  syncMode: 'full' | 'incremental'
-  selectedColumns: string[]
-  whereCondition: string
-  incrementalColumn: string
-  cronExpression: string
-  isScheduled: boolean
-}
 
 interface SyncTaskItem {
   id: number
@@ -82,6 +56,13 @@ interface SyncTaskItem {
   last_error?: string
 }
 
+interface ColumnMapping {
+  sourceColumn: string
+  sourceType: string
+  targetColumn: string
+  targetType: string
+}
+
 interface SelectedTableItem {
   tableName: string
   targetTableName: string
@@ -93,6 +74,7 @@ interface SelectedTableItem {
   syncStatus?: 'pending' | 'syncing' | 'success' | 'error'
   syncError?: string
   syncRows?: number
+  columnMappings?: ColumnMapping[]
 }
 
 export default function DataSync() {
@@ -106,7 +88,7 @@ export default function DataSync() {
 
   // 数仓配置（从系统配置读取）
   const [warehouseConfig, setWarehouseConfig] = useState<any>(null)
-  const [loadingWarehouse, setLoadingWarehouse] = useState(true)
+  const [, setLoadingWarehouse] = useState(true)
 
   // 新增弹窗
   const [addModalVisible, setAddModalVisible] = useState(false)
@@ -118,10 +100,9 @@ export default function DataSync() {
   const [creating, setCreating] = useState(false)
   const [tasksCreated, setTasksCreated] = useState(false)
   const [syncing, setSyncing] = useState(false)
-  const [createdCount, setCreatedCount] = useState(0) // 已创建的表数量
+  const [, setCreatedCount] = useState(0) // 已创建的表数量
   const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([])
   const [batchDeleting, setBatchDeleting] = useState(false)
-
   // DDL 预览弹窗
   const [ddlModalVisible, setDdlModalVisible] = useState(false)
   const [currentDdlTable, setCurrentDdlTable] = useState<string>('')
@@ -148,13 +129,11 @@ export default function DataSync() {
     status: 'loading' | 'success' | 'error'
   } | null>(null)
 
-  // 配置弹窗
-  const [configModalVisible, setConfigModalVisible] = useState(false)
-  const [configTask, setConfigTask] = useState<SyncTaskItem | null>(null)
-  const [configForm] = Form.useForm()
-  const [tableColumns, setTableColumns] = useState<ColumnInfo[]>([])
+  // 字段映射弹窗
+  const [columnMappingVisible, setColumnMappingVisible] = useState(false)
+  const [columnMappingTable, setColumnMappingTable] = useState<SelectedTableItem | null>(null)
+  const [columnMappings, setColumnMappings] = useState<ColumnMapping[]>([])
   const [loadingColumns, setLoadingColumns] = useState(false)
-  const [savingConfig, setSavingConfig] = useState(false)
 
   // 数仓是否已配置
   const warehouseConfigured = warehouseConfig?.configured || false
@@ -305,11 +284,18 @@ export default function DataSync() {
         if (table.withDrop) {
           ddl = `DROP TABLE IF EXISTS ${table.targetTableName};\n\n${ddl}`
         }
-        // 更新对应表的 DDL
+        // 从 type_mappings 提取字段映射，确保 DDL 和字段映射一致
+        const columnMappings: ColumnMapping[] = (res.data.type_mappings || []).map((m: any) => ({
+          sourceColumn: m.column_name,
+          sourceType: m.source_type,
+          targetColumn: m.column_name,  // 默认目标字段名与源字段名相同
+          targetType: m.target_type,
+        }))
+        // 更新对应表的 DDL 和字段映射
         setSelectedTables((prev) =>
           prev.map((item) =>
             item.tableName === table.tableName
-              ? { ...item, ddl, ddlStatus: 'success' as const }
+              ? { ...item, ddl, ddlStatus: 'success' as const, columnMappings }
               : item
           )
         )
@@ -433,6 +419,264 @@ export default function DataSync() {
     )
     setPreviewDdlVisible(false)
     message.success('DDL 已保存')
+  }
+
+  // 默认示例映射数据（仅在 API 失败时显示）
+  const defaultMockMappings: ColumnMapping[] = [
+    { sourceColumn: 'id', sourceType: 'INT', targetColumn: 'id', targetType: 'INT' },
+    { sourceColumn: 'name', sourceType: 'VARCHAR(255)', targetColumn: 'name', targetType: 'VARCHAR(255)' },
+    { sourceColumn: 'created_at', sourceType: 'DATETIME', targetColumn: 'created_at', targetType: 'DATETIME' },
+  ]
+
+  // 打开字段映射弹窗
+  const handleOpenColumnMapping = async (item: SelectedTableItem) => {
+    if (!sourceDsId) {
+      message.warning('请先选择数据源')
+      return
+    }
+
+    // 先设置默认数据，确保弹窗有内容显示
+    setColumnMappingTable(item)
+    setColumnMappings(defaultMockMappings)
+    setLoadingColumns(true)
+    setColumnMappingVisible(true)
+
+    let finalMappings: ColumnMapping[] = defaultMockMappings
+
+    // 获取源库和目标库类型
+    const sourceDbType = sourceDs?.type?.toLowerCase() || 'mysql'
+    const targetDbType = warehouseConfig?.type?.toLowerCase() || 'mysql'
+
+    try {
+      // 1. 优先使用 selectedTables 中已有的映射（与 DDL 一致）
+      if (item.columnMappings && item.columnMappings.length > 0) {
+        finalMappings = item.columnMappings
+        message.success(`已加载 ${finalMappings.length} 个字段映射`)
+        setColumnMappings(finalMappings)
+        setLoadingColumns(false)
+        return
+      }
+
+      // 2. 尝试从数据库加载已保存的映射
+      try {
+        const savedRes = await syncApi.getColumnMappings(sourceDsId, item.tableName, item.targetTableName)
+        if (savedRes.data.mappings && savedRes.data.mappings.length > 0) {
+          finalMappings = savedRes.data.mappings.map((m: any) => ({
+            sourceColumn: m.source_column,
+            sourceType: m.source_type,
+            targetColumn: m.target_column,
+            targetType: m.target_type,
+          }))
+          message.success(`已加载保存的 ${finalMappings.length} 个字段映射`)
+          setColumnMappings(finalMappings)
+          setLoadingColumns(false)
+          return // 已有保存的映射，直接返回
+        }
+      } catch (e) {
+        // 没有保存的映射，继续从数据库获取
+        console.log('没有已保存的映射，从源表获取')
+      }
+
+      // 3. 获取源表字段
+      const res = await syncApi.getTableColumns(sourceDsId, item.tableName)
+      const sourceColumns = res.data
+
+      if (Array.isArray(sourceColumns) && sourceColumns.length > 0) {
+        // 判断源库和目标库类型是否相同
+        if (sourceDbType === targetDbType) {
+          // 类型相同，直接复制字段和类型
+          finalMappings = sourceColumns.map((col: any) => ({
+            sourceColumn: col.name || 'unknown',
+            sourceType: col.data_type || 'unknown',
+            targetColumn: col.name || 'unknown',
+            targetType: col.data_type || 'unknown',
+          }))
+          message.info('源库和目标库类型相同，字段和类型直接复制')
+        } else {
+          // 类型不同，调用AI转换
+          try {
+            const convertRes = await aiApi.convertColumnTypes({
+              columns: sourceColumns.map((col: any) => ({
+                name: col.name,
+                data_type: col.data_type,
+              })),
+              source_db_type: sourceDbType,
+              target_db_type: targetDbType,
+            })
+            if (convertRes.data.mappings && convertRes.data.mappings.length > 0) {
+              finalMappings = convertRes.data.mappings.map((m: any) => ({
+                sourceColumn: m.source_column,
+                sourceType: m.source_type,
+                targetColumn: m.target_column,
+                targetType: m.target_type,
+              }))
+              if (convertRes.data.explanation) {
+                message.success(convertRes.data.explanation)
+              }
+            }
+          } catch (convertError) {
+            console.error('AI转换失败，使用默认规则:', convertError)
+            // AI失败时使用本地转换规则
+            finalMappings = sourceColumns.map((col: any) => ({
+              sourceColumn: col.name || 'unknown',
+              sourceType: col.data_type || 'unknown',
+              targetColumn: col.name || 'unknown',
+              targetType: convertToTargetType(col.data_type || 'unknown', targetDbType),
+            }))
+            message.warning('AI转换失败，使用默认转换规则')
+          }
+        }
+      } else {
+        message.info('未获取到字段信息，显示示例数据')
+      }
+    } catch (error: any) {
+      const errDetail = error.response?.data?.detail || error.message || '未知错误'
+      const errStatus = error.response?.status || ''
+      console.error('获取字段信息失败:', { status: errStatus, detail: errDetail, error })
+      // 弹窗显示详细错误
+      Modal.error({
+        title: '获取字段信息失败',
+        content: (
+          <div>
+            <p><strong>数据源 ID:</strong> {sourceDsId}</p>
+            <p><strong>表名:</strong> {item.tableName}</p>
+            <p><strong>错误码:</strong> {errStatus}</p>
+            <p><strong>错误详情:</strong> {errDetail}</p>
+          </div>
+        ),
+        okText: '确定',
+      })
+    }
+
+    // 统一在最后设置状态
+    setColumnMappings(finalMappings)
+    setLoadingColumns(false)
+  }
+
+  // 类型转换（根据目标数据库类型）
+  const convertToTargetType = (sourceType: string, targetDbType: string = 'hive'): string => {
+    const type = sourceType.toLowerCase()
+    const target = targetDbType.toLowerCase()
+
+    // Hive/Spark 类型
+    if (target === 'hive' || target === 'spark') {
+      if (type.includes('int')) return 'BIGINT'
+      if (type.includes('varchar') || type.includes('char') || type.includes('text')) return 'STRING'
+      if (type.includes('decimal') || type.includes('numeric')) return 'DECIMAL(38,10)'
+      if (type.includes('float') || type.includes('double')) return 'DOUBLE'
+      if (type.includes('date') && !type.includes('time')) return 'DATE'
+      if (type.includes('time') || type.includes('timestamp')) return 'TIMESTAMP'
+      if (type.includes('bool')) return 'BOOLEAN'
+      return 'STRING'
+    }
+
+    // Doris/StarRocks 类型
+    if (target === 'doris' || target === 'starrocks') {
+      if (type.includes('bigint')) return 'BIGINT'
+      if (type.includes('int')) return 'INT'
+      if (type.includes('varchar')) return 'VARCHAR(65533)'
+      if (type.includes('char') || type.includes('text')) return 'STRING'
+      if (type.includes('decimal') || type.includes('numeric')) return 'DECIMAL(38,10)'
+      if (type.includes('float')) return 'FLOAT'
+      if (type.includes('double')) return 'DOUBLE'
+      if (type.includes('date') && !type.includes('time')) return 'DATE'
+      if (type.includes('time') || type.includes('timestamp')) return 'DATETIME'
+      if (type.includes('bool')) return 'BOOLEAN'
+      return 'STRING'
+    }
+
+    // MySQL 类型（默认）
+    if (type.includes('int')) return 'BIGINT'
+    if (type.includes('varchar')) return type.toUpperCase()
+    if (type.includes('char') || type.includes('text')) return 'TEXT'
+    if (type.includes('decimal') || type.includes('numeric')) return 'DECIMAL(38,10)'
+    if (type.includes('float') || type.includes('double')) return 'DOUBLE'
+    if (type.includes('date') && !type.includes('time')) return 'DATE'
+    if (type.includes('time') || type.includes('timestamp')) return 'DATETIME'
+    if (type.includes('bool')) return 'TINYINT(1)'
+    return sourceType
+  }
+
+  // 添加新字段（目标表新增字段）
+  const handleAddTargetColumn = () => {
+    const newMapping: ColumnMapping = {
+      sourceColumn: '',
+      sourceType: '-',
+      targetColumn: `new_column_${columnMappings.length + 1}`,
+      targetType: 'STRING',
+    }
+    setColumnMappings([...columnMappings, newMapping])
+  }
+
+  // 删除字段映射
+  const handleDeleteColumnMapping = (index: number) => {
+    setColumnMappings((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  // 更新目标字段名
+  const handleUpdateTargetColumn = (index: number, newName: string) => {
+    setColumnMappings((prev) =>
+      prev.map((m, i) => (i === index ? { ...m, targetColumn: newName } : m))
+    )
+  }
+
+  // 更新目标字段类型
+  const handleUpdateTargetType = (index: number, newType: string) => {
+    setColumnMappings((prev) =>
+      prev.map((m, i) => (i === index ? { ...m, targetType: newType } : m))
+    )
+  }
+
+  // 保存字段映射并重新生成 DDL
+  const handleSaveColumnMapping = async () => {
+    if (!columnMappingTable || !sourceDsId) return
+
+    // 1. 保存到数据库
+    try {
+      await syncApi.saveColumnMappings({
+        source_datasource_id: sourceDsId,
+        source_table: columnMappingTable.tableName,
+        target_table: columnMappingTable.targetTableName,
+        mappings: columnMappings.map((m) => ({
+          source_column: m.sourceColumn,
+          source_type: m.sourceType,
+          target_column: m.targetColumn,
+          target_type: m.targetType,
+          is_new_column: !m.sourceColumn || m.sourceColumn === '',
+        })),
+      })
+    } catch (error: any) {
+      console.error('保存映射到数据库失败:', error)
+      message.warning('映射保存到本地，但未能持久化到数据库')
+    }
+
+    // 2. 将映射保存到 selectedTables（内存）
+    setSelectedTables((prev) =>
+      prev.map((item) =>
+        item.tableName === columnMappingTable.tableName
+          ? { ...item, columnMappings }
+          : item
+      )
+    )
+
+    // 3. 根据映射重新生成 DDL
+    const targetTable = columnMappingTable.targetTableName
+    const columns = columnMappings
+      .filter((m) => m.targetColumn) // 过滤掉空的目标字段
+      .map((m) => `  ${m.targetColumn} ${m.targetType}`)
+      .join(',\n')
+    const newDdl = `CREATE TABLE IF NOT EXISTS ${targetTable} (\n${columns}\n);`
+
+    setSelectedTables((prev) =>
+      prev.map((item) =>
+        item.tableName === columnMappingTable.tableName
+          ? { ...item, ddl: newDdl, ddlStatus: 'success' as const }
+          : item
+      )
+    )
+
+    setColumnMappingVisible(false)
+    message.success('字段映射已保存并更新 DDL')
   }
 
   // 重新生成单个表的 DDL
@@ -930,8 +1174,9 @@ export default function DataSync() {
       await syncApi.delete(task.id)
       message.success('任务和数仓表已删除')
       loadSyncTasks()
-    } catch (error) {
-      message.error('删除失败')
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || '删除失败'
+      message.error(detail)
     }
   }
 
@@ -941,6 +1186,7 @@ export default function DataSync() {
     setBatchDeleting(true)
     let success = 0
     let fail = 0
+    const errors: string[] = []
 
     const tasksToDelete = syncTasks.filter((t) => selectedTaskIds.includes(t.id))
 
@@ -950,8 +1196,12 @@ export default function DataSync() {
         await syncApi.executeDdlOnWarehouse(dropDdl)
         await syncApi.delete(task.id)
         success++
-      } catch (error) {
+      } catch (error: any) {
         fail++
+        const detail = error.response?.data?.detail
+        if (detail && !errors.includes(detail)) {
+          errors.push(detail)
+        }
       }
     }
 
@@ -960,6 +1210,8 @@ export default function DataSync() {
 
     if (fail === 0) {
       message.success(`已删除 ${success} 个任务`)
+    } else if (errors.length > 0) {
+      message.warning(`成功 ${success} 个，失败 ${fail} 个：${errors.join('; ')}`)
     } else {
       message.warning(`成功 ${success} 个，失败 ${fail} 个`)
     }
@@ -983,7 +1235,7 @@ export default function DataSync() {
   }
 
   // AI 生成 DDL（使用 sync API，会自动读取系统数仓配置）
-  const [currentDdlTaskId, setCurrentDdlTaskId] = useState<number | null>(null)
+  const [, setCurrentDdlTaskId] = useState<number | null>(null)
 
   const handleShowDdl = async (task: SyncTaskItem) => {
     setCurrentDdlTable(task.source_table)
@@ -1021,83 +1273,6 @@ export default function DataSync() {
       setExecuting(false)
     }
   }
-
-  // 打开配置弹窗
-  const handleOpenConfig = async (task: SyncTaskItem) => {
-    setConfigTask(task)
-    setConfigModalVisible(true)
-    setLoadingColumns(true)
-
-    configForm.setFieldsValue({
-      syncMode: task.sync_mode,
-      whereCondition: '',
-      incrementalColumn: '',
-      cronExpression: task.cron_expression || '0 2 * * *',
-      isScheduled: task.is_scheduled,
-    })
-
-    try {
-      const res = await syncApi.getTableColumns(task.source_datasource_id, task.source_table)
-      setTableColumns(res.data)
-      configForm.setFieldsValue({
-        selectedColumns: res.data.map((c: ColumnInfo) => c.name),
-      })
-    } catch (error) {
-      message.error('获取表字段失败')
-      setTableColumns([])
-    } finally {
-      setLoadingColumns(false)
-    }
-  }
-
-  // 保存配置
-  const handleSaveConfig = async () => {
-    if (!configTask) return
-
-    try {
-      const values = await configForm.validateFields()
-      setSavingConfig(true)
-
-      await syncApi.update(configTask.id, {
-        sync_mode: values.syncMode,
-        incremental_column: values.incrementalColumn || null,
-        where_condition: values.whereCondition || null,
-        selected_columns: values.selectedColumns,
-        cron_expression: values.cronExpression,
-        is_scheduled: values.isScheduled,
-      })
-
-      // 如果开启了调度，生成 DAG
-      if (values.isScheduled) {
-        try {
-          const dagRes = await syncApi.generateDag(configTask.id)
-          message.success(`配置已保存，DAG 已生成: ${dagRes.data.dag_id}`)
-        } catch (dagError: any) {
-          message.warning(`配置已保存，但 DAG 生成失败: ${dagError.response?.data?.detail || '未知错误'}`)
-        }
-      } else {
-        message.success('配置保存成功')
-      }
-
-      loadSyncTasks()
-      setConfigModalVisible(false)
-    } catch (error: any) {
-      if (error.errorFields) return
-      message.error(error.response?.data?.detail || '保存配置失败')
-    } finally {
-      setSavingConfig(false)
-    }
-  }
-
-  // Cron 预设
-  const cronPresets = [
-    { label: '每天凌晨2点', value: '0 2 * * *' },
-    { label: '每天早上6点', value: '0 6 * * *' },
-    { label: '每小时', value: '0 * * * *' },
-    { label: '每6小时', value: '0 */6 * * *' },
-    { label: '每周一凌晨3点', value: '0 3 * * 1' },
-    { label: '每月1号凌晨1点', value: '0 1 1 * *' },
-  ]
 
   const sourceDs = datasources.find((d) => d.id === sourceDsId)
   const availableTables = sourceTables.filter(
@@ -1205,19 +1380,6 @@ export default function DataSync() {
       },
     },
     {
-      title: '调度',
-      key: 'schedule',
-      width: 120,
-      render: (_: any, record: SyncTaskItem) =>
-        record.is_scheduled ? (
-          <Tooltip title={`Cron: ${record.cron_expression}`}>
-            <Tag icon={<ScheduleOutlined />} color="purple">已启用</Tag>
-          </Tooltip>
-        ) : (
-          <Tag>未启用</Tag>
-        ),
-    },
-    {
       title: '上次同步',
       key: 'last_sync',
       width: 150,
@@ -1234,7 +1396,7 @@ export default function DataSync() {
     {
       title: '操作',
       key: 'actions',
-      width: 200,
+      width: 220,
       render: (_: any, record: SyncTaskItem) => (
         <Space>
           <Tooltip title="执行同步">
@@ -1253,17 +1415,17 @@ export default function DataSync() {
               onClick={() => handleShowDdl(record)}
             />
           </Tooltip>
-          <Tooltip title="配置">
-            <Button
-              type="text"
-              size="small"
-              icon={<SettingOutlined />}
-              onClick={() => handleOpenConfig(record)}
-            />
-          </Tooltip>
-          <Popconfirm title="删除任务并DROP数仓表？" onConfirm={() => handleDeleteTask(record)}>
-            <Button type="text" size="small" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
+          {!record.is_scheduled && (
+            <Tooltip title="删除">
+              <Button
+                type="text"
+                size="small"
+                danger
+                icon={<DeleteOutlined />}
+                onClick={() => handleDeleteTask(record)}
+              />
+            </Tooltip>
+          )}
         </Space>
       ),
     },
@@ -1286,16 +1448,24 @@ export default function DataSync() {
           )}
         </Space>
         <Space>
-          {selectedTaskIds.length > 0 && (
-            <Popconfirm
-              title={`确定删除 ${selectedTaskIds.length} 个任务及数仓表？`}
-              onConfirm={handleBatchDelete}
-            >
-              <Button danger icon={<DeleteOutlined />} loading={batchDeleting}>
-                删除 ({selectedTaskIds.length})
-              </Button>
-            </Popconfirm>
-          )}
+          {selectedTaskIds.length > 0 && (() => {
+            const selectedTasks = syncTasks.filter((t) => selectedTaskIds.includes(t.id))
+            const deletableCount = selectedTasks.filter((t) => !t.is_scheduled).length
+            return (
+              <>
+                {deletableCount > 0 && (
+                  <Button danger icon={<DeleteOutlined />} loading={batchDeleting} onClick={handleBatchDelete}>
+                    批量删除 ({deletableCount})
+                  </Button>
+                )}
+                {deletableCount < selectedTaskIds.length && (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    已上线任务需先在「调度管理」下线后才能删除
+                  </Text>
+                )}
+              </>
+            )
+          })()}
           <Button icon={<ReloadOutlined />} onClick={loadSyncTasks}>
             刷新
           </Button>
@@ -1726,6 +1896,21 @@ export default function DataSync() {
                         </Tag>
                       </Tooltip>
                     )}
+                    {/* 字段映射按钮（创建前可用） */}
+                    {item.ddlStatus === 'success' && !tasksCreated && (
+                      <Tooltip title="字段映射">
+                        <Button
+                          type="text"
+                          size="small"
+                          style={{ padding: '0 4px' }}
+                          icon={<SettingOutlined style={{ color: '#1890ff', fontSize: 13 }} />}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleOpenColumnMapping(item)
+                          }}
+                        />
+                      </Tooltip>
+                    )}
                     {/* 查看 DDL 按钮（创建前可编辑） */}
                     {item.ddlStatus === 'success' && !tasksCreated && (
                       <Tooltip title="查看/编辑 DDL">
@@ -2154,194 +2339,168 @@ export default function DataSync() {
         )}
       </Modal>
 
-      {/* 配置弹窗 */}
+      {/* 字段映射弹窗 */}
       <Modal
-        title={<span style={{ fontSize: 14 }}><SettingOutlined /> 配置 - {configTask?.source_table}</span>}
-        open={configModalVisible}
-        onCancel={() => setConfigModalVisible(false)}
-        width={750}
-        styles={{ header: { padding: '10px 16px' }, body: { padding: '12px 16px' } }}
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <SettingOutlined style={{ color: '#1890ff' }} />
+            <span>字段映射</span>
+            {columnMappingTable && (
+              <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>
+                {columnMappingTable.tableName} → {columnMappingTable.targetTableName}
+              </Tag>
+            )}
+          </div>
+        }
+        open={columnMappingVisible}
+        onCancel={() => setColumnMappingVisible(false)}
+        width={780}
         footer={[
-          <Button key="cancel" size="small" onClick={() => setConfigModalVisible(false)}>
+          <Button key="add" size="small" icon={<PlusOutlined />} onClick={handleAddTargetColumn}>
+            添加字段
+          </Button>,
+          <Button key="cancel" size="small" onClick={() => setColumnMappingVisible(false)}>
             取消
           </Button>,
           <Button
             key="save"
             type="primary"
             size="small"
-            icon={<ScheduleOutlined />}
-            onClick={handleSaveConfig}
-            loading={savingConfig}
+            onClick={handleSaveColumnMapping}
+            disabled={loadingColumns}
           >
-            保存
+            保存并更新 DDL
           </Button>,
         ]}
       >
+        {/* 源库和目标库类型信息 */}
+        <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+          <Tag color="cyan">{sourceDs?.type || '源库'}</Tag>
+          <RightOutlined style={{ fontSize: 10, color: '#999' }} />
+          <Tag color="gold">{warehouseConfig?.type || '目标库'}</Tag>
+          <span style={{ color: '#999', marginLeft: 8 }}>
+            {sourceDs?.type?.toLowerCase() === warehouseConfig?.type?.toLowerCase()
+              ? '类型相同，字段直接复制'
+              : '类型不同，智能转换'}
+          </span>
+        </div>
+
         {loadingColumns ? (
-          <div style={{ textAlign: 'center', padding: 50 }}>
-            <Spin tip="加载字段信息..." />
+          <div style={{ textAlign: 'center', padding: 40 }}>
+            <Spin size="small" tip="加载字段信息..." />
           </div>
         ) : (
-          <Form form={configForm} layout="vertical">
-            {/* 同步模式 */}
-            <Form.Item
-              name="syncMode"
-              label={<Space><SyncOutlined />同步模式</Space>}
-              rules={[{ required: true }]}
-            >
-              <Radio.Group>
-                <Radio.Button value="full">全量同步</Radio.Button>
-                <Radio.Button value="incremental">增量同步</Radio.Button>
-              </Radio.Group>
-            </Form.Item>
-
-            {/* 增量字段 */}
-            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.syncMode !== cur.syncMode}>
-              {({ getFieldValue }) =>
-                getFieldValue('syncMode') === 'incremental' ? (
-                  <Form.Item
-                    name="incrementalColumn"
-                    label={<Space><FieldTimeOutlined />增量字段</Space>}
-                    rules={[{ required: true, message: '增量模式必须选择增量字段' }]}
-                    tooltip="选择用于判断数据更新的时间戳或自增ID字段"
-                  >
-                    <Select
-                      placeholder="选择增量字段"
-                      options={tableColumns.map((c) => ({
-                        value: c.name,
-                        label: (
-                          <Space>
-                            <span>{c.name}</span>
-                            <Tag style={{ fontSize: 10 }}>{c.data_type}</Tag>
-                          </Space>
-                        ),
-                      }))}
+          <div style={{ maxHeight: 420, overflow: 'auto' }}>
+            <Table
+              dataSource={columnMappings}
+              rowKey={(record, index) => `${record.sourceColumn}_${index}`}
+              size="small"
+              pagination={false}
+              locale={{ emptyText: '暂无字段数据' }}
+              columns={[
+                {
+                  title: '源字段',
+                  dataIndex: 'sourceColumn',
+                  key: 'sourceColumn',
+                  width: 130,
+                  render: (text: string) => (
+                    text ? (
+                      <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text}</span>
+                    ) : (
+                      <span style={{ color: '#999', fontSize: 11 }}>新增字段</span>
+                    )
+                  ),
+                },
+                {
+                  title: '源类型',
+                  dataIndex: 'sourceType',
+                  key: 'sourceType',
+                  width: 100,
+                  render: (text: string) => (
+                    text && text !== '-' ? (
+                      <Tag style={{ margin: 0, fontSize: 10 }}>{text}</Tag>
+                    ) : (
+                      <span style={{ color: '#999', fontSize: 11 }}>-</span>
+                    )
+                  ),
+                },
+                {
+                  title: '',
+                  key: 'arrow',
+                  width: 36,
+                  align: 'center' as const,
+                  render: () => (
+                    <RightOutlined style={{ fontSize: 11, color: '#1890ff' }} />
+                  ),
+                },
+                {
+                  title: '目标字段',
+                  dataIndex: 'targetColumn',
+                  key: 'targetColumn',
+                  width: 130,
+                  render: (text: string, _: any, index: number) => (
+                    <Input
+                      size="small"
+                      value={text}
+                      onChange={(e) => handleUpdateTargetColumn(index, e.target.value)}
+                      style={{ fontFamily: 'monospace', fontSize: 12 }}
                     />
-                  </Form.Item>
-                ) : null
-              }
-            </Form.Item>
-
-            {/* 过滤条件 */}
-            <Form.Item
-              name="whereCondition"
-              label={<Space><FilterOutlined />过滤条件（可选）</Space>}
-              tooltip="SQL WHERE 子句，不需要包含 WHERE 关键字"
-            >
-              <Input.TextArea
-                placeholder="例如: status = 1 AND create_time > '2024-01-01'"
-                rows={2}
-              />
-            </Form.Item>
-
-            {/* 字段选择 */}
-            <Form.Item
-              label={<Space><TableOutlined />选择字段</Space>}
-            >
-              <div style={{ marginBottom: 8 }}>
-                <Button
-                  size="small"
-                  type="link"
-                  onClick={() => configForm.setFieldsValue({
-                    selectedColumns: tableColumns.map((c) => c.name),
-                  })}
-                >
-                  全选
-                </Button>
-                <Button
-                  size="small"
-                  type="link"
-                  onClick={() => configForm.setFieldsValue({ selectedColumns: [] })}
-                >
-                  清空
-                </Button>
-                <Text type="secondary" style={{ marginLeft: 16, fontSize: 12 }}>
-                  共 {tableColumns.length} 个字段
-                </Text>
-              </div>
-            </Form.Item>
-            <Form.Item
-              name="selectedColumns"
-              rules={[{ required: true, message: '请至少选择一个字段' }]}
-              style={{ marginTop: -16 }}
-            >
-              <Checkbox.Group style={{ width: '100%' }}>
-                <div style={{
-                  maxHeight: 200,
-                  overflow: 'auto',
-                  border: '1px solid #d9d9d9',
-                  borderRadius: 6,
-                  padding: 12,
-                }}>
-                  {tableColumns.map((col) => (
-                    <div
-                      key={col.name}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        padding: '6px 0',
-                        borderBottom: '1px solid #f5f5f5',
-                      }}
-                    >
-                      <Checkbox value={col.name} style={{ marginRight: 12 }} />
-                      <span style={{ flex: 1, minWidth: 150 }}>{col.name}</span>
-                      <Tag style={{ fontSize: 10, minWidth: 80 }}>{col.data_type}</Tag>
-                      {col.is_primary_key && <Tag color="gold" style={{ marginLeft: 4 }}>PK</Tag>}
-                      {!col.is_nullable && <Tag color="red" style={{ marginLeft: 4 }}>非空</Tag>}
-                    </div>
-                  ))}
-                </div>
-              </Checkbox.Group>
-            </Form.Item>
-
-            {/* 调度设置 */}
-            <Alert
-              message="调度设置"
-              description="配置定时任务将自动生成 Airflow DAG"
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
+                  ),
+                },
+                {
+                  title: '目标类型',
+                  dataIndex: 'targetType',
+                  key: 'targetType',
+                  width: 140,
+                  render: (text: string, _: any, index: number) => (
+                    <Select
+                      size="small"
+                      value={text}
+                      onChange={(v) => handleUpdateTargetType(index, v)}
+                      style={{ width: '100%', fontSize: 12 }}
+                      options={[
+                        { value: 'STRING', label: 'STRING' },
+                        { value: 'VARCHAR(255)', label: 'VARCHAR(255)' },
+                        { value: 'VARCHAR(65533)', label: 'VARCHAR(65533)' },
+                        { value: 'TEXT', label: 'TEXT' },
+                        { value: 'BIGINT', label: 'BIGINT' },
+                        { value: 'INT', label: 'INT' },
+                        { value: 'SMALLINT', label: 'SMALLINT' },
+                        { value: 'TINYINT', label: 'TINYINT' },
+                        { value: 'DOUBLE', label: 'DOUBLE' },
+                        { value: 'FLOAT', label: 'FLOAT' },
+                        { value: 'DECIMAL(38,10)', label: 'DECIMAL(38,10)' },
+                        { value: 'DECIMAL(18,2)', label: 'DECIMAL(18,2)' },
+                        { value: 'DATE', label: 'DATE' },
+                        { value: 'DATETIME', label: 'DATETIME' },
+                        { value: 'TIMESTAMP', label: 'TIMESTAMP' },
+                        { value: 'BOOLEAN', label: 'BOOLEAN' },
+                      ]}
+                    />
+                  ),
+                },
+                {
+                  title: '',
+                  key: 'action',
+                  width: 40,
+                  render: (_: any, __: any, index: number) => (
+                    <Tooltip title="删除">
+                      <Button
+                        type="text"
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined style={{ fontSize: 12 }} />}
+                        onClick={() => handleDeleteColumnMapping(index)}
+                      />
+                    </Tooltip>
+                  ),
+                },
+              ]}
             />
-
-            <Form.Item
-              name="isScheduled"
-              valuePropName="checked"
-              label={<Space><ScheduleOutlined />启用定时调度</Space>}
-            >
-              <Checkbox>开启后将生成 Airflow DAG 进行定时同步</Checkbox>
-            </Form.Item>
-
-            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.isScheduled !== cur.isScheduled}>
-              {({ getFieldValue }) =>
-                getFieldValue('isScheduled') ? (
-                  <Form.Item
-                    name="cronExpression"
-                    label="Cron 表达式"
-                    rules={[{ required: true, message: '请输入 Cron 表达式' }]}
-                    tooltip="标准 5 位 Cron 表达式: 分 时 日 月 周"
-                  >
-                    <Space direction="vertical" style={{ width: '100%' }}>
-                      <Input placeholder="0 2 * * *" />
-                      <Space wrap>
-                        {cronPresets.map((p) => (
-                          <Tag
-                            key={p.value}
-                            color="blue"
-                            style={{ cursor: 'pointer' }}
-                            onClick={() => configForm.setFieldsValue({ cronExpression: p.value })}
-                          >
-                            {p.label}
-                          </Tag>
-                        ))}
-                      </Space>
-                    </Space>
-                  </Form.Item>
-                ) : null
-              }
-            </Form.Item>
-          </Form>
+          </div>
         )}
       </Modal>
+
     </div>
   )
 }

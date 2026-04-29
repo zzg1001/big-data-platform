@@ -119,3 +119,42 @@ class AIFixDDLResponse(BaseModel):
     fixed_ddl: str
     explanation: str
     changes: List[str] = []
+
+
+class AIGenerateCronRequest(BaseModel):
+    """Schema for AI cron generation request."""
+    description: str = Field(..., min_length=1, max_length=500)
+
+
+class AIGenerateCronResponse(BaseModel):
+    """Schema for AI cron generation response."""
+    cron_expression: str
+    explanation: str
+    next_runs: List[str] = []  # ISO format datetime strings
+
+
+class ColumnTypeInfo(BaseModel):
+    """Schema for column type info."""
+    name: str
+    data_type: str
+
+
+class AIConvertColumnTypesRequest(BaseModel):
+    """Schema for AI column type conversion request."""
+    columns: List[ColumnTypeInfo]
+    source_db_type: str
+    target_db_type: str
+
+
+class ColumnTypeMapping(BaseModel):
+    """Schema for column type mapping result."""
+    source_column: str
+    source_type: str
+    target_column: str
+    target_type: str
+
+
+class AIConvertColumnTypesResponse(BaseModel):
+    """Schema for AI column type conversion response."""
+    mappings: List[ColumnTypeMapping]
+    explanation: Optional[str] = None

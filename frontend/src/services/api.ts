@@ -32,6 +32,23 @@ api.interceptors.response.use(
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true
 
+      // Check if it's a session expiration
+      const detail = error.response?.data?.detail
+      if (detail === 'Session expired, please login again') {
+        // Session expired, clear local state and redirect to login
+        const { useAuthStore } = await import('../stores/authStore')
+        // Clear local state without calling server logout (session already expired)
+        delete api.defaults.headers.common['Authorization']
+        useAuthStore.setState({
+          user: null,
+          accessToken: null,
+          refreshToken: null,
+          isAuthenticated: false,
+        })
+        window.location.href = '/login'
+        return Promise.reject(error)
+      }
+
       try {
         const { useAuthStore } = await import('../stores/authStore')
         await useAuthStore.getState().refreshAccessToken()
@@ -41,9 +58,15 @@ api.interceptors.response.use(
         originalRequest.headers['Authorization'] = `Bearer ${token}`
         return api(originalRequest)
       } catch {
-        // Refresh failed, logout user
+        // Refresh failed, clear local state and redirect to login
         const { useAuthStore } = await import('../stores/authStore')
-        useAuthStore.getState().logout()
+        delete api.defaults.headers.common['Authorization']
+        useAuthStore.setState({
+          user: null,
+          accessToken: null,
+          refreshToken: null,
+          isAuthenticated: false,
+        })
         window.location.href = '/login'
       }
     }
@@ -137,6 +160,13 @@ export const aiApi = {
     api.post('/api/v1/ai/execute-ddl', data),
   fixDdl: (data: { ddl: string; error: string; target_db_type: string }) =>
     api.post('/api/v1/ai/fix-ddl', data),
+  generateCron: (data: { description: string }) =>
+    api.post('/api/v1/ai/generate-cron', data),
+  convertColumnTypes: (data: {
+    columns: { name: string; data_type: string }[]
+    source_db_type: string
+    target_db_type: string
+  }) => api.post('/api/v1/ai/convert-column-types', data),
 }
 
 export const lineageApi = {
@@ -205,4 +235,43 @@ export const syncApi = {
     target_table?: string
     target_schema?: string
   }) => api.post('/api/v1/sync/generate-ddl-preview', data),
+  // 字段映射
+  saveColumnMappings: (data: {
+    source_datasource_id: number
+    source_table: string
+    target_table: string
+    mappings: { source_column: string; source_type: string; target_column: string; target_type: string; is_new_column?: boolean }[]
+    sync_task_id?: number
+  }) => api.post('/api/v1/sync/column-mappings', data),
+  getColumnMappings: (sourceDatasourceId: number, sourceTable: string, targetTable: string) =>
+    api.get('/api/v1/sync/column-mappings', {
+      params: { source_datasource_id: sourceDatasourceId, source_table: sourceTable, target_table: targetTable },
+    }),
+  deleteColumnMappings: (sourceDatasourceId: number, sourceTable: string, targetTable: string) =>
+    api.delete('/api/v1/sync/column-mappings', {
+      params: { source_datasource_id: sourceDatasourceId, source_table: sourceTable, target_table: targetTable },
+    }),
+}
+
+// 调度管理 API (独立实体，封装 sync task)
+export const syncScheduleApi = {
+  // 调度列表
+  list: (enabledFilter?: string) =>
+    api.get('/api/v1/sync-schedules/', { params: { enabled_filter: enabledFilter } }),
+  // 获取可调度的任务（未创建调度的同步任务）
+  getAvailableTasks: () => api.get('/api/v1/sync-schedules/available-tasks'),
+  // 创建调度
+  create: (data: { name: string; description?: string; sync_task_id: number; cron_expression: string }) =>
+    api.post('/api/v1/sync-schedules/', data),
+  // 获取单个调度
+  get: (id: number) => api.get(`/api/v1/sync-schedules/${id}`),
+  // 更新调度
+  update: (id: number, data: { name?: string; description?: string; cron_expression?: string }) =>
+    api.put(`/api/v1/sync-schedules/${id}`, data),
+  // 删除调度
+  delete: (id: number) => api.delete(`/api/v1/sync-schedules/${id}`),
+  // 上线调度（生成 DAG 并激活）
+  enable: (id: number) => api.post(`/api/v1/sync-schedules/${id}/enable`),
+  // 下线调度（暂停 DAG）
+  disable: (id: number) => api.post(`/api/v1/sync-schedules/${id}/disable`),
 }

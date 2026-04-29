@@ -4,6 +4,7 @@ Data sync API endpoints.
 from typing import List
 from datetime import datetime
 import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy import select
@@ -13,7 +14,7 @@ from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.datasource import DataSource
-from app.models.sync_task import SyncTask, SyncLog, SyncStatus, SyncMode
+from app.models.sync_task import SyncTask, SyncLog, SyncStatus, SyncMode, ColumnMapping
 from app.schemas.sync_task import (
     SyncTaskCreate,
     SyncTaskUpdate,
@@ -21,10 +22,17 @@ from app.schemas.sync_task import (
     SyncLogResponse,
     SyncPreviewRequest,
     SyncPreviewResponse,
+    SyncTaskEnableRequest,
+    SyncTaskSchedulerView,
+    SyncTaskBackfillRequest,
+    ColumnMappingSaveRequest,
+    ColumnMappingListResponse,
+    ColumnMappingItem,
 )
 from app.services.db_connector import DatabaseConnector
 from app.services.sync_service import SyncService
 from app.services.ai_assistant import AIAssistant
+from app.services.airflow_service import airflow_service
 from app.schemas.ai import AIDDLConvertResponse, DDLTypeMapping
 from app.core.config import settings
 from app.core.security import decrypt_password
@@ -217,8 +225,20 @@ async def delete_sync_task(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a sync task and its logs."""
+    """Delete a sync task, its logs, and the Airflow DAG file."""
     from sqlalchemy.orm import selectinload
+    from app.models.sync_schedule import SyncSchedule
+
+    # Check if any schedule references this task
+    schedule_result = await db.execute(
+        select(SyncSchedule).where(SyncSchedule.sync_task_id == task_id)
+    )
+    schedule = schedule_result.scalar_one_or_none()
+    if schedule:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"无法删除：此同步任务已被调度任务 '{schedule.name}' 引用，请先删除调度任务"
+        )
 
     # 使用 selectinload 预加载 logs，以便级联删除
     result = await db.execute(
@@ -229,6 +249,16 @@ async def delete_sync_task(
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
+
+    # 删除 Airflow DAG 文件
+    dag_id = f"sync_{task.id}_{task.source_table.replace('.', '_')}"
+    dag_path = os.path.join(settings.AIRFLOW_DAGS_PATH or '/opt/airflow/dags/generated', f'{dag_id}.py')
+    if os.path.exists(dag_path):
+        try:
+            os.remove(dag_path)
+        except Exception as e:
+            # 记录错误但不阻止删除任务
+            print(f"Warning: Failed to delete DAG file {dag_path}: {e}")
 
     await db.delete(task)
     await db.flush()
@@ -509,6 +539,7 @@ with DAG(
     schedule_interval='{schedule}',
     start_date=datetime(2024, 1, 1),
     catchup=False,
+    is_paused_upon_creation=False,
     tags=['data_sync', 'auto_generated'],
 ) as dag:
 
@@ -715,9 +746,13 @@ async def execute_ddl_on_warehouse(
     except HTTPException:
         raise
     except Exception as e:
+        import logging
+        import traceback
+        error_detail = traceback.format_exc()
+        logging.error(f"DDL 执行失败: {type(e).__name__}: {str(e)}\nDDL: {request.ddl[:300]}\nTraceback: {error_detail}")
         return {
             "success": False,
-            "message": f"DDL 执行失败: {str(e)}",
+            "message": f"DDL 执行失败: {type(e).__name__}: {str(e) or '未知错误'}",
             "table_name": None,
         }
 
@@ -759,7 +794,10 @@ async def generate_ddl_preview(
         columns_ddl = []
         type_mappings = []
         for col in metadata.columns:
-            col_def = f"  {col.name} {col.data_type}"
+            # 清理数据类型中的 COLLATE 子句
+            import re
+            clean_data_type = re.sub(r'\s+COLLATE\s+["\']?\w+["\']?', '', col.data_type, flags=re.IGNORECASE)
+            col_def = f"  {col.name} {clean_data_type}"
             if not col.is_nullable:
                 col_def += " NOT NULL"
             if col.default_value:
@@ -771,8 +809,8 @@ async def generate_ddl_preview(
             # Record type mapping
             type_mappings.append(DDLTypeMapping(
                 column_name=col.name,
-                source_type=col.data_type,
-                target_type=col.data_type,  # Same type if no conversion
+                source_type=clean_data_type,
+                target_type=clean_data_type,  # Same type if no conversion
                 warning=None,
             ))
 
@@ -827,3 +865,467 @@ async def generate_ddl_preview(
         raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ==================== Column Mapping Endpoints ====================
+
+@router.post("/column-mappings", response_model=dict)
+async def save_column_mappings(
+    request: ColumnMappingSaveRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save column mappings for a source-target table pair."""
+    from sqlalchemy import delete
+
+    # Delete existing mappings for this source-target pair
+    await db.execute(
+        delete(ColumnMapping).where(
+            ColumnMapping.source_datasource_id == request.source_datasource_id,
+            ColumnMapping.source_table == request.source_table,
+            ColumnMapping.target_table == request.target_table,
+        )
+    )
+
+    # Insert new mappings
+    for idx, mapping in enumerate(request.mappings):
+        cm = ColumnMapping(
+            sync_task_id=request.sync_task_id,
+            source_datasource_id=request.source_datasource_id,
+            source_table=request.source_table,
+            target_table=request.target_table,
+            source_column=mapping.source_column,
+            source_type=mapping.source_type,
+            target_column=mapping.target_column,
+            target_type=mapping.target_type,
+            sort_order=idx,
+            is_new_column=mapping.is_new_column,
+        )
+        db.add(cm)
+
+    await db.flush()
+
+    return {
+        "success": True,
+        "message": f"保存了 {len(request.mappings)} 个字段映射",
+        "count": len(request.mappings),
+    }
+
+
+@router.get("/column-mappings", response_model=ColumnMappingListResponse)
+async def get_column_mappings(
+    source_datasource_id: int,
+    source_table: str,
+    target_table: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get saved column mappings for a source-target table pair."""
+    result = await db.execute(
+        select(ColumnMapping)
+        .where(
+            ColumnMapping.source_datasource_id == source_datasource_id,
+            ColumnMapping.source_table == source_table,
+            ColumnMapping.target_table == target_table,
+        )
+        .order_by(ColumnMapping.sort_order)
+    )
+    mappings = result.scalars().all()
+
+    return ColumnMappingListResponse(
+        source_table=source_table,
+        target_table=target_table,
+        mappings=[
+            ColumnMappingItem(
+                source_column=m.source_column,
+                source_type=m.source_type,
+                target_column=m.target_column,
+                target_type=m.target_type,
+                is_new_column=m.is_new_column,
+            )
+            for m in mappings
+        ],
+    )
+
+
+@router.delete("/column-mappings", response_model=dict)
+async def delete_column_mappings(
+    source_datasource_id: int,
+    source_table: str,
+    target_table: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete column mappings for a source-target table pair."""
+    from sqlalchemy import delete
+
+    result = await db.execute(
+        delete(ColumnMapping).where(
+            ColumnMapping.source_datasource_id == source_datasource_id,
+            ColumnMapping.source_table == source_table,
+            ColumnMapping.target_table == target_table,
+        )
+    )
+    await db.flush()
+
+    return {
+        "success": True,
+        "deleted_count": result.rowcount,
+    }
+
+
+# ==================== Scheduler Management Endpoints ====================
+
+@router.get("/scheduler/list", response_model=List[SyncTaskSchedulerView])
+async def list_sync_tasks_for_scheduler(
+    status_filter: str = None,  # "online" | "offline" | None (all)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List sync tasks for scheduler management view.
+    Includes creator name from joined User table.
+    """
+    from app.models.user import User as UserModel
+
+    query = select(SyncTask, UserModel.username).outerjoin(
+        UserModel, SyncTask.created_by == UserModel.id
+    )
+
+    if status_filter == "online":
+        query = query.where(SyncTask.is_scheduled == True)
+    elif status_filter == "offline":
+        query = query.where(SyncTask.is_scheduled == False)
+
+    query = query.order_by(SyncTask.created_at.desc())
+    result = await db.execute(query)
+    rows = result.all()
+
+    tasks = []
+    for task, creator_name in rows:
+        task_dict = {
+            "id": task.id,
+            "name": task.name,
+            "description": task.description,
+            "source_datasource_id": task.source_datasource_id,
+            "source_table": task.source_table,
+            "target_table": task.target_table,
+            "sync_mode": task.sync_mode,
+            "is_scheduled": task.is_scheduled,
+            "cron_expression": task.cron_expression,
+            "dag_id": task.dag_id,
+            "airflow_status": task.airflow_status,
+            "next_run_time": task.next_run_time,
+            "status": task.status,
+            "last_sync_at": task.last_sync_at,
+            "last_sync_rows": task.last_sync_rows,
+            "created_by": task.created_by,
+            "creator_name": creator_name,
+            "created_at": task.created_at,
+        }
+        tasks.append(task_dict)
+
+    return tasks
+
+
+@router.post("/{task_id}/enable", response_model=dict)
+async def enable_sync_task(
+    task_id: int,
+    request: SyncTaskEnableRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Enable/上线 a sync task:
+    1. Set cron_expression and is_scheduled=True
+    2. Generate DAG file
+    3. Activate DAG in Airflow
+    """
+    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
+
+    if task.is_scheduled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task is already scheduled")
+
+    # Update task with cron expression
+    task.cron_expression = request.cron_expression
+    task.is_scheduled = True
+
+    # Generate DAG ID
+    dag_id = f"sync_{task.id}_{task.source_table.replace('.', '_')}"
+    task.dag_id = dag_id
+
+    # Generate DAG file content
+    schedule = task.cron_expression
+    dag_content = f'''"""
+Auto-generated Airflow DAG for sync task: {task.name}
+Source: {task.source_table}
+Target: {task.target_table}
+"""
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+import requests
+
+default_args = {{
+    'owner': 'data_platform',
+    'depends_on_past': False,
+    'email_on_failure': True,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}}
+
+def execute_sync():
+    """Call the data platform API to execute sync."""
+    import os
+    api_url = os.environ.get('DATA_PLATFORM_API_URL', 'http://backend:8000')
+    response = requests.post(
+        f"{{api_url}}/api/v1/sync/{task.id}/execute",
+        headers={{"Authorization": "Bearer YOUR_API_TOKEN"}},
+        timeout=3600
+    )
+    response.raise_for_status()
+    return response.json()
+
+with DAG(
+    dag_id='{dag_id}',
+    default_args=default_args,
+    description='{task.description or task.name}',
+    schedule_interval='{schedule}',
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    is_paused_upon_creation=False,
+    tags=['data_sync', 'auto_generated'],
+) as dag:
+
+    sync_task = PythonOperator(
+        task_id='execute_sync',
+        python_callable=execute_sync,
+    )
+'''
+
+    # Save DAG file
+    dag_path = os.path.join(settings.AIRFLOW_DAGS_PATH or '/opt/airflow/dags/generated', f'{dag_id}.py')
+    try:
+        os.makedirs(os.path.dirname(dag_path), exist_ok=True)
+        with open(dag_path, 'w', encoding='utf-8') as f:
+            f.write(dag_content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save DAG file: {str(e)}"
+        )
+
+    # Update task status
+    task.status = SyncStatus.ACTIVE
+    task.airflow_status = "active"
+
+    await db.flush()
+
+    return {
+        "success": True,
+        "task_id": task_id,
+        "dag_id": dag_id,
+        "message": f"Task enabled successfully. DAG '{dag_id}' generated."
+    }
+
+
+@router.post("/{task_id}/disable", response_model=dict)
+async def disable_sync_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Disable/下线 a sync task:
+    1. Set is_scheduled=False
+    2. Pause DAG in Airflow (if exists)
+    """
+    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
+
+    if not task.is_scheduled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task is not scheduled")
+
+    # Pause DAG in Airflow
+    if task.dag_id:
+        await airflow_service.pause_dag(task.dag_id)
+
+    # Update task
+    task.is_scheduled = False
+    task.airflow_status = "paused"
+    task.status = SyncStatus.PAUSED
+
+    await db.flush()
+
+    return {
+        "success": True,
+        "task_id": task_id,
+        "message": "Task disabled successfully."
+    }
+
+
+@router.get("/{task_id}/airflow-status", response_model=dict)
+async def get_sync_task_airflow_status(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get real-time Airflow status for a sync task.
+    """
+    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
+
+    if not task.dag_id:
+        return {
+            "task_id": task_id,
+            "dag_id": None,
+            "status": None,
+            "next_run_time": None,
+            "recent_runs": [],
+        }
+
+    # Get status from Airflow
+    dag_status = await airflow_service.get_dag_status(task.dag_id)
+    next_run = await airflow_service.get_next_dag_run(task.dag_id)
+    recent_runs = await airflow_service.get_dag_runs(task.dag_id, limit=5)
+
+    # Update cached status in DB
+    if dag_status:
+        task.airflow_status = dag_status
+    if next_run:
+        task.next_run_time = next_run
+    await db.flush()
+
+    return {
+        "task_id": task_id,
+        "dag_id": task.dag_id,
+        "status": dag_status,
+        "next_run_time": next_run.isoformat() if next_run else None,
+        "recent_runs": [
+            {
+                "run_id": run.get("dag_run_id"),
+                "state": run.get("state"),
+                "execution_date": run.get("execution_date"),
+                "start_date": run.get("start_date"),
+                "end_date": run.get("end_date"),
+            }
+            for run in recent_runs
+        ],
+    }
+
+
+@router.post("/{task_id}/backfill", response_model=dict)
+async def backfill_sync_task(
+    task_id: int,
+    request: SyncTaskBackfillRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger backfill for a sync task.
+    Modes: full | by_partition | by_date
+    """
+    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
+
+    # Update backfill config
+    task.backfill_mode = request.mode
+    task.backfill_start_date = request.start_date
+    task.backfill_end_date = request.end_date
+
+    # For full backfill, just execute the sync
+    if request.mode == "full":
+        try:
+            source_ds = await get_datasource(db, task.source_datasource_id)
+
+            # Get target engine
+            if task.target_datasource_id:
+                target_ds = await get_datasource(db, task.target_datasource_id)
+                target_engine = get_engine_for_datasource(target_ds)
+            else:
+                target_engine = await get_warehouse_engine(db)
+
+            source_engine = get_engine_for_datasource(source_ds)
+            sync_service = SyncService(source_engine, target_engine)
+
+            # Create log entry
+            sync_log = SyncLog(
+                sync_task_id=task.id,
+                sync_mode=SyncMode.FULL,
+                status="running",
+                started_at=datetime.utcnow(),
+            )
+            db.add(sync_log)
+            await db.flush()
+
+            # Execute sync (full mode = truncate + insert)
+            rows_read, rows_written = sync_service.execute_sync(task, mode_override="full")
+
+            # Update log
+            sync_log.status = "success"
+            sync_log.rows_read = rows_read
+            sync_log.rows_written = rows_written
+            sync_log.completed_at = datetime.utcnow()
+
+            # Update task
+            task.last_sync_at = datetime.utcnow()
+            task.last_sync_rows = rows_written
+
+            await db.flush()
+
+            return {
+                "success": True,
+                "task_id": task_id,
+                "mode": request.mode,
+                "rows_read": rows_read,
+                "rows_written": rows_written,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "task_id": task_id,
+                "mode": request.mode,
+                "error": str(e),
+            }
+
+    # For partition/date backfill - trigger Airflow DAG with conf
+    elif request.mode in ["by_partition", "by_date"]:
+        if not task.dag_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Task must be scheduled before triggering backfill by partition/date"
+            )
+
+        conf = {
+            "backfill_mode": request.mode,
+            "start_date": request.start_date.isoformat() if request.start_date else None,
+            "end_date": request.end_date.isoformat() if request.end_date else None,
+            "partitions": request.partitions,
+        }
+
+        result = await airflow_service.trigger_dag(task.dag_id, conf=conf)
+        if result:
+            return {
+                "success": True,
+                "task_id": task_id,
+                "mode": request.mode,
+                "dag_run_id": result.get("dag_run_id"),
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to trigger Airflow DAG"
+            )
+
+    return {"success": False, "error": "Invalid backfill mode"}

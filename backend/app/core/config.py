@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # Session (Redis)
+    SESSION_EXPIRE_SECONDS: int = 600  # 10 minutes
+
     # OpenAI (legacy)
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4"
@@ -60,13 +63,14 @@ class Settings(BaseSettings):
     AIRFLOW_API_URL: str = "http://localhost:8080/api/v1"
     AIRFLOW_USERNAME: str = "admin"
     AIRFLOW_PASSWORD: str = "admin"
-    AIRFLOW_DAGS_PATH: str = "./airflow/dags/generated"
+    AIRFLOW_DAGS_PATH: str = "/opt/airflow/dags/generated"
 
     # CORS
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173"]
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
         case_sensitive = True
 
 

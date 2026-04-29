@@ -64,6 +64,7 @@ services:
     volumes:
       - ./backend:/app
       - uploads_data:/app/uploads
+      - ./airflow/dags:/opt/airflow/dags
     ports:
       - "8000:8000"
     depends_on:

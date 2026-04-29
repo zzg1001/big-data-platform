@@ -80,3 +80,4 @@ airflow/dags/generated/*.py
 # Temporary files
 *.tmp
 *.temp
+Prompt-Requirements
