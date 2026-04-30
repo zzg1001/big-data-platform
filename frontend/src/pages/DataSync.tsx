@@ -1693,6 +1693,9 @@ export default function DataSync() {
                 <GoldOutlined style={{ color: '#d4af37' }} />
                 待同步
                 <Tag color="green" style={{ margin: 0, fontSize: 10 }}>{selectedTables.length}</Tag>
+                <Tooltip title="双击表名可打开字段映射">
+                  <span style={{ color: '#999', fontSize: 10, cursor: 'help' }}>双击映射</span>
+                </Tooltip>
                 {creating && (
                   <Tag icon={<LoadingOutlined spin />} color="blue" style={{ margin: 0, fontSize: 10 }}>
                     创建 {selectedTables.filter((t) => t.createStatus === 'success' || t.createStatus === 'error').length}/{selectedTables.length}
@@ -1743,6 +1746,11 @@ export default function DataSync() {
                 <div
                   key={item.tableName}
                   onClick={() => handleRightClick(item.tableName)}
+                  onDoubleClick={() => {
+                    if (item.ddlStatus === 'success' && !tasksCreated) {
+                      handleOpenColumnMapping(item)
+                    }
+                  }}
                   style={{
                     padding: '4px 8px',
                     cursor: 'pointer',
@@ -1894,21 +1902,6 @@ export default function DataSync() {
                         <Tag icon={<ExclamationCircleOutlined />} color="error" style={{ margin: 0, fontSize: 11, background: '#fff1f0', borderColor: '#ffa39e' }}>
                           失败
                         </Tag>
-                      </Tooltip>
-                    )}
-                    {/* 字段映射按钮（创建前可用） */}
-                    {item.ddlStatus === 'success' && !tasksCreated && (
-                      <Tooltip title="字段映射">
-                        <Button
-                          type="text"
-                          size="small"
-                          style={{ padding: '0 4px' }}
-                          icon={<SettingOutlined style={{ color: '#1890ff', fontSize: 13 }} />}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleOpenColumnMapping(item)
-                          }}
-                        />
                       </Tooltip>
                     )}
                     {/* 查看 DDL 按钮（创建前可编辑） */}
@@ -2354,7 +2347,9 @@ export default function DataSync() {
         }
         open={columnMappingVisible}
         onCancel={() => setColumnMappingVisible(false)}
-        width={780}
+        width={950}
+        style={{ top: 40 }}
+        styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflow: 'auto' } }}
         footer={[
           <Button key="add" size="small" icon={<PlusOutlined />} onClick={handleAddTargetColumn}>
             添加字段
@@ -2451,33 +2446,74 @@ export default function DataSync() {
                   title: '目标类型',
                   dataIndex: 'targetType',
                   key: 'targetType',
-                  width: 140,
-                  render: (text: string, _: any, index: number) => (
-                    <Select
-                      size="small"
-                      value={text}
-                      onChange={(v) => handleUpdateTargetType(index, v)}
-                      style={{ width: '100%', fontSize: 12 }}
-                      options={[
-                        { value: 'STRING', label: 'STRING' },
-                        { value: 'VARCHAR(255)', label: 'VARCHAR(255)' },
-                        { value: 'VARCHAR(65533)', label: 'VARCHAR(65533)' },
-                        { value: 'TEXT', label: 'TEXT' },
-                        { value: 'BIGINT', label: 'BIGINT' },
-                        { value: 'INT', label: 'INT' },
-                        { value: 'SMALLINT', label: 'SMALLINT' },
-                        { value: 'TINYINT', label: 'TINYINT' },
-                        { value: 'DOUBLE', label: 'DOUBLE' },
-                        { value: 'FLOAT', label: 'FLOAT' },
-                        { value: 'DECIMAL(38,10)', label: 'DECIMAL(38,10)' },
-                        { value: 'DECIMAL(18,2)', label: 'DECIMAL(18,2)' },
-                        { value: 'DATE', label: 'DATE' },
-                        { value: 'DATETIME', label: 'DATETIME' },
-                        { value: 'TIMESTAMP', label: 'TIMESTAMP' },
-                        { value: 'BOOLEAN', label: 'BOOLEAN' },
-                      ]}
-                    />
-                  ),
+                  width: 130,
+                  render: (text: string, _: any, index: number) => {
+                    // 解析类型和大小，如 VARCHAR(255) -> VARCHAR, 255
+                    const match = text?.match(/^([A-Za-z]+)(?:\(([^)]+)\))?$/)
+                    const baseType = match ? match[1].toUpperCase() : text?.toUpperCase() || ''
+                    return (
+                      <Select
+                        size="small"
+                        value={baseType}
+                        onChange={(v) => {
+                          // 保留原有大小
+                          const sizeMatch = text?.match(/\(([^)]+)\)/)
+                          const size = sizeMatch ? sizeMatch[1] : ''
+                          const needsSize = ['VARCHAR', 'CHAR', 'DECIMAL', 'NUMERIC'].includes(v)
+                          const newType = needsSize && size ? `${v}(${size})` : v
+                          handleUpdateTargetType(index, newType)
+                        }}
+                        style={{ width: '100%', fontSize: 12 }}
+                        options={[
+                          { value: 'VARCHAR', label: 'VARCHAR' },
+                          { value: 'CHAR', label: 'CHAR' },
+                          { value: 'TEXT', label: 'TEXT' },
+                          { value: 'STRING', label: 'STRING' },
+                          { value: 'INT', label: 'INT' },
+                          { value: 'BIGINT', label: 'BIGINT' },
+                          { value: 'SMALLINT', label: 'SMALLINT' },
+                          { value: 'TINYINT', label: 'TINYINT' },
+                          { value: 'DECIMAL', label: 'DECIMAL' },
+                          { value: 'DOUBLE', label: 'DOUBLE' },
+                          { value: 'FLOAT', label: 'FLOAT' },
+                          { value: 'DATE', label: 'DATE' },
+                          { value: 'DATETIME', label: 'DATETIME' },
+                          { value: 'TIMESTAMP', label: 'TIMESTAMP' },
+                          { value: 'BOOLEAN', label: 'BOOLEAN' },
+                        ]}
+                      />
+                    )
+                  },
+                },
+                {
+                  title: '大小',
+                  key: 'typeSize',
+                  width: 90,
+                  render: (_: any, record: ColumnMapping, index: number) => {
+                    // 解析大小，如 VARCHAR(255) -> 255
+                    const match = record.targetType?.match(/\(([^)]+)\)/)
+                    const size = match ? match[1] : ''
+                    const baseType = record.targetType?.replace(/\([^)]+\)/, '').toUpperCase() || ''
+                    const needsSize = ['VARCHAR', 'CHAR', 'DECIMAL', 'NUMERIC'].includes(baseType)
+
+                    if (!needsSize) {
+                      return <span style={{ color: '#999', fontSize: 11 }}>-</span>
+                    }
+
+                    return (
+                      <Input
+                        size="small"
+                        value={size}
+                        onChange={(e) => {
+                          const newSize = e.target.value.trim()
+                          const newType = newSize ? `${baseType}(${newSize})` : baseType
+                          handleUpdateTargetType(index, newType)
+                        }}
+                        style={{ fontFamily: 'monospace', fontSize: 12 }}
+                        placeholder="255"
+                      />
+                    )
+                  },
                 },
                 {
                   title: '',

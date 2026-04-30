@@ -1,6 +1,29 @@
+
 version: '3.8'
 
 services:
+  # MySQL - Metadata Database
+  mysql:
+    image: mysql:8.0
+    container_name: bigdata-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: ${DB_NAME:-ai_agent}
+      MYSQL_USER: ${DB_USER:-ai_agent}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-ai_agent123}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bigdata-network
+
   # PostgreSQL - Metadata Database
   postgres:
     image: postgres:15
@@ -173,6 +196,7 @@ services:
       - bigdata-network
 
 volumes:
+  mysql_data:
   postgres_data:
   redis_data:
   uploads_data:
