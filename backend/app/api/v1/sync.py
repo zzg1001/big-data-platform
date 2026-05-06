@@ -1,7 +1,7 @@
 """
 Data sync API endpoints.
 """
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import json
 import os
@@ -174,6 +174,26 @@ async def list_sync_tasks(
 
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+@router.get("/table-columns", response_model=List[dict])
+async def get_table_columns_direct(
+    datasource_id: int,
+    table_name: str,
+    schema_name: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get column information for a table directly from datasource."""
+    ds = await get_datasource(db, datasource_id)
+
+    try:
+        engine = get_engine_for_datasource(ds)
+        sync_service = SyncService(engine, engine)
+        columns = sync_service.get_table_columns(table_name, schema_name)
+        return columns
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @router.get("/{task_id}", response_model=SyncTaskResponse)
@@ -397,26 +417,6 @@ async def get_sync_logs(
         .limit(limit)
     )
     return list(result.scalars().all())
-
-
-@router.get("/table-columns", response_model=List[dict])
-async def get_table_columns_direct(
-    datasource_id: int,
-    table_name: str,
-    schema_name: str = None,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get column information for a table directly from datasource."""
-    ds = await get_datasource(db, datasource_id)
-
-    try:
-        engine = get_engine_for_datasource(ds)
-        sync_service = SyncService(engine, engine)
-        columns = sync_service.get_table_columns(table_name, schema_name)
-        return columns
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @router.post("/{task_id}/generate-ddl", response_model=dict)

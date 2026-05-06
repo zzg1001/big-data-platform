@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Card,
   Button,
@@ -33,11 +34,15 @@ import {
   ExclamationCircleOutlined,
   EyeOutlined,
   SettingOutlined,
+  SaveOutlined,
+  FullscreenOutlined,
+  FullscreenExitOutlined,
 } from '@ant-design/icons'
 import { datasourceApi, syncApi, configApi, warehouseApi, aiApi } from '../services/api'
+import { useFieldTemplateStore } from '../stores/fieldTemplateStore'
 import Editor from '@monaco-editor/react'
 
-const { Text, Title } = Typography
+const { Text } = Typography
 
 interface SyncTaskItem {
   id: number
@@ -134,6 +139,22 @@ export default function DataSync() {
   const [columnMappingTable, setColumnMappingTable] = useState<SelectedTableItem | null>(null)
   const [columnMappings, setColumnMappings] = useState<ColumnMapping[]>([])
   const [loadingColumns, setLoadingColumns] = useState(false)
+  const [columnMappingFullscreen, setColumnMappingFullscreen] = useState(false)
+  const columnMappingListRef = useRef<HTMLDivElement>(null)
+
+  // 批量加字段弹窗
+  const [batchAddFieldVisible, setBatchAddFieldVisible] = useState(false)
+  const [batchFields, setBatchFields] = useState<Array<{ name: string; type: string; size: string; templateLabel?: string }>>([
+    { name: '', type: 'TIMESTAMP', size: '' }
+  ])
+
+  // 全局重置状态
+  const [globalResetting, setGlobalResetting] = useState(false)
+  const [globalResetProgress, setGlobalResetProgress] = useState({ current: 0, total: 0 })
+
+  // 字段值模板（从共享 Store 获取）
+  const { templates: fieldValueTemplates } = useFieldTemplateStore()
+  const navigate = useNavigate()
 
   // 数仓是否已配置
   const warehouseConfigured = warehouseConfig?.configured || false
@@ -421,13 +442,6 @@ export default function DataSync() {
     message.success('DDL 已保存')
   }
 
-  // 默认示例映射数据（仅在 API 失败时显示）
-  const defaultMockMappings: ColumnMapping[] = [
-    { sourceColumn: 'id', sourceType: 'INT', targetColumn: 'id', targetType: 'INT' },
-    { sourceColumn: 'name', sourceType: 'VARCHAR(255)', targetColumn: 'name', targetType: 'VARCHAR(255)' },
-    { sourceColumn: 'created_at', sourceType: 'DATETIME', targetColumn: 'created_at', targetType: 'DATETIME' },
-  ]
-
   // 打开字段映射弹窗
   const handleOpenColumnMapping = async (item: SelectedTableItem) => {
     if (!sourceDsId) {
@@ -435,20 +449,18 @@ export default function DataSync() {
       return
     }
 
-    // 先设置默认数据，确保弹窗有内容显示
     setColumnMappingTable(item)
-    setColumnMappings(defaultMockMappings)
     setLoadingColumns(true)
     setColumnMappingVisible(true)
 
-    let finalMappings: ColumnMapping[] = defaultMockMappings
+    let finalMappings: ColumnMapping[] = []
 
     // 获取源库和目标库类型
     const sourceDbType = sourceDs?.type?.toLowerCase() || 'mysql'
     const targetDbType = warehouseConfig?.type?.toLowerCase() || 'mysql'
 
     try {
-      // 1. 优先使用 selectedTables 中已有的映射（与 DDL 一致）
+      // 1. 优先使用 selectedTables 中已有的映射（上次保存的映射）
       if (item.columnMappings && item.columnMappings.length > 0) {
         finalMappings = item.columnMappings
         message.success(`已加载 ${finalMappings.length} 个字段映射`)
@@ -527,7 +539,18 @@ export default function DataSync() {
           }
         }
       } else {
-        message.info('未获取到字段信息，显示示例数据')
+        // 4. 备用方案：从已有 DDL 解析字段
+        if (item.ddl && item.ddlStatus === 'success') {
+          const ddlFields = parseDdlFields(item.ddl)
+          if (ddlFields.length > 0) {
+            finalMappings = ddlFields
+            message.info(`从 DDL 恢复了 ${ddlFields.length} 个字段`)
+          } else {
+            message.warning('未获取到字段信息')
+          }
+        } else {
+          message.warning('未获取到字段信息')
+        }
       }
     } catch (error: any) {
       const errDetail = error.response?.data?.detail || error.message || '未知错误'
@@ -551,6 +574,42 @@ export default function DataSync() {
     // 统一在最后设置状态
     setColumnMappings(finalMappings)
     setLoadingColumns(false)
+  }
+
+  // 从 DDL 解析字段（备用方案）
+  const parseDdlFields = (ddl: string): ColumnMapping[] => {
+    const mappings: ColumnMapping[] = []
+    try {
+      // 匹配 CREATE TABLE ... ( ... )
+      const match = ddl.match(/CREATE\s+TABLE[^(]*\(([\s\S]*)\)/i)
+      if (!match) return []
+
+      const columnsStr = match[1]
+      // 按逗号分割，但要注意类型中的逗号如 DECIMAL(10,2)
+      const lines = columnsStr.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('--'))
+
+      lines.forEach(line => {
+        // 移除末尾的逗号
+        const cleanLine = line.replace(/,\s*$/, '').trim()
+        if (!cleanLine) return
+
+        // 匹配字段名和类型，如 "  field_name VARCHAR(255)"
+        const fieldMatch = cleanLine.match(/^\s*(\w+)\s+(\S+.*)$/i)
+        if (fieldMatch) {
+          const fieldName = fieldMatch[1]
+          const fieldType = fieldMatch[2].trim()
+          mappings.push({
+            sourceColumn: '',
+            sourceType: '-',
+            targetColumn: fieldName,
+            targetType: fieldType,
+          })
+        }
+      })
+    } catch (e) {
+      console.error('解析 DDL 失败:', e)
+    }
+    return mappings
   }
 
   // 类型转换（根据目标数据库类型）
@@ -606,6 +665,195 @@ export default function DataSync() {
       targetType: 'STRING',
     }
     setColumnMappings([...columnMappings, newMapping])
+    // 滚动到底部
+    setTimeout(() => {
+      columnMappingListRef.current?.scrollTo({
+        top: columnMappingListRef.current.scrollHeight,
+        behavior: 'smooth',
+      })
+    }, 50)
+  }
+
+  // 批量添加字段到所有表
+  const handleBatchAddField = () => {
+    // 过滤有效字段
+    const validFields = batchFields.filter(f => f.name.trim())
+    if (validFields.length === 0) {
+      message.warning('请至少添加一个字段')
+      return
+    }
+
+    // 检查有多少表可以添加（有 DDL 的表）
+    const tablesToUpdate = selectedTables.filter(t => t.ddlStatus === 'success')
+    if (tablesToUpdate.length === 0) {
+      message.warning('没有可更新的表，请先生成 DDL')
+      return
+    }
+
+    let totalAdded = 0
+
+    // 给每个表添加字段并更新 DDL
+    setSelectedTables(prev => prev.map(item => {
+      if (item.ddlStatus !== 'success') return item
+
+      const existingMappings = item.columnMappings || []
+      const newMappings: ColumnMapping[] = []
+
+      // 添加每个新字段
+      validFields.forEach(field => {
+        const fieldName = field.name.trim()
+        // 检查字段是否已存在
+        if (!existingMappings.some(m => m.targetColumn.toLowerCase() === fieldName.toLowerCase()) &&
+            !newMappings.some(m => m.targetColumn.toLowerCase() === fieldName.toLowerCase())) {
+          // 构建完整类型（带大小）
+          const fullType = field.size ? `${field.type}(${field.size})` : field.type
+
+          // 如果有模板，使用模板的表达式
+          const template = field.templateLabel ? fieldValueTemplates.find(t => t.label === field.templateLabel) : null
+
+          newMappings.push({
+            sourceColumn: template ? `{{${template.label}}}` : '',
+            sourceType: template ? template.expression : '-',
+            targetColumn: fieldName,
+            targetType: fullType,
+          })
+        }
+      })
+
+      if (newMappings.length === 0) return item
+
+      totalAdded += newMappings.length
+      const updatedMappings = [...existingMappings, ...newMappings]
+
+      // 重新生成 DDL
+      const columns = updatedMappings
+        .filter(m => m.targetColumn)
+        .map(m => `  ${m.targetColumn} ${m.targetType}`)
+        .join(',\n')
+      const newDdl = `CREATE TABLE IF NOT EXISTS ${item.targetTableName} (\n${columns}\n);`
+
+      return {
+        ...item,
+        columnMappings: updatedMappings,
+        ddl: newDdl,
+      }
+    }))
+
+    message.success(`已为 ${tablesToUpdate.length} 个表添加 ${validFields.length} 个字段`)
+    setBatchAddFieldVisible(false)
+    setBatchFields([{ name: '', type: 'TIMESTAMP', size: '' }])
+  }
+
+  // 全局重置所有表的字段映射（恢复到源表原始状态，使用和初始化相同的逻辑）
+  const handleGlobalReset = async () => {
+    if (!sourceDsId) {
+      message.warning('请先选择数据源')
+      return
+    }
+
+    const tablesToReset = selectedTables.filter(t => t.ddlStatus === 'success')
+    if (tablesToReset.length === 0) {
+      message.warning('没有可重置的表')
+      return
+    }
+
+    setGlobalResetting(true)
+    setGlobalResetProgress({ current: 0, total: tablesToReset.length })
+
+    let successCount = 0
+    let failCount = 0
+
+    // 逐个重置，使用和初始化相同的 API
+    for (let i = 0; i < tablesToReset.length; i++) {
+      const item = tablesToReset[i]
+      setGlobalResetProgress({ current: i + 1, total: tablesToReset.length })
+
+      try {
+        // 调用和初始化相同的 API
+        const res = await syncApi.generateDdlPreview({
+          source_datasource_id: sourceDsId!,
+          source_table: item.tableName,
+          target_table: item.targetTableName,
+        })
+
+        const ddl = res.data.target_ddl
+        const newMappings: ColumnMapping[] = (res.data.type_mappings || []).map((m: any) => ({
+          sourceColumn: m.column_name,
+          sourceType: m.source_type,
+          targetColumn: m.column_name,
+          targetType: m.target_type,
+        }))
+
+        // 更新表数据
+        setSelectedTables(prev => prev.map(t =>
+          t.tableName === item.tableName
+            ? { ...t, ddl, ddlStatus: 'success' as const, columnMappings: newMappings }
+            : t
+        ))
+
+        // 如果当前正在查看这个表，同步更新弹窗
+        if (columnMappingTable?.tableName === item.tableName) {
+          setColumnMappings(newMappings)
+          setColumnMappingTable(prev => prev ? { ...prev, ddl, columnMappings: newMappings } : prev)
+        }
+
+        successCount++
+      } catch (error: any) {
+        console.error(`重置表 ${item.tableName} 失败:`, error)
+        failCount++
+      }
+    }
+
+    setGlobalResetting(false)
+    if (failCount > 0) {
+      message.warning(`重置完成：${successCount} 个成功，${failCount} 个失败`)
+    } else {
+      message.success(`已重置 ${successCount} 个表`)
+    }
+  }
+
+  // 单个表重置字段映射（使用和初始化相同的逻辑）
+  const handleResetColumnMapping = async () => {
+    if (!columnMappingTable || !sourceDsId) return
+
+    setLoadingColumns(true)
+
+    try {
+      // 调用和初始化相同的 API
+      const res = await syncApi.generateDdlPreview({
+        source_datasource_id: sourceDsId,
+        source_table: columnMappingTable.tableName,
+        target_table: columnMappingTable.targetTableName,
+      })
+
+      const ddl = res.data.target_ddl
+      const newMappings: ColumnMapping[] = (res.data.type_mappings || []).map((m: any) => ({
+        sourceColumn: m.column_name,
+        sourceType: m.source_type,
+        targetColumn: m.column_name,
+        targetType: m.target_type,
+      }))
+
+      // 更新弹窗数据
+      setColumnMappings(newMappings)
+
+      // 同步更新 selectedTables
+      setSelectedTables(prev => prev.map(t =>
+        t.tableName === columnMappingTable.tableName
+          ? { ...t, ddl, ddlStatus: 'success' as const, columnMappings: newMappings }
+          : t
+      ))
+
+      // 同步更新 columnMappingTable
+      setColumnMappingTable(prev => prev ? { ...prev, ddl, columnMappings: newMappings } : prev)
+
+      message.success(`已重置 ${newMappings.length} 个字段`)
+    } catch (error: any) {
+      console.error('重置失败:', error)
+      message.error('重置失败: ' + (error.response?.data?.detail || error.message || '未知错误'))
+    } finally {
+      setLoadingColumns(false)
+    }
   }
 
   // 删除字段映射
@@ -1432,51 +1680,103 @@ export default function DataSync() {
   ]
 
   return (
-    <div>
-      {/* 顶部工具栏 */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-        <Space>
-          <Title level={4} style={{ margin: 0 }}>数据同步</Title>
+    <div style={{ padding: '0 4px' }}>
+      {/* 顶部工具栏 - 苹果风格 */}
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: 20,
+        padding: '12px 16px',
+        background: 'linear-gradient(to bottom, #fafafa, #f5f5f5)',
+        borderRadius: 12,
+        border: '1px solid #eee',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <span style={{ fontSize: 18, fontWeight: 600, color: '#1d1d1f' }}>数据同步</span>
           {warehouseConfig?.configured ? (
-            <Tag icon={<GoldOutlined />} color="gold" style={{ marginLeft: 16 }}>
-              目标数仓: {warehouseConfig.name} ({warehouseConfig.type})
-            </Tag>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '4px 12px',
+              background: 'linear-gradient(135deg, #fef3cd, #fff8e1)',
+              borderRadius: 20,
+              fontSize: 12,
+              color: '#856404',
+            }}>
+              <GoldOutlined />
+              <span>{warehouseConfig.name}</span>
+              <span style={{ opacity: 0.7 }}>({warehouseConfig.type})</span>
+            </div>
           ) : (
-            <Tag color="warning" style={{ marginLeft: 16 }}>
-              未配置数仓，请在「系统管理」中配置
-            </Tag>
+            <div style={{
+              padding: '4px 12px',
+              background: '#fff3cd',
+              borderRadius: 20,
+              fontSize: 12,
+              color: '#856404',
+            }}>
+              未配置数仓
+            </div>
           )}
-        </Space>
-        <Space>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           {selectedTaskIds.length > 0 && (() => {
             const selectedTasks = syncTasks.filter((t) => selectedTaskIds.includes(t.id))
             const deletableCount = selectedTasks.filter((t) => !t.is_scheduled).length
-            return (
-              <>
-                {deletableCount > 0 && (
-                  <Button danger icon={<DeleteOutlined />} loading={batchDeleting} onClick={handleBatchDelete}>
-                    批量删除 ({deletableCount})
-                  </Button>
-                )}
-                {deletableCount < selectedTaskIds.length && (
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    已上线任务需先在「调度管理」下线后才能删除
-                  </Text>
-                )}
-              </>
-            )
+            return deletableCount > 0 ? (
+              <Button
+                danger
+                size="small"
+                icon={<DeleteOutlined />}
+                loading={batchDeleting}
+                onClick={handleBatchDelete}
+                style={{ borderRadius: 6 }}
+              >
+                删除 ({deletableCount})
+              </Button>
+            ) : null
           })()}
-          <Button icon={<ReloadOutlined />} onClick={loadSyncTasks}>
+          <Button
+            size="small"
+            icon={<ReloadOutlined />}
+            onClick={loadSyncTasks}
+            style={{ borderRadius: 6 }}
+          >
             刷新
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={handleOpenAddModal}>
-            新增同步任务
+          <Tooltip title="管理字段值模板（如 etl_time = CURRENT_TIMESTAMP）">
+            <Button
+              size="small"
+              icon={<SettingOutlined />}
+              onClick={() => navigate('/field-templates')}
+              style={{ borderRadius: 6 }}
+            >
+              字段模板
+            </Button>
+          </Tooltip>
+          <Button
+            type="primary"
+            size="small"
+            icon={<PlusOutlined />}
+            onClick={handleOpenAddModal}
+            style={{ borderRadius: 6 }}
+          >
+            新增任务
           </Button>
-        </Space>
+        </div>
       </div>
 
-      {/* 任务列表 */}
-      <Card bodyStyle={{ padding: 12 }}>
+      {/* 任务列表 - 苹果风格卡片 */}
+      <Card
+        style={{
+          borderRadius: 12,
+          border: '1px solid #e8e8e8',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.04)',
+        }}
+        styles={{ body: { padding: 0 } }}
+      >
         <Table
           columns={taskColumns}
           dataSource={syncTasks}
@@ -1496,14 +1796,18 @@ export default function DataSync() {
         />
       </Card>
 
-      {/* 新增同步任务弹窗 */}
+      {/* 新增同步任务弹窗 - 苹果风格 */}
       <Modal
         title={null}
         closable={true}
         open={addModalVisible}
         onCancel={() => setAddModalVisible(false)}
-        width={920}
-        styles={{ body: { padding: '12px 16px' } }}
+        width={960}
+        style={{ top: 30 }}
+        styles={{
+          body: { padding: '16px 20px' },
+          content: { borderRadius: 16, overflow: 'hidden' },
+        }}
         footer={[
           <Button key="cancel" size="small" onClick={() => setAddModalVisible(false)}>
             取消
@@ -1542,13 +1846,23 @@ export default function DataSync() {
           ),
         ]}
       >
-        {/* 顶部：源库 → 目标数仓 */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, fontSize: 12 }}>
-          <Space size={6}>
+        {/* 顶部：源库 → 目标数仓 - 苹果风格 */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 24,
+          marginBottom: 16,
+          padding: '12px 20px',
+          background: 'linear-gradient(to bottom, #fafafa, #f5f5f5)',
+          borderRadius: 12,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <DatabaseOutlined style={{ fontSize: 16, color: '#1890ff' }} />
             <Select
               size="small"
-              style={{ width: 160, fontSize: 12 }}
-              placeholder="选择源库"
+              style={{ width: 180 }}
+              placeholder="选择源数据库"
               value={sourceDsId}
               onChange={(v) => {
                 setSourceDsId(v)
@@ -1556,50 +1870,69 @@ export default function DataSync() {
               }}
               options={datasources.map((ds) => ({
                 value: ds.id,
-                label: (
-                  <span style={{ fontSize: 12 }}>
-                    {ds.name} <Tag color="blue" style={{ fontSize: 10, margin: 0 }}>{ds.type}</Tag>
-                  </span>
-                ),
+                label: `${ds.name} (${ds.type})`,
               }))}
             />
-            {sourceDs && (
-              <Text type="secondary" style={{ fontSize: 11 }}>
-                {sourceDs.type}/{sourceDs.database}
-              </Text>
+          </div>
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '4px 16px',
+            background: '#fff',
+            borderRadius: 20,
+            boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
+          }}>
+            <RightOutlined style={{ color: '#1890ff', fontSize: 12 }} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <GoldOutlined style={{ fontSize: 16, color: '#d4af37' }} />
+            {warehouseConfig?.configured ? (
+              <span style={{ fontSize: 13, fontWeight: 500 }}>
+                {warehouseConfig.name}
+                <span style={{ color: '#999', fontWeight: 400, marginLeft: 6 }}>({warehouseConfig.type})</span>
+              </span>
+            ) : (
+              <span style={{ color: '#faad14', fontSize: 13 }}>未配置数仓</span>
             )}
-          </Space>
-          <RightOutlined style={{ color: '#999', fontSize: 10 }} />
-          {warehouseConfig?.configured ? (
-            <Space size={4}>
-              <GoldOutlined style={{ color: '#d4af37' }} />
-              <Text strong style={{ fontSize: 12 }}>{warehouseConfig.name}</Text>
-              <Tag color="gold" style={{ margin: 0, fontSize: 10 }}>{warehouseConfig.type}</Tag>
-            </Space>
-          ) : (
-            <Tag color="warning" style={{ fontSize: 11 }}>未配置数仓</Tag>
-          )}
+          </div>
         </div>
 
-        {/* 穿梭框 */}
-        <div style={{ display: 'flex', gap: 10, height: 580 }}>
+        {/* 穿梭框 - 苹果风格 */}
+        <div style={{ display: 'flex', gap: 12, height: 540 }}>
           {/* 左侧：源表列表 */}
           <Card
             title={
-              <Space size={4} style={{ fontSize: 12 }}>
-                <DatabaseOutlined />
-                {sourceDs ? `${sourceDs.type}` : '源表'}
-                <Tag style={{ margin: 0, fontSize: 10 }}>{availableTables.length}</Tag>
-              </Space>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <TableOutlined style={{ color: '#1890ff' }} />
+                <span style={{ fontWeight: 500 }}>源表</span>
+                <span style={{
+                  background: '#e6f4ff',
+                  color: '#1890ff',
+                  padding: '1px 8px',
+                  borderRadius: 10,
+                  fontSize: 11,
+                }}>{availableTables.length}</span>
+              </div>
             }
             size="small"
-            style={{ flex: 2, display: 'flex', flexDirection: 'column', minWidth: 200 }}
-            styles={{ header: { minHeight: 36, padding: '0 12px' }, body: { flex: 1, overflow: 'auto', padding: 6 } }}
+            style={{
+              flex: 2,
+              display: 'flex',
+              flexDirection: 'column',
+              minWidth: 200,
+              borderRadius: 12,
+              border: '1px solid #e8e8e8',
+            }}
+            styles={{
+              header: { minHeight: 40, padding: '0 14px', borderBottom: '1px solid #f0f0f0' },
+              body: { flex: 1, overflow: 'auto', padding: 8 },
+            }}
             extra={
               <Button
-                type="link"
+                type="text"
                 size="small"
-                style={{ padding: '0 4px', fontSize: 12 }}
+                style={{ fontSize: 12, color: '#1890ff' }}
                 onClick={() => {
                   if (leftSelected.length === availableTables.length) {
                     setLeftSelected([])
@@ -1609,12 +1942,12 @@ export default function DataSync() {
                 }}
                 disabled={availableTables.length === 0}
               >
-                {leftSelected.length === availableTables.length && availableTables.length > 0 ? '取消' : '全选'}
+                {leftSelected.length === availableTables.length && availableTables.length > 0 ? '取消全选' : '全选'}
               </Button>
             }
           >
             {loadingTables ? (
-              <div style={{ textAlign: 'center', padding: 40 }}>
+              <div style={{ textAlign: 'center', padding: 60 }}>
                 <Spin size="small" />
               </div>
             ) : availableTables.length > 0 ? (
@@ -1625,23 +1958,20 @@ export default function DataSync() {
                     key={table}
                     onClick={() => handleLeftClick(table)}
                     style={{
-                      padding: '5px 10px',
+                      padding: '8px 12px',
                       cursor: 'pointer',
-                      borderRadius: 4,
-                      marginBottom: 2,
+                      borderRadius: 8,
+                      marginBottom: 4,
                       fontSize: 13,
-                      background: leftSelected.includes(table) ? '#e6f4ff' : '#fafafa',
-                      border: leftSelected.includes(table) ? '1px solid #91caff' : '1px solid transparent',
-                      transition: 'all 0.15s',
+                      background: leftSelected.includes(table) ? '#e6f4ff' : '#fff',
+                      border: leftSelected.includes(table) ? '1px solid #91caff' : '1px solid #f0f0f0',
+                      transition: 'all 0.2s',
                       display: 'flex',
                       justifyContent: 'space-between',
                       alignItems: 'center',
                     }}
                   >
-                    <Space size={6}>
-                      <TableOutlined style={{ color: '#1890ff', fontSize: 12 }} />
-                      <span>{table}</span>
-                    </Space>
+                    <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{table}</span>
                     {existingCount > 0 && (
                       <Tooltip title={`已同步 ${existingCount} 个目标表`}>
                         <span style={{
@@ -1668,55 +1998,125 @@ export default function DataSync() {
             )}
           </Card>
 
-          {/* 中间：操作按钮 */}
-          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 8 }}>
-            <Tooltip title="添加并生成DDL">
+          {/* 中间：操作按钮 - 苹果风格 */}
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            gap: 8,
+            padding: '0 4px',
+          }}>
+            <Tooltip title="添加到待同步">
               <Button
+                type="primary"
                 size="small"
-                icon={<RightOutlined />}
+                icon={<RightOutlined style={{ fontSize: 12 }} />}
                 onClick={handleMoveRight}
                 disabled={leftSelected.length === 0 || !warehouseConfigured || tasksCreated}
+                style={{ borderRadius: 8, width: 36, height: 36 }}
               />
             </Tooltip>
-            <Button
-              size="small"
-              icon={<LeftOutlined />}
-              onClick={handleMoveLeft}
-              disabled={rightSelected.length === 0 || tasksCreated}
-            />
+            <Tooltip title="移除">
+              <Button
+                size="small"
+                icon={<LeftOutlined style={{ fontSize: 12 }} />}
+                onClick={handleMoveLeft}
+                disabled={rightSelected.length === 0 || tasksCreated}
+                style={{ borderRadius: 8, width: 36, height: 36 }}
+              />
+            </Tooltip>
           </div>
 
-          {/* 右侧：已选表列表 */}
+          {/* 右侧：已选表列表 - 苹果风格 */}
           <Card
             title={
-              <Space size={4} style={{ fontSize: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <GoldOutlined style={{ color: '#d4af37' }} />
-                待同步
-                <Tag color="green" style={{ margin: 0, fontSize: 10 }}>{selectedTables.length}</Tag>
-                <Tooltip title="双击表名可打开字段映射">
-                  <span style={{ color: '#999', fontSize: 10, cursor: 'help' }}>双击映射</span>
-                </Tooltip>
+                <span style={{ fontWeight: 500 }}>待同步</span>
+                <span style={{
+                  background: '#f6ffed',
+                  color: '#52c41a',
+                  padding: '1px 8px',
+                  borderRadius: 10,
+                  fontSize: 11,
+                }}>{selectedTables.length}</span>
                 {creating && (
-                  <Tag icon={<LoadingOutlined spin />} color="blue" style={{ margin: 0, fontSize: 10 }}>
-                    创建 {selectedTables.filter((t) => t.createStatus === 'success' || t.createStatus === 'error').length}/{selectedTables.length}
-                  </Tag>
+                  <span style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    background: '#e6f4ff',
+                    color: '#1890ff',
+                    padding: '2px 8px',
+                    borderRadius: 10,
+                    fontSize: 11,
+                  }}>
+                    <LoadingOutlined spin style={{ fontSize: 10 }} />
+                    {selectedTables.filter((t) => t.createStatus === 'success' || t.createStatus === 'error').length}/{selectedTables.length}
+                  </span>
                 )}
                 {syncing && (
-                  <Tag icon={<LoadingOutlined spin />} color="processing" style={{ margin: 0, fontSize: 10 }}>
-                    同步 {selectedTables.filter((t) => t.syncStatus === 'success' || t.syncStatus === 'error').length}/{selectedTables.length}
-                  </Tag>
+                  <span style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    background: '#e6f4ff',
+                    color: '#1890ff',
+                    padding: '2px 8px',
+                    borderRadius: 10,
+                    fontSize: 11,
+                  }}>
+                    <LoadingOutlined spin style={{ fontSize: 10 }} />
+                    {selectedTables.filter((t) => t.syncStatus === 'success' || t.syncStatus === 'error').length}/{selectedTables.length}
+                  </span>
                 )}
-              </Space>
+              </div>
             }
             size="small"
-            style={{ flex: 3, display: 'flex', flexDirection: 'column' }}
-            styles={{ header: { minHeight: 36, padding: '0 12px' }, body: { flex: 1, overflow: 'auto', padding: 6 } }}
+            style={{
+              flex: 3,
+              display: 'flex',
+              flexDirection: 'column',
+              borderRadius: 12,
+              border: '1px solid #e8e8e8',
+            }}
+            styles={{
+              header: { minHeight: 40, padding: '0 14px', borderBottom: '1px solid #f0f0f0' },
+              body: { flex: 1, overflow: 'auto', padding: 8 },
+            }}
             extra={
-              <Space size={0}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 2,
+                background: '#f5f5f5',
+                borderRadius: 6,
+                padding: '2px 4px',
+              }}>
+                <Tooltip title={globalResetting ? `${globalResetProgress.current}/${globalResetProgress.total}` : '全局重置（恢复到源表原始状态）'}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={globalResetting ? <LoadingOutlined spin style={{ fontSize: 12 }} /> : <ReloadOutlined style={{ fontSize: 12 }} />}
+                    onClick={handleGlobalReset}
+                    disabled={selectedTables.length === 0 || tasksCreated || globalResetting}
+                    style={{ color: '#666', padding: '0 6px' }}
+                  />
+                </Tooltip>
+                <Tooltip title="批量添加字段">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<PlusOutlined style={{ fontSize: 12 }} />}
+                    onClick={() => setBatchAddFieldVisible(true)}
+                    disabled={selectedTables.length === 0 || !selectedTables.some(t => t.ddlStatus === 'success') || tasksCreated}
+                    style={{ color: '#666', padding: '0 6px' }}
+                  />
+                </Tooltip>
+                <div style={{ width: 1, height: 14, background: '#ddd', margin: '0 2px' }} />
                 <Button
-                  type="link"
+                  type="text"
                   size="small"
-                  style={{ padding: '0 4px', fontSize: 12 }}
                   onClick={() => {
                     if (rightSelected.length === selectedTables.length) {
                       setRightSelected([])
@@ -1725,20 +2125,20 @@ export default function DataSync() {
                     }
                   }}
                   disabled={selectedTables.length === 0}
+                  style={{ color: '#666', padding: '0 6px', fontSize: 11 }}
                 >
                   {rightSelected.length === selectedTables.length && selectedTables.length > 0 ? '取消' : '全选'}
                 </Button>
                 <Button
-                  type="link"
+                  type="text"
                   size="small"
-                  danger
-                  style={{ padding: '0 4px', fontSize: 12 }}
                   onClick={() => setSelectedTables([])}
                   disabled={selectedTables.length === 0 || tasksCreated}
+                  style={{ color: '#ff4d4f', padding: '0 6px', fontSize: 11 }}
                 >
                   清空
                 </Button>
-              </Space>
+              </div>
             }
           >
             {selectedTables.length > 0 ? (
@@ -2335,47 +2735,88 @@ export default function DataSync() {
       {/* 字段映射弹窗 */}
       <Modal
         title={
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <SettingOutlined style={{ color: '#1890ff' }} />
-            <span>字段映射</span>
-            {columnMappingTable && (
-              <Tag color="blue" style={{ margin: 0, fontSize: 11 }}>
-                {columnMappingTable.tableName} → {columnMappingTable.targetTableName}
-              </Tag>
-            )}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ fontWeight: 500 }}>字段映射</span>
+              {columnMappingTable && (
+                <span style={{ fontSize: 12, color: '#666', fontWeight: 400 }}>
+                  {columnMappingTable.tableName} → {columnMappingTable.targetTableName}
+                </span>
+              )}
+            </div>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 2,
+              marginRight: 20,
+              background: '#f5f5f5',
+              borderRadius: 6,
+              padding: '2px 4px',
+            }}>
+              <Tooltip title="重置（恢复到源表原始状态，清除新增字段和修改）">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<ReloadOutlined style={{ fontSize: 14 }} />}
+                  onClick={handleResetColumnMapping}
+                  disabled={loadingColumns}
+                  style={{ color: '#666' }}
+                />
+              </Tooltip>
+              <Tooltip title="添加字段">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<PlusOutlined style={{ fontSize: 14 }} />}
+                  onClick={handleAddTargetColumn}
+                  style={{ color: '#666' }}
+                />
+              </Tooltip>
+              <div style={{ width: 1, height: 16, background: '#e0e0e0', margin: '0 4px' }} />
+              <Tooltip title="保存并更新 DDL">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<SaveOutlined style={{ fontSize: 14 }} />}
+                  onClick={handleSaveColumnMapping}
+                  disabled={loadingColumns}
+                  style={{ color: '#1890ff' }}
+                />
+              </Tooltip>
+              <div style={{ width: 1, height: 16, background: '#e0e0e0', margin: '0 4px' }} />
+              <Tooltip title={columnMappingFullscreen ? '退出全屏' : '全屏'}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={columnMappingFullscreen ? <FullscreenExitOutlined style={{ fontSize: 14 }} /> : <FullscreenOutlined style={{ fontSize: 14 }} />}
+                  onClick={() => setColumnMappingFullscreen(!columnMappingFullscreen)}
+                  style={{ color: '#666' }}
+                />
+              </Tooltip>
+            </div>
           </div>
         }
         open={columnMappingVisible}
-        onCancel={() => setColumnMappingVisible(false)}
-        width={950}
-        style={{ top: 40 }}
-        styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflow: 'auto' } }}
-        footer={[
-          <Button key="add" size="small" icon={<PlusOutlined />} onClick={handleAddTargetColumn}>
-            添加字段
-          </Button>,
-          <Button key="cancel" size="small" onClick={() => setColumnMappingVisible(false)}>
-            取消
-          </Button>,
-          <Button
-            key="save"
-            type="primary"
-            size="small"
-            onClick={handleSaveColumnMapping}
-            disabled={loadingColumns}
-          >
-            保存并更新 DDL
-          </Button>,
-        ]}
+        onCancel={() => { setColumnMappingVisible(false); setColumnMappingFullscreen(false) }}
+        width={columnMappingFullscreen ? '100vw' : 1000}
+        style={columnMappingFullscreen ? { top: 0, maxWidth: '100vw', paddingBottom: 0 } : { top: 20 }}
+        styles={{
+          body: {
+            height: columnMappingFullscreen ? 'calc(100vh - 55px)' : 'calc(100vh - 180px)',
+            overflow: 'auto',
+            padding: '12px 16px',
+          },
+        }}
+        footer={null}
       >
         {/* 源库和目标库类型信息 */}
-        <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-          <Tag color="cyan">{sourceDs?.type || '源库'}</Tag>
-          <RightOutlined style={{ fontSize: 10, color: '#999' }} />
-          <Tag color="gold">{warehouseConfig?.type || '目标库'}</Tag>
-          <span style={{ color: '#999', marginLeft: 8 }}>
+        <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+          <Tag color="cyan" style={{ margin: 0, fontSize: 11, lineHeight: '18px', padding: '0 6px' }}>{sourceDs?.type || '源库'}</Tag>
+          <RightOutlined style={{ fontSize: 9, color: '#999' }} />
+          <Tag color="gold" style={{ margin: 0, fontSize: 11, lineHeight: '18px', padding: '0 6px' }}>{warehouseConfig?.type || '目标库'}</Tag>
+          <span style={{ color: '#999' }}>
             {sourceDs?.type?.toLowerCase() === warehouseConfig?.type?.toLowerCase()
-              ? '类型相同，字段直接复制'
+              ? '类型相同，直接复制'
               : '类型不同，智能转换'}
           </span>
         </div>
@@ -2385,7 +2826,7 @@ export default function DataSync() {
             <Spin size="small" tip="加载字段信息..." />
           </div>
         ) : (
-          <div style={{ maxHeight: 420, overflow: 'auto' }}>
+          <div ref={columnMappingListRef} style={{ height: columnMappingFullscreen ? 'calc(100vh - 120px)' : 'calc(100vh - 260px)', overflow: 'auto' }}>
             <Table
               dataSource={columnMappings}
               rowKey={(record, index) => `${record.sourceColumn}_${index}`}
@@ -2397,27 +2838,97 @@ export default function DataSync() {
                   title: '源字段',
                   dataIndex: 'sourceColumn',
                   key: 'sourceColumn',
-                  width: 130,
-                  render: (text: string) => (
-                    text ? (
-                      <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text}</span>
-                    ) : (
-                      <span style={{ color: '#999', fontSize: 11 }}>新增字段</span>
-                    )
-                  ),
+                  width: 160,
+                  render: (text: string, _: any, index: number) => {
+                    const safeText = text || ''
+                    // 如果是新增字段（sourceColumn为空），显示模板选择器
+                    if (!safeText) {
+                      // 检查是否已选择了模板（sourceColumn 为 {{label}} 格式）
+                      const currentMapping = columnMappings[index]
+                      // 从 sourceColumn 提取已选模板（如果有的话）
+                      const existingLabel = currentMapping?.sourceColumn?.startsWith('{{')
+                        ? currentMapping.sourceColumn.slice(2, -2)
+                        : undefined
+                      return (
+                        <Select
+                          size="small"
+                          value={existingLabel}
+                          placeholder="选择模板..."
+                          style={{ width: '100%', fontSize: 12 }}
+                          allowClear
+                          onChange={(value) => {
+                            const template = fieldValueTemplates.find(t => t.label === value)
+                            const newMappings = [...columnMappings]
+                            newMappings[index] = {
+                              ...newMappings[index],
+                              sourceColumn: value ? `{{${value}}}` : '',
+                              sourceType: template?.expression || '-',
+                            }
+                            setColumnMappings(newMappings)
+                          }}
+                          options={fieldValueTemplates.map(t => ({
+                            value: t.label,
+                            label: (
+                              <span style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                                {t.label}
+                                <span style={{ color: '#999', marginLeft: 6, fontSize: 10 }}>
+                                  {t.description || t.expression}
+                                </span>
+                              </span>
+                            ),
+                          }))}
+                        />
+                      )
+                    }
+                    // 如果是模板字段（以{{开头），显示模板标签
+                    if (safeText.startsWith('{{') && safeText.endsWith('}}')) {
+                      const templateLabel = safeText.slice(2, -2)
+                      return (
+                        <Tag color="blue" style={{ margin: 0, fontFamily: 'monospace', fontSize: 11 }}>
+                          {templateLabel}
+                        </Tag>
+                      )
+                    }
+                    // 普通源字段
+                    return <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{safeText}</span>
+                  },
                 },
                 {
-                  title: '源类型',
+                  title: '源类型/表达式',
                   dataIndex: 'sourceType',
                   key: 'sourceType',
-                  width: 100,
-                  render: (text: string) => (
-                    text && text !== '-' ? (
-                      <Tag style={{ margin: 0, fontSize: 10 }}>{text}</Tag>
+                  width: 140,
+                  render: (text: string, record: ColumnMapping) => {
+                    const safeText = text || '-'
+                    const safeSourceColumn = record.sourceColumn || ''
+                    // 如果是模板字段，显示表达式
+                    if (safeSourceColumn.startsWith('{{') && safeSourceColumn.endsWith('}}')) {
+                      return (
+                        <Tooltip title={safeText}>
+                          <span style={{
+                            fontFamily: 'monospace',
+                            fontSize: 10,
+                            color: '#52c41a',
+                            background: '#f6ffed',
+                            padding: '2px 6px',
+                            borderRadius: 4,
+                            display: 'inline-block',
+                            maxWidth: 120,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}>
+                            {safeText}
+                          </span>
+                        </Tooltip>
+                      )
+                    }
+                    return safeText && safeText !== '-' ? (
+                      <Tag style={{ margin: 0, fontSize: 10 }}>{safeText}</Tag>
                     ) : (
                       <span style={{ color: '#999', fontSize: 11 }}>-</span>
                     )
-                  ),
+                  },
                 },
                 {
                   title: '',
@@ -2535,6 +3046,231 @@ export default function DataSync() {
             />
           </div>
         )}
+      </Modal>
+
+      {/* 批量加字段弹窗 - 苹果风格 */}
+      <Modal
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontWeight: 500 }}>批量添加字段</span>
+            <span style={{ fontSize: 12, color: '#999', fontWeight: 400, marginRight: 20 }}>
+              {selectedTables.filter(t => t.ddlStatus === 'success').length} 个表
+            </span>
+          </div>
+        }
+        open={batchAddFieldVisible}
+        onCancel={() => {
+          setBatchAddFieldVisible(false)
+          setBatchFields([{ name: '', type: 'TIMESTAMP', size: '' }])
+        }}
+        width={600}
+        footer={null}
+        styles={{ body: { padding: '12px 20px 16px' } }}
+      >
+        {/* 快捷预设 - 使用字段值模板 */}
+        <div style={{
+          display: 'flex',
+          gap: 6,
+          flexWrap: 'wrap',
+          padding: '8px 12px',
+          background: '#fafafa',
+          borderRadius: 8,
+          marginBottom: 16,
+        }}>
+          <span style={{ fontSize: 11, color: '#999', marginRight: 4 }}>快捷添加模板字段:</span>
+          {fieldValueTemplates.map(template => (
+            <Tooltip key={template.label} title={`${template.expression}${template.description ? ` - ${template.description}` : ''}`}>
+              <div
+                onClick={() => {
+                  // 检查是否已添加
+                  if (!batchFields.some(f => f.name === template.label)) {
+                    setBatchFields(prev => {
+                      // 如果第一行是空的，替换它；否则添加新行
+                      if (prev.length === 1 && !prev[0].name.trim()) {
+                        return [{ name: template.label, type: 'TIMESTAMP', size: '', templateLabel: template.label }]
+                      }
+                      return [...prev, { name: template.label, type: 'TIMESTAMP', size: '', templateLabel: template.label }]
+                    })
+                  }
+                }}
+                style={{
+                  padding: '4px 10px',
+                  fontSize: 12,
+                  background: batchFields.some(f => f.name === template.label) ? '#e6f4ff' : '#fff',
+                  border: batchFields.some(f => f.name === template.label) ? '1px solid #91caff' : '1px solid #e8e8e8',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s',
+                  fontFamily: 'monospace',
+                }}
+              >
+                {template.label}
+              </div>
+            </Tooltip>
+          ))}
+        </div>
+
+        {/* 字段列表 */}
+        <div style={{ marginBottom: 12 }}>
+          {batchFields.map((field, index) => (
+            <div
+              key={index}
+              style={{
+                display: 'flex',
+                gap: 8,
+                alignItems: 'center',
+                marginBottom: 8,
+                padding: '8px 12px',
+                background: field.templateLabel ? '#f0f5ff' : '#fafafa',
+                borderRadius: 8,
+                border: field.templateLabel ? '1px solid #adc6ff' : '1px solid transparent',
+              }}
+            >
+              {/* 字段名 */}
+              <Input
+                value={field.name}
+                onChange={e => {
+                  const newFields = [...batchFields]
+                  newFields[index].name = e.target.value
+                  // 如果手动修改字段名，清除模板关联
+                  if (newFields[index].templateLabel && e.target.value !== newFields[index].templateLabel) {
+                    newFields[index].templateLabel = undefined
+                  }
+                  setBatchFields(newFields)
+                }}
+                placeholder="字段名"
+                style={{ flex: 2, fontFamily: 'monospace', fontSize: 13 }}
+                size="small"
+              />
+              {/* 值来源（模板选择） */}
+              <Select
+                value={field.templateLabel || undefined}
+                onChange={v => {
+                  const newFields = [...batchFields]
+                  newFields[index].templateLabel = v
+                  // 如果选择了模板，自动填充字段名
+                  if (v && !newFields[index].name) {
+                    newFields[index].name = v
+                  }
+                  setBatchFields(newFields)
+                }}
+                allowClear
+                placeholder="值来源"
+                style={{ width: 100, fontSize: 12 }}
+                size="small"
+                options={[
+                  { value: undefined, label: <span style={{ color: '#999' }}>无</span> },
+                  ...fieldValueTemplates.map(t => ({
+                    value: t.label,
+                    label: <span style={{ fontFamily: 'monospace' }}>{t.label}</span>,
+                  }))
+                ]}
+              />
+              {/* 类型 */}
+              <Select
+                value={field.type}
+                onChange={v => {
+                  const newFields = [...batchFields]
+                  newFields[index].type = v
+                  // 清除不需要大小的类型的 size
+                  if (!['VARCHAR', 'CHAR', 'DECIMAL'].includes(v)) {
+                    newFields[index].size = ''
+                  }
+                  setBatchFields(newFields)
+                }}
+                style={{ width: 110, fontSize: 12 }}
+                size="small"
+                options={[
+                  { value: 'TIMESTAMP', label: 'TIMESTAMP' },
+                  { value: 'DATETIME', label: 'DATETIME' },
+                  { value: 'DATE', label: 'DATE' },
+                  { value: 'STRING', label: 'STRING' },
+                  { value: 'VARCHAR', label: 'VARCHAR' },
+                  { value: 'CHAR', label: 'CHAR' },
+                  { value: 'TEXT', label: 'TEXT' },
+                  { value: 'BIGINT', label: 'BIGINT' },
+                  { value: 'INT', label: 'INT' },
+                  { value: 'DECIMAL', label: 'DECIMAL' },
+                  { value: 'DOUBLE', label: 'DOUBLE' },
+                  { value: 'BOOLEAN', label: 'BOOLEAN' },
+                ]}
+              />
+              {/* 大小 */}
+              <Input
+                value={field.size}
+                onChange={e => {
+                  const newFields = [...batchFields]
+                  newFields[index].size = e.target.value
+                  setBatchFields(newFields)
+                }}
+                placeholder={
+                  ['VARCHAR', 'CHAR', 'DECIMAL'].includes(field.type)
+                    ? (field.type === 'DECIMAL' ? '10,2' : '255')
+                    : '-'
+                }
+                disabled={!['VARCHAR', 'CHAR', 'DECIMAL'].includes(field.type)}
+                style={{
+                  width: 60,
+                  fontFamily: 'monospace',
+                  fontSize: 12,
+                  background: ['VARCHAR', 'CHAR', 'DECIMAL'].includes(field.type) ? '#fff' : '#fafafa',
+                  color: ['VARCHAR', 'CHAR', 'DECIMAL'].includes(field.type) ? 'inherit' : '#ccc',
+                }}
+                size="small"
+              />
+              {/* 删除按钮 */}
+              {batchFields.length > 1 && (
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<DeleteOutlined style={{ fontSize: 13, color: '#999' }} />}
+                  onClick={() => setBatchFields(prev => prev.filter((_, i) => i !== index))}
+                  style={{ padding: '0 4px' }}
+                />
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* 底部操作栏 */}
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          paddingTop: 8,
+          borderTop: '1px solid #f0f0f0',
+        }}>
+          <Button
+            type="text"
+            size="small"
+            icon={<PlusOutlined style={{ fontSize: 12 }} />}
+            onClick={() => setBatchFields(prev => [...prev, { name: '', type: 'STRING', size: '' }])}
+            style={{ color: '#1890ff', padding: '0 8px' }}
+          >
+            添加字段
+          </Button>
+          <Space size={8}>
+            <Button
+              size="small"
+              onClick={() => {
+                setBatchAddFieldVisible(false)
+                setBatchFields([{ name: '', type: 'TIMESTAMP', size: '' }])
+              }}
+              style={{ borderRadius: 6 }}
+            >
+              取消
+            </Button>
+            <Button
+              type="primary"
+              size="small"
+              onClick={handleBatchAddField}
+              disabled={!batchFields.some(f => f.name.trim())}
+              style={{ borderRadius: 6 }}
+            >
+              添加到所有表
+            </Button>
+          </Space>
+        </div>
       </Modal>
 
     </div>

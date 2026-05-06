@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard'
 import DataSources from './pages/DataSources'
 import FileManager from './pages/FileManager'
 import DataSync from './pages/DataSync'
+import FieldTemplates from './pages/FieldTemplates'
 import DataExplorer from './pages/DataExplorer'
 import Scheduler from './pages/Scheduler'
 import Admin from './pages/Admin'
@@ -31,6 +32,7 @@ function App() {
         <Route path="datasources" element={<DataSources />} />
         <Route path="files" element={<FileManager />} />
         <Route path="data-sync" element={<DataSync />} />
+        <Route path="field-templates" element={<FieldTemplates />} />
         <Route path="data-explorer" element={<DataExplorer />} />
         <Route path="scheduler" element={<Scheduler />} />
         <Route path="admin" element={<Admin />} />

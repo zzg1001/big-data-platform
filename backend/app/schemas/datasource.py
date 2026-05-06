@@ -31,7 +31,7 @@ class DataSourceCreate(BaseModel):
     type: DataSourceType
     host: str = Field(..., max_length=255)
     port: int = Field(..., ge=1, le=65535)
-    database: str = Field(..., max_length=100)
+    database: Optional[str] = Field(None, max_length=100)
     username: str = Field(..., max_length=100)
     password: str = Field(..., max_length=255)
     schema_name: Optional[str] = Field(None, max_length=100)
@@ -89,7 +89,7 @@ class DataSourceTest(BaseModel):
     type: DataSourceType
     host: str
     port: int
-    database: str
+    database: Optional[str] = None
     username: str
     password: str
     schema_name: Optional[str] = None

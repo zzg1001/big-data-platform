@@ -13,6 +13,7 @@ import {
   DashboardOutlined,
   SyncOutlined,
   GoldOutlined,
+  TagsOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 
@@ -21,7 +22,15 @@ const { Header, Sider, Content } = Layout
 const menuItems = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
   { key: '/datasources', icon: <DatabaseOutlined />, label: '数据源管理' },
-  { key: '/data-sync', icon: <SyncOutlined />, label: '数据同步' },
+  {
+    key: 'sync-group',
+    icon: <SyncOutlined />,
+    label: '数据同步',
+    children: [
+      { key: '/data-sync', icon: <SyncOutlined />, label: '同步任务' },
+      { key: '/field-templates', icon: <TagsOutlined />, label: '字段模板' },
+    ],
+  },
   { key: '/data-explorer', icon: <GoldOutlined />, label: '数据探索' },
   { key: '/files', icon: <FileOutlined />, label: '文件管理' },
   { key: '/scheduler', icon: <ScheduleOutlined />, label: '调度管理' },
@@ -78,6 +87,7 @@ export default function MainLayout() {
           theme="dark"
           mode="inline"
           selectedKeys={[location.pathname]}
+          defaultOpenKeys={['sync-group']}
           items={menuItems}
           onClick={handleMenuClick}
         />

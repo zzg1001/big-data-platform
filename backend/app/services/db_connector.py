@@ -25,7 +25,7 @@ class DatabaseConnector:
         db_type: DataSourceType,
         host: str,
         port: int,
-        database: str,
+        database: Optional[str],
         username: str,
         password: str,
         schema_name: Optional[str] = None,
@@ -35,12 +35,20 @@ class DatabaseConnector:
         # URL encode username and password to handle special characters
         encoded_username = quote_plus(username)
         encoded_password = quote_plus(password)
+        db_part = database or ""
 
         if db_type == DataSourceType.MYSQL:
-            return f"mysql+pymysql://{encoded_username}:{encoded_password}@{host}:{port}/{database}?charset=utf8mb4"
+            url = f"mysql+pymysql://{encoded_username}:{encoded_password}@{host}:{port}/{db_part}"
+            if db_part:
+                url += "?charset=utf8mb4"
+            else:
+                url += "?charset=utf8mb4"
+            return url
 
         elif db_type == DataSourceType.POSTGRESQL:
-            url = f"postgresql+psycopg2://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
+            # PostgreSQL 需要一个数据库名，默认使用 postgres
+            db_name = database or "postgres"
+            url = f"postgresql+psycopg2://{encoded_username}:{encoded_password}@{host}:{port}/{db_name}"
             if schema_name:
                 url += f"?options=-csearch_path={schema_name}"
             return url
@@ -48,13 +56,13 @@ class DatabaseConnector:
         elif db_type == DataSourceType.ORACLE:
             if service_name:
                 return f"oracle+cx_oracle://{encoded_username}:{encoded_password}@{host}:{port}/?service_name={service_name}"
-            return f"oracle+cx_oracle://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
+            return f"oracle+cx_oracle://{encoded_username}:{encoded_password}@{host}:{port}/{db_part}"
 
         elif db_type == DataSourceType.HIVE:
-            return f"hive://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
+            return f"hive://{encoded_username}:{encoded_password}@{host}:{port}/{db_part}"
 
         elif db_type == DataSourceType.SQLSERVER:
-            return f"mssql+pymssql://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
+            return f"mssql+pymssql://{encoded_username}:{encoded_password}@{host}:{port}/{db_part}"
 
         raise ValueError(f"Unsupported database type: {db_type}")
 
@@ -65,7 +73,7 @@ class DatabaseConnector:
         db_type: DataSourceType,
         host: str,
         port: int,
-        database: str,
+        database: Optional[str],
         username: str,
         encrypted_password: str,
         schema_name: Optional[str] = None,
@@ -116,7 +124,7 @@ class DatabaseConnector:
         db_type: DataSourceType,
         host: str,
         port: int,
-        database: str,
+        database: Optional[str],
         username: str,
         password: str,
         schema_name: Optional[str] = None,

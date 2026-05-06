@@ -220,7 +220,11 @@ export const syncApi = {
   getColumns: (id: number) => api.get(`/api/v1/sync/${id}/columns`),
   getTableColumns: (datasourceId: number, tableName: string, schemaName?: string) =>
     api.get('/api/v1/sync/table-columns', {
-      params: { datasource_id: datasourceId, table_name: tableName, schema_name: schemaName },
+      params: {
+        datasource_id: datasourceId,
+        table_name: tableName,
+        ...(schemaName ? { schema_name: schemaName } : {}),
+      },
     }),
   getLogs: (id: number) => api.get(`/api/v1/sync/${id}/logs`),
   generateDdl: (id: number) => api.post(`/api/v1/sync/${id}/generate-ddl`),

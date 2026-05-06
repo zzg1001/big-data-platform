@@ -41,7 +41,7 @@ class DataSource(Base):
     type = Column(Enum(DataSourceType), nullable=False)
     host = Column(String(255), nullable=False)
     port = Column(BigInteger, nullable=False)
-    database = Column(String(100), nullable=False)
+    database = Column(String(100), nullable=True)
     username = Column(String(100), nullable=False)
     encrypted_password = Column(Text, nullable=False)
 

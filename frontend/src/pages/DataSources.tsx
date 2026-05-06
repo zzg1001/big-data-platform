@@ -271,8 +271,8 @@ export default function DataSources() {
           <Form.Item name="port" label="端口" rules={[{ required: true }]}>
             <InputNumber style={{ width: '100%' }} placeholder="3306" />
           </Form.Item>
-          <Form.Item name="database" label="数据库" rules={[{ required: true }]}>
-            <Input placeholder="数据库名" />
+          <Form.Item name="database" label="数据库">
+            <Input placeholder="可选，留空则连接后选择" />
           </Form.Item>
           <Form.Item name="username" label="用户名" rules={[{ required: true }]}>
             <Input placeholder="用户名" />
