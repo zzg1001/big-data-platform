@@ -1329,3 +1329,149 @@ async def backfill_sync_task(
             )
 
     return {"success": False, "error": "Invalid backfill mode"}
+
+
+@router.post("/internal/{task_id}/execute", response_model=dict)
+async def internal_execute_sync_task(
+    task_id: int,
+    x_internal_key: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint for Airflow DAG to execute sync task.
+    Uses internal API key instead of user authentication.
+    """
+    from app.core.config import settings
+    from fastapi import Header
+
+    # Validate internal API key from query param or header
+    if x_internal_key != settings.INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid internal API key"
+        )
+
+    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
+
+    if task.status == SyncStatus.RUNNING:
+        return {"success": False, "message": "Task is already running", "task_id": task_id}
+
+    # Get datasources
+    source_ds = await get_datasource(db, task.source_datasource_id)
+
+    # Create log entry
+    log = SyncLog(
+        sync_task_id=task.id,
+        sync_mode=task.sync_mode,
+        status="pending",
+        started_at=datetime.utcnow(),
+    )
+    db.add(log)
+    task.status = SyncStatus.RUNNING
+    await db.flush()
+    await db.refresh(log)
+
+    # Execute sync
+    try:
+        source_engine = get_engine_for_datasource(source_ds)
+        if task.target_datasource_id:
+            target_ds = await get_datasource(db, task.target_datasource_id)
+            target_engine = get_engine_for_datasource(target_ds)
+        else:
+            target_engine = await get_warehouse_engine(db)
+        sync_service = SyncService(source_engine, target_engine)
+
+        log = sync_service.execute_sync(task, log)
+
+        # Update task status
+        if log.status == "success":
+            task.status = SyncStatus.ACTIVE
+            task.last_sync_at = datetime.utcnow()
+            task.last_sync_rows = log.rows_written
+            task.last_error = None
+        else:
+            task.status = SyncStatus.FAILED
+            task.last_error = log.error_message
+
+        await db.flush()
+
+        return {
+            "success": log.status == "success",
+            "task_id": task_id,
+            "log_id": log.id,
+            "rows_read": log.rows_read,
+            "rows_written": log.rows_written,
+            "status": log.status,
+            "error": log.error_message,
+        }
+
+    except Exception as e:
+        log.status = "failed"
+        log.error_message = str(e)
+        log.finished_at = datetime.utcnow()
+        task.status = SyncStatus.FAILED
+        task.last_error = str(e)
+        await db.flush()
+        return {
+            "success": False,
+            "task_id": task_id,
+            "error": str(e),
+        }
+
+
+@router.post("/internal/{task_id}/update-status", response_model=dict)
+async def internal_update_sync_status(
+    task_id: int,
+    x_internal_key: str = None,
+    rows_read: int = 0,
+    rows_written: int = 0,
+    status_str: str = "success",
+    error_msg: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint for Airflow DAG to update sync task status.
+    Lightweight API - failures here don't affect the actual sync.
+    """
+    from app.core.config import settings
+
+    # Validate internal API key
+    if x_internal_key != settings.INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid internal API key"
+        )
+
+    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        return {"success": False, "error": "Task not found"}
+
+    # Update task status
+    if status_str == "success":
+        task.status = SyncStatus.ACTIVE
+        task.last_sync_at = datetime.utcnow()
+        task.last_sync_rows = rows_written
+        task.last_error = None
+    else:
+        task.status = SyncStatus.FAILED
+        task.last_error = error_msg
+
+    # Create log entry
+    log = SyncLog(
+        sync_task_id=task.id,
+        sync_mode=task.sync_mode,
+        status=status_str,
+        rows_read=rows_read,
+        rows_written=rows_written,
+        error_message=error_msg,
+        started_at=datetime.utcnow(),
+        completed_at=datetime.utcnow(),
+    )
+    db.add(log)
+    await db.flush()
+
+    return {"success": True, "task_id": task_id, "status": status_str}

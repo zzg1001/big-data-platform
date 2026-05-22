@@ -108,6 +108,8 @@ export default function Scheduler() {
   // Batch selection
   const [selectedIds, setSelectedIds] = useState<number[]>([])
   const [batchDeleting, setBatchDeleting] = useState(false)
+  const [batchEnabling, setBatchEnabling] = useState(false)
+  const [batchDisabling, setBatchDisabling] = useState(false)
 
   // Draggable popover
   const [popoverPosition, setPopoverPosition] = useState({ x: 0, y: 0 })
@@ -395,6 +397,76 @@ export default function Scheduler() {
     loadSchedules()
   }
 
+  // Batch enable
+  const handleBatchEnable = async () => {
+    if (selectedIds.length === 0) return
+
+    // 过滤出未上线的调度
+    const toEnable = schedules.filter(s => selectedIds.includes(s.id) && !s.is_enabled)
+    if (toEnable.length === 0) {
+      message.warning('选中的调度都已上线')
+      return
+    }
+
+    setBatchEnabling(true)
+    let success = 0
+    let fail = 0
+
+    for (const schedule of toEnable) {
+      try {
+        await syncScheduleApi.enable(schedule.id)
+        success++
+      } catch (error) {
+        fail++
+      }
+    }
+
+    setBatchEnabling(false)
+    setSelectedIds([])
+
+    if (fail === 0) {
+      message.success(`已上线 ${success} 个调度`)
+    } else {
+      message.warning(`成功 ${success} 个，失败 ${fail} 个`)
+    }
+    loadSchedules()
+  }
+
+  // Batch disable
+  const handleBatchDisable = async () => {
+    if (selectedIds.length === 0) return
+
+    // 过滤出已上线的调度
+    const toDisable = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled)
+    if (toDisable.length === 0) {
+      message.warning('选中的调度都未上线')
+      return
+    }
+
+    setBatchDisabling(true)
+    let success = 0
+    let fail = 0
+
+    for (const schedule of toDisable) {
+      try {
+        await syncScheduleApi.disable(schedule.id)
+        success++
+      } catch (error) {
+        fail++
+      }
+    }
+
+    setBatchDisabling(false)
+    setSelectedIds([])
+
+    if (fail === 0) {
+      message.success(`已下线 ${success} 个调度`)
+    } else {
+      message.warning(`成功 ${success} 个，失败 ${fail} 个`)
+    }
+    loadSchedules()
+  }
+
   const columns = [
     {
       title: '调度名称',
@@ -600,29 +672,124 @@ export default function Scheduler() {
         </Space>
         <Space>
           {selectedIds.length > 0 && (
-            <Button
-              danger
-              icon={<DeleteOutlined />}
-              loading={batchDeleting}
-              onClick={() => {
-                // 检查是否有已上线的
-                const enabledCount = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled).length
-                if (enabledCount > 0) {
-                  message.warning(`有 ${enabledCount} 个调度已上线，请先下线后再删除`)
-                  return
-                }
-                Modal.confirm({
-                  title: '确认删除',
-                  content: `确定要删除选中的 ${selectedIds.length} 个调度吗？`,
-                  okText: '删除',
-                  okType: 'danger',
-                  cancelText: '取消',
-                  onOk: handleBatchDelete,
-                })
-              }}
-            >
-              批量删除 ({selectedIds.length})
-            </Button>
+            <>
+              <Button
+                type="primary"
+                icon={<PlayCircleOutlined />}
+                loading={batchEnabling}
+                onClick={() => {
+                  const offlineCount = schedules.filter(s => selectedIds.includes(s.id) && !s.is_enabled).length
+                  if (offlineCount === 0) {
+                    message.warning('选中的调度都已上线')
+                    return
+                  }
+                  Modal.confirm({
+                    title: null,
+                    icon: null,
+                    content: (
+                      <div style={{ textAlign: 'center', padding: '20px 0' }}>
+                        <div style={{ fontSize: 48, marginBottom: 16 }}>
+                          <PlayCircleOutlined style={{ color: '#52c41a' }} />
+                        </div>
+                        <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>批量上线</div>
+                        <div style={{ fontSize: 13, color: '#666' }}>
+                          确定要上线选中的 {offlineCount} 个调度吗？
+                        </div>
+                      </div>
+                    ),
+                    okText: '上线',
+                    cancelText: '取消',
+                    onOk: handleBatchEnable,
+                    centered: true,
+                    width: 320,
+                    okButtonProps: { style: { background: '#52c41a', borderColor: '#52c41a', borderRadius: 8, height: 36 } },
+                    cancelButtonProps: { style: { borderRadius: 8, height: 36 } },
+                    styles: { body: { padding: 0 } },
+                    className: 'apple-style-modal',
+                  })
+                }}
+                style={{ background: '#52c41a', borderColor: '#52c41a' }}
+              >
+                批量上线
+              </Button>
+              <Button
+                icon={<PauseOutlined />}
+                loading={batchDisabling}
+                onClick={() => {
+                  const onlineCount = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled).length
+                  if (onlineCount === 0) {
+                    message.warning('选中的调度都未上线')
+                    return
+                  }
+                  Modal.confirm({
+                    title: null,
+                    icon: null,
+                    content: (
+                      <div style={{ textAlign: 'center', padding: '20px 0' }}>
+                        <div style={{ fontSize: 48, marginBottom: 16 }}>
+                          <PauseOutlined style={{ color: '#faad14' }} />
+                        </div>
+                        <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>批量下线</div>
+                        <div style={{ fontSize: 13, color: '#666' }}>
+                          确定要下线选中的 {onlineCount} 个调度吗？
+                        </div>
+                      </div>
+                    ),
+                    okText: '下线',
+                    cancelText: '取消',
+                    onOk: handleBatchDisable,
+                    centered: true,
+                    width: 320,
+                    okButtonProps: { style: { background: '#faad14', borderColor: '#faad14', borderRadius: 8, height: 36 } },
+                    cancelButtonProps: { style: { borderRadius: 8, height: 36 } },
+                    styles: { body: { padding: 0 } },
+                    className: 'apple-style-modal',
+                  })
+                }}
+                style={{ color: '#faad14', borderColor: '#faad14' }}
+              >
+                批量下线
+              </Button>
+              <Button
+                danger
+                icon={<DeleteOutlined />}
+                loading={batchDeleting}
+                onClick={() => {
+                  const enabledCount = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled).length
+                  if (enabledCount > 0) {
+                    message.warning(`有 ${enabledCount} 个调度已上线，请先下线后再删除`)
+                    return
+                  }
+                  Modal.confirm({
+                    title: null,
+                    icon: null,
+                    content: (
+                      <div style={{ textAlign: 'center', padding: '20px 0' }}>
+                        <div style={{ fontSize: 48, marginBottom: 16 }}>
+                          <DeleteOutlined style={{ color: '#ff4d4f' }} />
+                        </div>
+                        <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>批量删除</div>
+                        <div style={{ fontSize: 13, color: '#666' }}>
+                          确定要删除选中的 {selectedIds.length} 个调度吗？
+                        </div>
+                      </div>
+                    ),
+                    okText: '删除',
+                    okType: 'danger',
+                    cancelText: '取消',
+                    onOk: handleBatchDelete,
+                    centered: true,
+                    width: 320,
+                    okButtonProps: { style: { borderRadius: 8, height: 36 } },
+                    cancelButtonProps: { style: { borderRadius: 8, height: 36 } },
+                    styles: { body: { padding: 0 } },
+                    className: 'apple-style-modal',
+                  })
+                }}
+              >
+                批量删除
+              </Button>
+            </>
           )}
           <Button icon={<ReloadOutlined />} onClick={loadSchedules}>
             刷新

@@ -251,6 +251,11 @@ async def enable_sync_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """Enable a sync schedule - generate DAG and activate."""
+    from app.models.datasource import DataSource
+    from app.core.security import decrypt_password
+    from app.models.system_config import SystemConfig
+    import json
+
     result = await db.execute(
         select(SyncSchedule, SyncTask)
         .join(SyncTask, SyncSchedule.sync_task_id == SyncTask.id)
@@ -271,21 +276,95 @@ async def enable_sync_schedule(
             detail="Schedule is already enabled"
         )
 
+    # Get source datasource
+    source_ds_result = await db.execute(
+        select(DataSource).where(DataSource.id == task.source_datasource_id)
+    )
+    source_ds = source_ds_result.scalar_one_or_none()
+    if not source_ds:
+        raise HTTPException(status_code=404, detail="Source datasource not found")
+
+    # Get target datasource (or warehouse config)
+    target_config = None
+    if task.target_datasource_id:
+        target_ds_result = await db.execute(
+            select(DataSource).where(DataSource.id == task.target_datasource_id)
+        )
+        target_ds = target_ds_result.scalar_one_or_none()
+        if target_ds:
+            target_config = {
+                "type": target_ds.type.value,
+                "host": target_ds.host,
+                "port": target_ds.port,
+                "database": target_ds.database,
+                "username": target_ds.username,
+                "password": decrypt_password(target_ds.encrypted_password),
+            }
+
+    if not target_config:
+        # Use system warehouse config
+        wh_result = await db.execute(
+            select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
+        )
+        wh_config = wh_result.scalar_one_or_none()
+        if wh_config and wh_config.config_value:
+            wh = json.loads(wh_config.config_value)
+            # Decrypt the encrypted_password from warehouse config
+            wh_password = wh.get("encrypted_password")
+            if wh_password:
+                wh_password = decrypt_password(wh_password)
+            target_config = {
+                "type": wh.get("type", "mysql"),
+                "host": wh.get("host"),
+                "port": wh.get("port"),
+                "database": wh.get("database"),
+                "username": wh.get("username"),
+                "password": wh_password,
+            }
+
+    if not target_config:
+        raise HTTPException(status_code=400, detail="No target datasource or warehouse configured")
+
     # Generate DAG ID
     dag_id = f"sync_schedule_{schedule.id}_{task.source_table.replace('.', '_')}"
     schedule.dag_id = dag_id
 
-    # Generate DAG file content
+    # Build source and target connection URLs
+    source_password = decrypt_password(source_ds.encrypted_password)
+    source_type = source_ds.type.value
+    target_type = target_config["type"]
+
+    # Escape special characters in passwords for URL
+    import urllib.parse
+    source_password_escaped = urllib.parse.quote_plus(source_password or "")
+    target_password_escaped = urllib.parse.quote_plus(target_config["password"] or "")
+
+    source_url = f"{source_type}://{source_ds.username}:{source_password_escaped}@{source_ds.host}:{source_ds.port}/{source_ds.database or ''}"
+    target_url = f"{target_type}://{target_config['username']}:{target_password_escaped}@{target_config['host']}:{target_config['port']}/{target_config['database'] or ''}"
+
+    # Build table names
+    source_table = f"{task.source_schema}.{task.source_table}" if task.source_schema else task.source_table
+    target_table = f"{task.target_schema}.{task.target_table}" if task.target_schema else task.target_table
+
+    # Get sync configuration
+    sync_mode = task.sync_mode.value if task.sync_mode else "full"
+    selected_columns = task.selected_columns if task.selected_columns else "None"
+    column_mapping = task.column_mapping if task.column_mapping else "None"
+    where_condition = f'"{task.where_condition}"' if task.where_condition else "None"
+    incremental_column = f'"{task.incremental_column}"' if task.incremental_column else "None"
+    incremental_value = f'"{task.incremental_value}"' if task.incremental_value else "None"
+
+    # Generate DAG file content with direct sync logic
     dag_content = f'''"""
 Auto-generated Airflow DAG for sync schedule: {schedule.name}
 Sync Task: {task.name}
-Source: {task.source_table}
-Target: {task.target_table}
+Source: {source_table}
+Target: {target_table}
+Mode: {sync_mode}
 """
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-import requests
 
 default_args = {{
     'owner': 'data_platform',
@@ -295,17 +374,106 @@ default_args = {{
     'retry_delay': timedelta(minutes=5),
 }}
 
+# Sync configuration
+SYNC_CONFIG = {{
+    "task_id": {task.id},
+    "source_url": "{source_url}",
+    "target_url": "{target_url}",
+    "source_table": "{source_table}",
+    "target_table": "{target_table}",
+    "sync_mode": "{sync_mode}",
+    "selected_columns": {selected_columns},
+    "column_mapping": {column_mapping},
+    "where_condition": {where_condition},
+    "incremental_column": {incremental_column},
+    "incremental_value": {incremental_value},
+}}
+
 def execute_sync():
-    """Call the data platform API to execute sync."""
-    import os
-    api_url = os.environ.get('DATA_PLATFORM_API_URL', 'http://backend:8000')
-    response = requests.post(
-        f"{{api_url}}/api/v1/sync/{task.id}/execute",
-        headers={{"Authorization": "Bearer YOUR_API_TOKEN"}},
-        timeout=3600
-    )
-    response.raise_for_status()
-    return response.json()
+    """Execute data synchronization directly."""
+    import json
+    from sqlalchemy import create_engine, text
+
+    config = SYNC_CONFIG
+
+    # Create engines
+    source_engine = create_engine(config["source_url"])
+    target_engine = create_engine(config["target_url"])
+
+    # Build SELECT query
+    columns = config["selected_columns"]
+    col_str = ", ".join(columns) if columns else "*"
+    sql = f"SELECT {{col_str}} FROM {{config['source_table']}}"
+
+    # Build WHERE clause
+    conditions = []
+    if config["where_condition"]:
+        conditions.append(f"({{config['where_condition']}})")
+
+    if config["sync_mode"] == "incremental" and config["incremental_column"] and config["incremental_value"]:
+        conditions.append(f"{{config['incremental_column']}} > '{{config['incremental_value']}}'")
+
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+
+    if config["sync_mode"] == "incremental" and config["incremental_column"]:
+        sql += f" ORDER BY {{config['incremental_column']}}"
+
+    # Read source data
+    with source_engine.connect() as conn:
+        result = conn.execute(text(sql))
+        columns_list = list(result.keys())
+        rows = result.fetchall()
+
+    rows_read = len(rows)
+    print(f"Read {{rows_read}} rows from source")
+
+    if not rows:
+        print("No data to sync")
+        return {{"success": True, "rows_read": 0, "rows_written": 0}}
+
+    # Apply column mapping
+    if config["column_mapping"]:
+        columns_list = [config["column_mapping"].get(col, col) for col in columns_list]
+
+    # Write to target (use begin() for auto-commit transaction)
+    with target_engine.begin() as conn:
+        # For full sync, truncate target table first
+        if config["sync_mode"] == "full":
+            conn.execute(text(f"TRUNCATE TABLE {{config['target_table']}}"))
+
+        # Build INSERT statement
+        placeholders = ", ".join([f":p{{i}}" for i in range(len(columns_list))])
+        col_names = ", ".join([f"`{{col}}`" for col in columns_list])
+        insert_sql = f"INSERT INTO {{config['target_table']}} ({{col_names}}) VALUES ({{placeholders}})"
+
+        # Insert in batches
+        batch_size = 1000
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            for row in batch:
+                params = {{f"p{{j}}": val for j, val in enumerate(row)}}
+                conn.execute(text(insert_sql), params)
+        # Transaction auto-commits when exiting the 'with' block
+
+    print(f"Written {{rows_read}} rows to target")
+
+    # Update sync status via API (optional, non-blocking)
+    try:
+        import requests
+        import os
+        api_url = os.environ.get('DATA_PLATFORM_API_URL', 'http://host.docker.internal:8000')
+        internal_key = os.environ.get('DATA_PLATFORM_INTERNAL_KEY', 'bigdata_platform_internal_key_2024')
+        requests.post(
+            f"{{api_url}}/api/v1/sync/internal/{{config['task_id']}}/update-status",
+            params={{"x_internal_key": internal_key}},
+            json={{"rows_read": rows_read, "rows_written": rows_read, "status": "success"}},
+            timeout=10
+        )
+    except Exception as e:
+        print(f"Failed to update status: {{e}}")
+
+    return {{"success": True, "rows_read": rows_read, "rows_written": rows_read}}
 
 with DAG(
     dag_id='{dag_id}',
@@ -344,6 +512,17 @@ with DAG(
     schedule.airflow_status = "active"
 
     await db.flush()
+
+    # Unpause DAG in Airflow - retry a few times as Airflow needs time to detect new DAG
+    import asyncio
+    for attempt in range(5):
+        try:
+            success = await airflow_service.unpause_dag(dag_id)
+            if success:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(2)  # Wait 2 seconds before retry
 
     return {
         "success": True,

@@ -37,3 +37,35 @@ body {
   border: 1px solid #d9d9d9;
   border-radius: 4px;
 }
+
+/* Apple-style Modal */
+.apple-style-modal .ant-modal-content {
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(0, 0, 0, 0.05);
+}
+
+.apple-style-modal .ant-modal-body {
+  padding: 24px;
+}
+
+.apple-style-modal .ant-modal-confirm-body {
+  display: block;
+}
+
+.apple-style-modal .ant-modal-confirm-btns {
+  display: flex;
+  gap: 12px;
+  margin-top: 24px;
+  justify-content: center;
+}
+
+.apple-style-modal .ant-modal-confirm-btns .ant-btn {
+  flex: 1;
+  min-width: 100px;
+  font-weight: 500;
+}
+
+.apple-style-modal .ant-modal-confirm-content {
+  margin: 0;
+}

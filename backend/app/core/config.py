@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173"]
 
+    # Internal API Key (for Airflow DAG calls)
+    INTERNAL_API_KEY: str = "bigdata_platform_internal_key_2024"
+
     class Config:
         env_file = ".env"
         extra = "ignore"

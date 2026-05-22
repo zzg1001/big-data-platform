@@ -47,8 +47,8 @@ with DAG(
 {task_dependencies}
 '''
 
-    def __init__(self, dags_folder: str = "/opt/airflow/dags/generated"):
-        self.dags_folder = dags_folder
+    def __init__(self, dags_folder: str = None):
+        self.dags_folder = dags_folder or settings.AIRFLOW_DAGS_PATH
         os.makedirs(self.dags_folder, exist_ok=True)
 
     def sanitize_dag_id(self, name: str) -> str:
