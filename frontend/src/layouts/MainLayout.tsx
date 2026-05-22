@@ -115,7 +115,12 @@ export default function MainLayout() {
           </Dropdown>
         </Header>
         <Content
-          style={{
+          style={location.pathname === '/data-explorer' ? {
+            margin: 0,
+            padding: 0,
+            background: token.colorBgContainer,
+            overflow: 'hidden',
+          } : {
             margin: 24,
             padding: 24,
             background: token.colorBgContainer,
