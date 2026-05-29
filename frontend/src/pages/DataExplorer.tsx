@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   Table,
   Typography,
@@ -14,6 +15,8 @@ import {
   Tabs,
   Descriptions,
   Splitter,
+  Modal,
+  Form,
 } from 'antd'
 import {
   GoldOutlined,
@@ -30,13 +33,14 @@ import {
   PlusOutlined,
   CloseOutlined,
   CaretRightOutlined,
+  SaveOutlined,
 } from '@ant-design/icons'
 import Editor, { Monaco } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
-import { configApi, warehouseApi, aiApi } from '../services/api'
+import { configApi, warehouseApi, aiApi, etlApi } from '../services/api'
 
 const { Title, Text } = Typography
-const { Search } = Input
+const { Search, TextArea } = Input
 
 interface ColumnInfo {
   name: string
@@ -48,7 +52,9 @@ interface ColumnInfo {
 }
 
 export default function DataExplorer() {
-  // 数仓配置
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 平台数据库配置
   const [warehouseConfig, setWarehouseConfig] = useState<any>(null)
   const [loadingConfig, setLoadingConfig] = useState(true)
 
@@ -116,6 +122,32 @@ export default function DataExplorer() {
     }
   }, [editorTabs, activeEditorTab, tabCounter])
 
+  // 从 URL 参数加载 ETL 任务的 SQL
+  useEffect(() => {
+    const etlId = searchParams.get('etl_id')
+    const etlName = searchParams.get('etl_name')
+    if (etlId) {
+      // 获取 ETL 任务的 SQL
+      etlApi.get(parseInt(etlId)).then(res => {
+        const task = res.data
+        const newId = String(tabCounter + 1)
+        setTabCounter(prev => prev + 1)
+        setEditorTabs(prev => [...prev, {
+          id: newId,
+          title: etlName || task.name || `ETL ${etlId}`,
+          sql: task.sql_content || '',
+          savedSql: task.sql_content || '',
+        }])
+        setActiveEditorTab(newId)
+        message.success(`已加载 ETL 任务: ${etlName || task.name}`)
+      }).catch(() => {
+        message.error('加载 ETL 任务失败')
+      })
+      // 清除 URL 参数
+      setSearchParams({})
+    }
+  }, [searchParams])
+
   // 当前Tab的SQL（从tabs中获取）
   const currentTab = editorTabs.find(t => t.id === activeEditorTab)
   const sql = currentTab?.sql || ''
@@ -140,6 +172,11 @@ export default function DataExplorer() {
 
   // 结果Tab
   const [activeTab, setActiveTab] = useState('result')
+
+  // 保存为ETL任务
+  const [saveEtlModalVisible, setSaveEtlModalVisible] = useState(false)
+  const [saveEtlForm] = Form.useForm()
+  const [savingEtl, setSavingEtl] = useState(false)
 
   // 添加新编辑器Tab
   const addEditorTab = () => {
@@ -373,7 +410,14 @@ export default function DataExplorer() {
         limit: 1000,
       })
       setQueryResult(res.data)
-      message.success(`执行成功，返回 ${res.data.row_count} 行`)
+      // 根据SQL类型显示不同的成功消息
+      if (res.data.sql_type === 'SELECT') {
+        message.success(`查询成功，返回 ${res.data.row_count} 行`)
+      } else if (res.data.sql_type === 'DDL') {
+        message.success('执行成功')
+      } else {
+        message.success(`执行成功，影响 ${res.data.affected_rows} 行`)
+      }
     } catch (error: any) {
       // 错误信息显示在结果框
       setQueryResult({
@@ -469,6 +513,41 @@ export default function DataExplorer() {
       message.error(error.response?.data?.detail || 'AI服务不可用')
     } finally {
       setAiLoading(false)
+    }
+  }
+
+  // 保存为ETL任务
+  const handleSaveAsEtl = () => {
+    if (!sql.trim()) {
+      message.warning('请输入SQL')
+      return
+    }
+    // 使用当前Tab的标题作为默认名称
+    const defaultName = currentTab?.title || 'ETL任务'
+    saveEtlForm.setFieldsValue({
+      name: defaultName,
+      description: '',
+    })
+    setSaveEtlModalVisible(true)
+  }
+
+  const handleSaveEtlSubmit = async () => {
+    try {
+      const values = await saveEtlForm.validateFields()
+      setSavingEtl(true)
+      await etlApi.create({
+        name: values.name,
+        description: values.description,
+        sql_content: sql,
+      })
+      message.success('已保存为ETL任务')
+      setSaveEtlModalVisible(false)
+      saveEtlForm.resetFields()
+    } catch (error: any) {
+      if (error.errorFields) return
+      message.error('保存失败: ' + (error.response?.data?.detail || error.message))
+    } finally {
+      setSavingEtl(false)
     }
   }
 
@@ -739,10 +818,10 @@ export default function DataExplorer() {
       <div style={{ padding: 24 }}>
         <Title level={4}>数据探索</Title>
         <Alert
-          message="数仓未配置"
+          message="平台数据库未配置"
           description={
             <Space direction="vertical">
-              <Text>请先在「系统管理 - 数仓配置」中配置目标数据库连接。</Text>
+              <Text>请先在「系统管理 - 平台数据库配置」中配置目标数据库连接。</Text>
               <Button type="primary" icon={<SettingOutlined />} href="#/admin">
                 前往配置
               </Button>
@@ -771,7 +850,7 @@ export default function DataExplorer() {
             {/* 表列表头部 */}
             <div style={{ padding: '6px 8px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', gap: 4 }}>
               <DatabaseOutlined style={{ fontSize: 12, color: '#8c8c8c' }} />
-              <Text style={{ fontSize: 12, fontWeight: 500 }}>{warehouseConfig.name}</Text>
+              <Text style={{ fontSize: 12, fontWeight: 500 }}>平台数据库</Text>
               <Text type="secondary" style={{ fontSize: 11 }}>({filteredTables.length})</Text>
               <div style={{ flex: 1 }} />
               <Tooltip title="刷新">
@@ -993,6 +1072,15 @@ export default function DataExplorer() {
                       style={{ width: 26, height: 26, padding: 0 }}
                     />
                   </Tooltip>
+                  <div style={{ flex: 1 }} />
+                  <Tooltip title="保存为ETL任务" placement="right">
+                    <Button
+                      size="small"
+                      icon={<SaveOutlined style={{ fontSize: 14 }} />}
+                      onClick={handleSaveAsEtl}
+                      style={{ width: 26, height: 26, padding: 0 }}
+                    />
+                  </Tooltip>
                 </div>
 
                 {/* SQL编辑器 */}
@@ -1067,8 +1155,12 @@ export default function DataExplorer() {
                         </Tag>
                       )}
                       {queryResult && !queryResult.error && !queryResult.multiple && (
-                        <Tag color="blue" style={{ marginLeft: 4, fontSize: 10, padding: '0 4px', lineHeight: '16px' }}>
-                          {queryResult.row_count}
+                        <Tag color={queryResult.sql_type === 'SELECT' ? 'blue' : 'green'} style={{ marginLeft: 4, fontSize: 10, padding: '0 4px', lineHeight: '16px' }}>
+                          {queryResult.sql_type === 'SELECT'
+                            ? queryResult.row_count
+                            : queryResult.sql_type === 'DDL'
+                              ? 'OK'
+                              : queryResult.affected_rows}
                         </Tag>
                       )}
                       {queryResult?.error && (
@@ -1111,38 +1203,54 @@ export default function DataExplorer() {
                               </span>
                             ),
                             children: r.success ? (
-                              <>
+                              r.data?.sql_type === 'SELECT' ? (
+                                // SELECT 查询结果
+                                <>
+                                  <Alert
+                                    message={`${r.sql}`}
+                                    description={`返回 ${r.row_count} 行，耗时 ${r.execution_time_ms}ms`}
+                                    type="success"
+                                    showIcon
+                                    style={{ marginBottom: 8, padding: '4px 12px', fontSize: 12 }}
+                                  />
+                                  <Table
+                                    columns={r.data?.columns?.map((col: string) => ({
+                                      title: col,
+                                      dataIndex: col,
+                                      key: col,
+                                      ellipsis: true,
+                                      width: 150,
+                                    })) || []}
+                                    dataSource={r.data?.rows?.map((row: any[], idx: number) => {
+                                      const obj: any = { key: idx }
+                                      r.data.columns?.forEach((col: string, i: number) => {
+                                        obj[col] = row[i]
+                                      })
+                                      return obj
+                                    }) || []}
+                                    size="small"
+                                    scroll={{ x: 'max-content' }}
+                                    pagination={{
+                                      pageSize: 50,
+                                      showSizeChanger: true,
+                                      showTotal: (total) => `共 ${total} 条`,
+                                    }}
+                                  />
+                                </>
+                              ) : (
+                                // DML/DDL 执行结果
                                 <Alert
                                   message={`${r.sql}`}
-                                  description={`返回 ${r.row_count} 行，耗时 ${r.execution_time_ms}ms`}
+                                  description={
+                                    r.data?.sql_type === 'DDL'
+                                      ? `执行成功，耗时 ${r.execution_time_ms}ms`
+                                      : `影响 ${r.data?.affected_rows} 行，耗时 ${r.execution_time_ms}ms`
+                                  }
                                   type="success"
                                   showIcon
-                                  style={{ marginBottom: 8, padding: '4px 12px', fontSize: 12 }}
+                                  style={{ padding: '8px 12px', fontSize: 12 }}
                                 />
-                                <Table
-                                  columns={r.data?.columns?.map((col: string) => ({
-                                    title: col,
-                                    dataIndex: col,
-                                    key: col,
-                                    ellipsis: true,
-                                    width: 150,
-                                  })) || []}
-                                  dataSource={r.data?.rows?.map((row: any[], idx: number) => {
-                                    const obj: any = { key: idx }
-                                    r.data.columns?.forEach((col: string, i: number) => {
-                                      obj[col] = row[i]
-                                    })
-                                    return obj
-                                  }) || []}
-                                  size="small"
-                                  scroll={{ x: 'max-content' }}
-                                  pagination={{
-                                    pageSize: 50,
-                                    showSizeChanger: true,
-                                    showTotal: (total) => `共 ${total} 条`,
-                                  }}
-                                />
-                              </>
+                              )
                             ) : (
                               <Alert
                                 message={r.sql}
@@ -1155,25 +1263,41 @@ export default function DataExplorer() {
                           }))}
                         />
                       ) : queryResult ? (
-                        <>
+                        queryResult.sql_type === 'SELECT' ? (
+                          // SELECT 查询结果 - 显示表格
+                          <>
+                            <Alert
+                              message={`返回 ${queryResult.row_count} 行，耗时 ${queryResult.execution_time_ms}ms`}
+                              type="success"
+                              showIcon
+                              style={{ marginBottom: 8, padding: '4px 12px', fontSize: 12 }}
+                            />
+                            <Table
+                              columns={resultColumns}
+                              dataSource={resultData}
+                              size="small"
+                              scroll={{ x: 'max-content' }}
+                              pagination={{
+                                pageSize: 50,
+                                showSizeChanger: true,
+                                showTotal: (total) => `共 ${total} 条`,
+                              }}
+                            />
+                          </>
+                        ) : (
+                          // DML/DDL 执行结果 - 显示影响行数
                           <Alert
-                            message={`返回 ${queryResult.row_count} 行，耗时 ${queryResult.execution_time_ms}ms`}
+                            message={
+                              queryResult.sql_type === 'DDL'
+                                ? '执行成功'
+                                : `执行成功，影响 ${queryResult.affected_rows} 行`
+                            }
+                            description={`耗时 ${queryResult.execution_time_ms}ms`}
                             type="success"
                             showIcon
-                            style={{ marginBottom: 8, padding: '4px 12px', fontSize: 12 }}
+                            style={{ padding: '12px 16px', fontSize: 13 }}
                           />
-                          <Table
-                            columns={resultColumns}
-                            dataSource={resultData}
-                            size="small"
-                            scroll={{ x: 'max-content' }}
-                            pagination={{
-                              pageSize: 50,
-                              showSizeChanger: true,
-                              showTotal: (total) => `共 ${total} 条`,
-                            }}
-                          />
-                        </>
+                        )
                       ) : (
                         <Empty description="点击「执行」运行SQL查询" />
                       )}
@@ -1271,6 +1395,35 @@ export default function DataExplorer() {
           </div>
         </Splitter.Panel>
       </Splitter>
+
+      {/* 保存为ETL任务的Modal */}
+      <Modal
+        title="保存为ETL任务"
+        open={saveEtlModalVisible}
+        onOk={handleSaveEtlSubmit}
+        onCancel={() => setSaveEtlModalVisible(false)}
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={savingEtl}
+      >
+        <Form form={saveEtlForm} layout="vertical">
+          <Form.Item
+            name="name"
+            label="任务名称"
+            rules={[{ required: true, message: '请输入任务名称' }]}
+          >
+            <Input placeholder="输入ETL任务名称" />
+          </Form.Item>
+          <Form.Item name="description" label="描述">
+            <TextArea rows={2} placeholder="任务描述（可选）" />
+          </Form.Item>
+        </Form>
+        <div style={{ marginTop: 8 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            当前SQL将被保存为ETL任务，可在「数据探索 &gt; ETL任务」中管理和执行。
+          </Text>
+        </div>
+      </Modal>
     </div>
   )
 }

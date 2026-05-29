@@ -56,7 +56,7 @@ class DataSource(Base):
 
     # Status
     is_active = Column(Boolean, default=True)
-    is_warehouse = Column(Boolean, default=False)  # 是否为数仓
+    is_warehouse = Column(Boolean, default=False)  # 是否为平台数据库
     last_connected_at = Column(DateTime)
     connection_status = Column(String(50), default="unknown")
 

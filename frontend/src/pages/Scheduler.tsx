@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   Card,
   Table,
@@ -29,8 +30,9 @@ import {
   RightOutlined,
   LeftOutlined,
   HolderOutlined,
+  CodeOutlined,
 } from '@ant-design/icons'
-import { syncScheduleApi } from '../services/api'
+import { syncScheduleApi, etlApi } from '../services/api'
 import CronExpressionInput from '../components/CronExpressionInput'
 
 const { Title, Text } = Typography
@@ -60,6 +62,25 @@ interface SyncScheduleItem {
   created_at: string
 }
 
+// 统一的调度项（包括同步和ETL）
+interface ScheduleItem {
+  id: number
+  type: 'sync' | 'etl'
+  name: string
+  description?: string
+  taskId: number  // 实际任务的id（同步任务id 或 ETL任务id）
+  taskName: string
+  taskDetail: string  // 源表→目标表 或 SQL预览
+  cron_expression: string
+  is_enabled: boolean
+  dag_id?: string
+  airflow_status?: string
+  next_run_time?: string
+  last_run_at?: string
+  last_run_rows?: number
+  created_at: string
+}
+
 // 可调度的同步任务（未创建调度的）
 interface AvailableSyncTask {
   id: number
@@ -69,17 +90,44 @@ interface AvailableSyncTask {
   sync_mode: string
 }
 
+// 可调度的ETL任务（未上线的）
+interface AvailableEtlTask {
+  id: number
+  name: string
+  description?: string
+  sql_preview: string
+}
+
 export default function Scheduler() {
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [schedules, setSchedules] = useState<SyncScheduleItem[]>([])
+  const [allSchedules, setAllSchedules] = useState<ScheduleItem[]>([])
   const [loading, setLoading] = useState(false)
   const [statusFilter, setStatusFilter] = useState<string | undefined>(undefined)
+  const [searchKeyword, setSearchKeyword] = useState('')
+  const [etlDisabling, setEtlDisabling] = useState<number | null>(null)
+  const [etlDeleting, setEtlDeleting] = useState<number | null>(null)
+  const [etlEnabling, setEtlEnabling] = useState<number | null>(null)
+
+  // ETL view/edit modal
+  const [etlViewModalVisible, setEtlViewModalVisible] = useState(false)
+  const [etlEditModalVisible, setEtlEditModalVisible] = useState(false)
+  const [etlEnableModalVisible, setEtlEnableModalVisible] = useState(false)
+  const [viewingEtl, setViewingEtl] = useState<ScheduleItem | null>(null)
+  const [editingEtl, setEditingEtl] = useState<ScheduleItem | null>(null)
+  const [enablingEtl, setEnablingEtl] = useState<ScheduleItem | null>(null)
+  const [etlEditCron, setEtlEditCron] = useState('')
 
   // Add schedule modal
   const [addModalVisible, setAddModalVisible] = useState(false)
+  const [addTaskType, setAddTaskType] = useState<'sync' | 'etl'>('sync')
   const [availableTasks, setAvailableTasks] = useState<AvailableSyncTask[]>([])
+  const [availableEtlTasks, setAvailableEtlTasks] = useState<AvailableEtlTask[]>([])
   const [leftSelected, setLeftSelected] = useState<number[]>([])
   const [rightSelected, setRightSelected] = useState<number[]>([])
   const [selectedTasks, setSelectedTasks] = useState<AvailableSyncTask[]>([])
+  const [selectedEtlTasks, setSelectedEtlTasks] = useState<AvailableEtlTask[]>([])
   const [addCronExpression, setAddCronExpression] = useState('0 2 * * *')
   const [adding, setAdding] = useState(false)
   const [cronPopoverOpen, setCronPopoverOpen] = useState(false)
@@ -105,12 +153,14 @@ export default function Scheduler() {
   const [editCron, setEditCron] = useState('')
   const [editing, setEditing] = useState(false)
 
-  // Batch selection
-  const [selectedIds, setSelectedIds] = useState<number[]>([])
+  // Batch selection (格式: "sync-1" 或 "etl-2")
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([])
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [batchEnabling, setBatchEnabling] = useState(false)
   const [batchDisabling, setBatchDisabling] = useState(false)
+  const [pendingSyncTaskIds, setPendingSyncTaskIds] = useState<number[]>([])  // 待选中的sync_task_id
 
+  
   // Draggable popover
   const [popoverPosition, setPopoverPosition] = useState({ x: 0, y: 0 })
   const [isDragging, setIsDragging] = useState(false)
@@ -168,11 +218,98 @@ export default function Scheduler() {
     loadSchedules()
   }, [statusFilter])
 
+  // 从 URL 参数获取 etl_id 或 sync_ids
+  useEffect(() => {
+    const etlId = searchParams.get('etl_id')
+    const syncIds = searchParams.get('sync_ids')
+
+    if (etlId) {
+      setSearchKeyword(`etl:${etlId}`)
+      setSearchParams({})
+    } else if (syncIds) {
+      // 存储待选中的sync_task_id
+      const ids = syncIds.split(',').map(id => parseInt(id.trim()))
+      setPendingSyncTaskIds(ids)
+      setSearchParams({})
+    }
+  }, [searchParams])
+
+  // 数据加载后，选中对应的调度
+  useEffect(() => {
+    if (pendingSyncTaskIds.length > 0 && allSchedules.length > 0) {
+      const keysToSelect = allSchedules
+        .filter(s => s.type === 'sync' && pendingSyncTaskIds.includes(s.taskId))
+        .map(s => `${s.type}-${s.id}`)
+      if (keysToSelect.length > 0) {
+        setSelectedKeys(keysToSelect)
+      }
+      setPendingSyncTaskIds([])  // 清除
+    }
+  }, [pendingSyncTaskIds, allSchedules])
+
   const loadSchedules = async () => {
     setLoading(true)
     try {
-      const res = await syncScheduleApi.list(statusFilter)
-      setSchedules(res.data)
+      // 同时加载同步调度和ETL任务
+      const [syncRes, etlRes] = await Promise.all([
+        syncScheduleApi.list(statusFilter),
+        etlApi.list(),
+      ])
+
+      setSchedules(syncRes.data)
+
+      // 合并为统一的调度列表
+      const syncItems: ScheduleItem[] = syncRes.data.map((s: SyncScheduleItem) => ({
+        id: s.id,
+        type: 'sync' as const,
+        name: s.name,
+        description: s.description,
+        taskId: s.sync_task_id,  // 同步任务的实际id
+        taskName: s.sync_task_name,
+        taskDetail: `${s.source_table} → ${s.target_table}`,
+        cron_expression: s.cron_expression,
+        is_enabled: s.is_enabled,
+        dag_id: s.dag_id,
+        airflow_status: s.airflow_status,
+        next_run_time: s.next_run_time,
+        last_run_at: s.last_sync_at,
+        last_run_rows: s.last_sync_rows,
+        created_at: s.created_at,
+      }))
+
+      // 显示曾经调度过的ETL任务（有dag_id或cron_expression，说明曾经上过调度）
+      const etlItems: ScheduleItem[] = etlRes.data
+        .filter((e: any) => e.is_scheduled || e.dag_id || e.cron_expression)
+        .map((e: any) => ({
+          id: e.id,
+          type: 'etl' as const,
+          name: e.name,
+          description: e.description,
+          taskId: e.id,  // ETL任务的id
+          taskName: e.name,
+          taskDetail: e.sql_preview || '',
+          cron_expression: e.cron_expression || '',
+          is_enabled: e.is_scheduled,
+          dag_id: e.dag_id,
+          airflow_status: e.airflow_status,
+          next_run_time: e.next_run_time,
+          last_run_at: e.last_run_at,
+          last_run_rows: e.last_run_rows,
+          created_at: e.created_at,
+        }))
+
+      // 根据筛选条件过滤
+      let combined = [...syncItems, ...etlItems]
+      if (statusFilter === 'enabled') {
+        combined = combined.filter(s => s.is_enabled)
+      } else if (statusFilter === 'disabled') {
+        combined = combined.filter(s => !s.is_enabled)
+      }
+
+      // 按创建时间排序
+      combined.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+
+      setAllSchedules(combined)
     } catch (error) {
       message.error('加载调度列表失败')
     } finally {
@@ -180,15 +317,114 @@ export default function Scheduler() {
     }
   }
 
+  const handleEtlDisable = async (task: ScheduleItem) => {
+    if (etlDisabling) return  // 防止重复提交
+    setEtlDisabling(task.id)
+    try {
+      await etlApi.disable(task.id)
+      message.success('ETL任务下线成功')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || 'ETL任务下线失败')
+    } finally {
+      setEtlDisabling(null)
+    }
+  }
+
+  const handleEtlView = (task: ScheduleItem) => {
+    setViewingEtl(task)
+    setEtlViewModalVisible(true)
+  }
+
+  const handleEtlOpenEditModal = (task: ScheduleItem) => {
+    setEditingEtl(task)
+    setEtlEditCron(task.cron_expression || '0 2 * * *')
+    setEtlEditModalVisible(true)
+  }
+
+  const handleEtlSaveEdit = async () => {
+    if (!editingEtl) return
+    if (etlEnabling) return  // 防止重复提交
+    setEtlEnabling(editingEtl.id)
+    try {
+      // 先下线再用新cron上线
+      await etlApi.disable(editingEtl.id)
+      await etlApi.enable(editingEtl.id, etlEditCron)
+      message.success('修改成功')
+      setEtlEditModalVisible(false)
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '修改失败')
+    } finally {
+      setEtlEnabling(null)
+    }
+  }
+
+  const handleEtlOpenEnableModal = (task: ScheduleItem) => {
+    setEnablingEtl(task)
+    setEtlEditCron(task.cron_expression || '0 2 * * *')
+    setEtlEnableModalVisible(true)
+  }
+
+  const handleEtlEnable = async () => {
+    if (!enablingEtl) return
+    if (etlEnabling) return  // 防止重复提交
+    setEtlEnabling(enablingEtl.id)
+    try {
+      await etlApi.enable(enablingEtl.id, etlEditCron)
+      message.success('上线成功')
+      setEtlEnableModalVisible(false)
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '上线失败')
+    } finally {
+      setEtlEnabling(null)
+    }
+  }
+
+  const handleEtlDelete = async (task: ScheduleItem) => {
+    if (task.is_enabled) {
+      message.warning('请先下线后再删除')
+      return
+    }
+    setEtlDeleting(task.id)
+    try {
+      // 只取消调度，不删除ETL任务本身
+      await etlApi.unschedule(task.id)
+      message.success('调度已删除')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '删除失败')
+    } finally {
+      setEtlDeleting(null)
+    }
+  }
+
   // Open add modal and load available tasks
   const handleOpenAddModal = async () => {
     try {
-      const res = await syncScheduleApi.getAvailableTasks()
-      setAvailableTasks(res.data)
+      // Load both sync tasks and ETL tasks
+      const [syncRes, etlRes] = await Promise.all([
+        syncScheduleApi.getAvailableTasks(),
+        etlApi.list(),
+      ])
+      setAvailableTasks(syncRes.data)
+      // Filter ETL tasks that are not scheduled
+      const unscheduledEtl = etlRes.data
+        .filter((t: any) => !t.is_scheduled)
+        .map((t: any) => ({
+          id: t.id,
+          name: t.name,
+          description: t.description,
+          sql_preview: t.sql_preview,
+        }))
+      setAvailableEtlTasks(unscheduledEtl)
       setLeftSelected([])
       setRightSelected([])
       setSelectedTasks([])
+      setSelectedEtlTasks([])
       setAddCronExpression('0 2 * * *')
+      setAddTaskType('sync')
       setAddModalVisible(true)
     } catch (error) {
       message.error('加载可用任务失败')
@@ -197,17 +433,29 @@ export default function Scheduler() {
 
   // Move tasks to right (selected)
   const handleMoveRight = () => {
-    const tasksToMove = availableTasks.filter(t => leftSelected.includes(t.id))
-    setSelectedTasks([...selectedTasks, ...tasksToMove])
-    setAvailableTasks(availableTasks.filter(t => !leftSelected.includes(t.id)))
+    if (addTaskType === 'sync') {
+      const tasksToMove = availableTasks.filter(t => leftSelected.includes(t.id))
+      setSelectedTasks([...selectedTasks, ...tasksToMove])
+      setAvailableTasks(availableTasks.filter(t => !leftSelected.includes(t.id)))
+    } else {
+      const tasksToMove = availableEtlTasks.filter(t => leftSelected.includes(t.id))
+      setSelectedEtlTasks([...selectedEtlTasks, ...tasksToMove])
+      setAvailableEtlTasks(availableEtlTasks.filter(t => !leftSelected.includes(t.id)))
+    }
     setLeftSelected([])
   }
 
   // Move tasks back to left
   const handleMoveLeft = () => {
-    const tasksToMove = selectedTasks.filter(t => rightSelected.includes(t.id))
-    setAvailableTasks([...availableTasks, ...tasksToMove])
-    setSelectedTasks(selectedTasks.filter(t => !rightSelected.includes(t.id)))
+    if (addTaskType === 'sync') {
+      const tasksToMove = selectedTasks.filter(t => rightSelected.includes(t.id))
+      setAvailableTasks([...availableTasks, ...tasksToMove])
+      setSelectedTasks(selectedTasks.filter(t => !rightSelected.includes(t.id)))
+    } else {
+      const tasksToMove = selectedEtlTasks.filter(t => rightSelected.includes(t.id))
+      setAvailableEtlTasks([...availableEtlTasks, ...tasksToMove])
+      setSelectedEtlTasks(selectedEtlTasks.filter(t => !rightSelected.includes(t.id)))
+    }
     setRightSelected([])
   }
 
@@ -231,47 +479,85 @@ export default function Scheduler() {
 
   // Batch create schedules
   const handleCreateSchedules = async (enableAfterCreate: boolean = false) => {
-    if (selectedTasks.length === 0) {
-      message.warning('请选择要调度的任务')
+    // 防止重复提交
+    if (adding) {
       return
     }
-    setAdding(true)
-    let success = 0
-    let fail = 0
-    const createdIds: number[] = []
 
-    for (const task of selectedTasks) {
-      try {
-        const res = await syncScheduleApi.create({
-          name: `${task.name}_调度`,
-          sync_task_id: task.id,
-          cron_expression: addCronExpression,
-        })
-        createdIds.push(res.data.id)
-        success++
-      } catch (error) {
-        fail++
+    if (addTaskType === 'sync') {
+      // 处理同步任务
+      if (selectedTasks.length === 0) {
+        message.warning('请选择要调度的任务')
+        return
       }
-    }
+      setAdding(true)
+      let success = 0
+      let fail = 0
+      const createdIds: number[] = []
 
-    // 如果需要上线
-    if (enableAfterCreate && createdIds.length > 0) {
-      let enableSuccess = 0
-      for (const id of createdIds) {
+      for (const task of selectedTasks) {
         try {
-          await syncScheduleApi.enable(id)
-          enableSuccess++
+          const res = await syncScheduleApi.create({
+            name: `${task.name}_调度`,
+            sync_task_id: task.id,
+            cron_expression: addCronExpression,
+          })
+          createdIds.push(res.data.id)
+          success++
         } catch (error) {
-          // 上线失败不影响创建结果
+          fail++
         }
       }
-      if (enableSuccess > 0) {
-        message.success(`已创建并上线 ${enableSuccess} 个调度`)
+
+      // 如果需要上线
+      if (enableAfterCreate && createdIds.length > 0) {
+        let enableSuccess = 0
+        for (const id of createdIds) {
+          try {
+            await syncScheduleApi.enable(id)
+            enableSuccess++
+          } catch (error) {
+            // 上线失败不影响创建结果
+          }
+        }
+        if (enableSuccess > 0) {
+          message.success(`已创建并上线 ${enableSuccess} 个调度`)
+        }
+      } else if (fail === 0) {
+        message.success(`已创建 ${success} 个调度`)
+      } else {
+        message.warning(`成功 ${success} 个，失败 ${fail} 个`)
       }
-    } else if (fail === 0) {
-      message.success(`已创建 ${success} 个调度`)
     } else {
-      message.warning(`成功 ${success} 个，失败 ${fail} 个`)
+      // 处理ETL任务
+      if (selectedEtlTasks.length === 0) {
+        message.warning('请选择要调度的ETL任务')
+        return
+      }
+      setAdding(true)
+      let success = 0
+      let fail = 0
+
+      for (const task of selectedEtlTasks) {
+        try {
+          if (enableAfterCreate) {
+            // 保存并上线：直接调用 enable（会触发 Airflow 事务）
+            await etlApi.enable(task.id, addCronExpression)
+          } else {
+            // 仅保存：只保存调度信息，不触发 Airflow
+            await etlApi.schedule(task.id, addCronExpression)
+          }
+          success++
+        } catch (error) {
+          fail++
+        }
+      }
+
+      if (fail === 0) {
+        message.success(enableAfterCreate ? `已上线 ${success} 个ETL任务` : `已保存 ${success} 个ETL调度`)
+      } else {
+        message.warning(`成功 ${success} 个，失败 ${fail} 个`)
+      }
     }
 
     setAdding(false)
@@ -286,6 +572,7 @@ export default function Scheduler() {
 
   const handleEnable = async () => {
     if (!selectedSchedule) return
+    if (enabling) return  // 防止重复提交
     setEnabling(true)
     try {
       await syncScheduleApi.enable(selectedSchedule.id)
@@ -300,6 +587,7 @@ export default function Scheduler() {
   }
 
   const handleDisable = async (schedule: SyncScheduleItem) => {
+    if (disabling) return  // 防止重复提交
     setDisabling(schedule.id)
     try {
       await syncScheduleApi.disable(schedule.id)
@@ -348,18 +636,35 @@ export default function Scheduler() {
   // Save edit
   const handleSaveEdit = async () => {
     if (!editSchedule) return
+    if (editing) return  // 防止重复提交
     if (!editName.trim()) {
       message.warning('请输入调度名称')
       return
     }
     setEditing(true)
     try {
-      await syncScheduleApi.update(editSchedule.id, {
-        name: editName.trim(),
-        description: editDescription.trim() || undefined,
-        cron_expression: editCron,
-      })
-      message.success('修改成功')
+      const cronChanged = editCron !== editSchedule.cron_expression
+      const isEnabled = editSchedule.is_enabled
+
+      if (cronChanged && isEnabled) {
+        // 已上线且cron变了，需要先下线、更新、再上线（事务性操作）
+        await syncScheduleApi.disable(editSchedule.id)
+        await syncScheduleApi.update(editSchedule.id, {
+          name: editName.trim(),
+          description: editDescription.trim() || undefined,
+          cron_expression: editCron,
+        })
+        await syncScheduleApi.enable(editSchedule.id)
+        message.success('修改成功，已重新部署')
+      } else {
+        // 未上线或cron没变，直接更新
+        await syncScheduleApi.update(editSchedule.id, {
+          name: editName.trim(),
+          description: editDescription.trim() || undefined,
+          cron_expression: editCron,
+        })
+        message.success('修改成功')
+      }
       setEditModalVisible(false)
       loadSchedules()
     } catch (error: any) {
@@ -369,17 +674,36 @@ export default function Scheduler() {
     }
   }
 
+  // 解析选中的key，返回 {type, id}
+  const parseSelectedKeys = () => {
+    return selectedKeys.map(key => {
+      const [type, id] = key.split('-')
+      return { type: type as 'sync' | 'etl', id: parseInt(id, 10) }
+    })
+  }
+
+  // 获取选中的调度项
+  const getSelectedSchedules = () => {
+    return allSchedules.filter(s => selectedKeys.includes(`${s.type}-${s.id}`))
+  }
+
   // Batch delete
   const handleBatchDelete = async () => {
-    if (selectedIds.length === 0) return
+    if (selectedKeys.length === 0) return
+    if (batchDeleting) return  // 防止重复提交
 
     setBatchDeleting(true)
     let success = 0
     let fail = 0
 
-    for (const id of selectedIds) {
+    for (const { type, id } of parseSelectedKeys()) {
       try {
-        await syncScheduleApi.delete(id)
+        if (type === 'sync') {
+          await syncScheduleApi.delete(id)
+        } else {
+          // ETL任务只取消调度，不删除任务本身
+          await etlApi.unschedule(id)
+        }
         success++
       } catch (error) {
         fail++
@@ -387,7 +711,7 @@ export default function Scheduler() {
     }
 
     setBatchDeleting(false)
-    setSelectedIds([])
+    setSelectedKeys([])
 
     if (fail === 0) {
       message.success(`已删除 ${success} 个调度`)
@@ -399,10 +723,11 @@ export default function Scheduler() {
 
   // Batch enable
   const handleBatchEnable = async () => {
-    if (selectedIds.length === 0) return
+    if (selectedKeys.length === 0) return
+    if (batchEnabling) return  // 防止重复提交
 
     // 过滤出未上线的调度
-    const toEnable = schedules.filter(s => selectedIds.includes(s.id) && !s.is_enabled)
+    const toEnable = getSelectedSchedules().filter(s => !s.is_enabled)
     if (toEnable.length === 0) {
       message.warning('选中的调度都已上线')
       return
@@ -412,9 +737,14 @@ export default function Scheduler() {
     let success = 0
     let fail = 0
 
-    for (const schedule of toEnable) {
+    for (const item of toEnable) {
       try {
-        await syncScheduleApi.enable(schedule.id)
+        if (item.type === 'sync') {
+          await syncScheduleApi.enable(item.id)
+        } else {
+          // ETL任务需要cron表达式，使用已有的或默认值
+          await etlApi.enable(item.id, item.cron_expression || '0 2 * * *')
+        }
         success++
       } catch (error) {
         fail++
@@ -422,7 +752,7 @@ export default function Scheduler() {
     }
 
     setBatchEnabling(false)
-    setSelectedIds([])
+    setSelectedKeys([])
 
     if (fail === 0) {
       message.success(`已上线 ${success} 个调度`)
@@ -434,10 +764,11 @@ export default function Scheduler() {
 
   // Batch disable
   const handleBatchDisable = async () => {
-    if (selectedIds.length === 0) return
+    if (selectedKeys.length === 0) return
+    if (batchDisabling) return  // 防止重复提交
 
     // 过滤出已上线的调度
-    const toDisable = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled)
+    const toDisable = getSelectedSchedules().filter(s => s.is_enabled)
     if (toDisable.length === 0) {
       message.warning('选中的调度都未上线')
       return
@@ -447,9 +778,13 @@ export default function Scheduler() {
     let success = 0
     let fail = 0
 
-    for (const schedule of toDisable) {
+    for (const item of toDisable) {
       try {
-        await syncScheduleApi.disable(schedule.id)
+        if (item.type === 'sync') {
+          await syncScheduleApi.disable(item.id)
+        } else {
+          await etlApi.disable(item.id)
+        }
         success++
       } catch (error) {
         fail++
@@ -457,7 +792,7 @@ export default function Scheduler() {
     }
 
     setBatchDisabling(false)
-    setSelectedIds([])
+    setSelectedKeys([])
 
     if (fail === 0) {
       message.success(`已下线 ${success} 个调度`)
@@ -467,59 +802,43 @@ export default function Scheduler() {
     loadSchedules()
   }
 
-  const columns = [
+  // 统一调度列表的列配置
+  const unifiedColumns = [
+    {
+      title: '类型',
+      key: 'type',
+      width: 80,
+      render: (_: any, record: ScheduleItem) => (
+        record.type === 'sync' ? (
+          <Tag color="blue"><SyncOutlined /> 同步</Tag>
+        ) : (
+          <Tag color="purple"><CodeOutlined /> ETL</Tag>
+        )
+      ),
+    },
     {
       title: '调度名称',
       dataIndex: 'name',
       key: 'name',
       ellipsis: { showTitle: false },
-      render: (name: string, record: SyncScheduleItem) => (
+      render: (name: string, record: ScheduleItem) => (
         <Tooltip title={record.description ? `${name} - ${record.description}` : name}>
           <Text strong style={{ fontSize: 13 }}>{name}</Text>
         </Tooltip>
       ),
     },
     {
-      title: '同步任务',
-      dataIndex: 'sync_task_name',
-      key: 'sync_task_name',
+      title: '任务详情',
+      dataIndex: 'taskDetail',
+      key: 'taskDetail',
       ellipsis: { showTitle: false },
-      render: (name: string) => (
-        <Tooltip title={name}>
-          <span style={{ fontSize: 12 }}>{name}</span>
-        </Tooltip>
-      ),
-    },
-    {
-      title: '创建人',
-      dataIndex: 'creator_name',
-      key: 'creator_name',
-      ellipsis: { showTitle: false },
-      render: (name: string) => (
-        <Tooltip title={name || '-'}>
-          <span>{name || '-'}</span>
-        </Tooltip>
-      ),
-    },
-    {
-      title: '源表',
-      dataIndex: 'source_table',
-      key: 'source_table',
-      ellipsis: { showTitle: false },
-      render: (table: string) => (
-        <Tooltip title={table}>
-          <Tag style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block' }}>{table}</Tag>
-        </Tooltip>
-      ),
-    },
-    {
-      title: '目标表',
-      dataIndex: 'target_table',
-      key: 'target_table',
-      ellipsis: { showTitle: false },
-      render: (table: string) => (
-        <Tooltip title={table}>
-          <Tag color="gold" style={{ maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block' }}>{table}</Tag>
+      render: (detail: string, record: ScheduleItem) => (
+        <Tooltip title={detail}>
+          {record.type === 'sync' ? (
+            <span style={{ fontSize: 12 }}>{detail}</span>
+          ) : (
+            <Text code style={{ fontSize: 11 }}>{detail}</Text>
+          )}
         </Tooltip>
       ),
     },
@@ -527,7 +846,7 @@ export default function Scheduler() {
       title: '状态',
       key: 'schedule_status',
       width: 90,
-      render: (_: any, record: SyncScheduleItem) => (
+      render: (_: any, record: ScheduleItem) => (
         record.is_enabled ? (
           <Tag icon={<CheckCircleOutlined />} color="green">已上线</Tag>
         ) : (
@@ -539,6 +858,7 @@ export default function Scheduler() {
       title: 'Cron',
       dataIndex: 'cron_expression',
       key: 'cron',
+      width: 120,
       ellipsis: { showTitle: false },
       render: (cron: string) => cron ? (
         <Tooltip title={cron}>
@@ -563,28 +883,14 @@ export default function Scheduler() {
       },
     },
     {
-      title: '下次执行',
-      dataIndex: 'next_run_time',
-      key: 'next_run_time',
+      title: '上次执行',
+      key: 'last_run',
+      width: 160,
       ellipsis: { showTitle: false },
-      render: (time: string) => {
-        if (!time) return '-'
-        const formatted = new Date(time).toLocaleString()
-        return (
-          <Tooltip title={formatted}>
-            <span style={{ fontSize: 12 }}>{formatted}</span>
-          </Tooltip>
-        )
-      },
-    },
-    {
-      title: '上次同步',
-      key: 'last_sync',
-      ellipsis: { showTitle: false },
-      render: (_: any, record: SyncScheduleItem) => {
-        if (!record.last_sync_at) return '-'
-        const formatted = new Date(record.last_sync_at).toLocaleString()
-        const tip = record.last_sync_rows !== undefined ? `${formatted} (${record.last_sync_rows} 行)` : formatted
+      render: (_: any, record: ScheduleItem) => {
+        if (!record.last_run_at) return '-'
+        const formatted = new Date(record.last_run_at).toLocaleString()
+        const tip = record.last_run_rows !== undefined ? `${formatted} (${record.last_run_rows} 行)` : formatted
         return (
           <Tooltip title={tip}>
             <span style={{ fontSize: 12 }}>{formatted}</span>
@@ -595,69 +901,162 @@ export default function Scheduler() {
     {
       title: '操作',
       key: 'actions',
-      width: 140,
+      width: 120,
       fixed: 'right' as const,
-      render: (_: any, record: SyncScheduleItem) => (
+      render: (_: any, record: ScheduleItem) => (
         <Space size={2}>
-          <Tooltip title="查看">
-            <Button
-              type="link"
-              size="small"
-              icon={<EyeOutlined />}
-              onClick={() => handleView(record)}
-              style={{ padding: '0 4px' }}
-            />
-          </Tooltip>
-          <Tooltip title="编辑">
-            <Button
-              type="link"
-              size="small"
-              icon={<EditOutlined />}
-              onClick={() => handleOpenEditModal(record)}
-              style={{ padding: '0 4px' }}
-            />
-          </Tooltip>
-          {record.is_enabled ? (
-            <Tooltip title="下线">
-              <Button
-                type="link"
-                size="small"
-                icon={<PauseOutlined />}
-                loading={disabling === record.id}
-                onClick={() => handleDisable(record)}
-                style={{ color: '#faad14', padding: '0 4px' }}
-              />
-            </Tooltip>
+          {record.type === 'sync' ? (
+            // 同步任务的操作
+            <>
+              <Tooltip title="查看">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={() => {
+                    const syncItem = schedules.find(s => s.id === record.id)
+                    if (syncItem) handleView(syncItem)
+                  }}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              <Tooltip title="编辑">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => {
+                    const syncItem = schedules.find(s => s.id === record.id)
+                    if (syncItem) handleOpenEditModal(syncItem)
+                  }}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              {record.is_enabled ? (
+                <Tooltip title="下线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PauseOutlined />}
+                    loading={disabling === record.id}
+                    onClick={() => {
+                      const syncItem = schedules.find(s => s.id === record.id)
+                      if (syncItem) handleDisable(syncItem)
+                    }}
+                    style={{ color: '#faad14', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              ) : (
+                <Tooltip title="上线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    onClick={() => {
+                      const syncItem = schedules.find(s => s.id === record.id)
+                      if (syncItem) handleOpenEnableModal(syncItem)
+                    }}
+                    style={{ color: '#52c41a', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              )}
+              <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
+                <Button
+                  type="link"
+                  size="small"
+                  danger={!record.is_enabled}
+                  disabled={record.is_enabled}
+                  icon={<DeleteOutlined />}
+                  loading={deleting === record.id}
+                  onClick={() => {
+                    const syncItem = schedules.find(s => s.id === record.id)
+                    if (syncItem) handleDelete(syncItem)
+                  }}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+            </>
           ) : (
-            <Tooltip title="上线">
-              <Button
-                type="link"
-                size="small"
-                icon={<PlayCircleOutlined />}
-                onClick={() => handleOpenEnableModal(record)}
-                style={{ color: '#52c41a', padding: '0 4px' }}
-              />
-            </Tooltip>
+            // ETL任务的操作
+            <>
+              <Tooltip title="查看">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={() => handleEtlView(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              <Tooltip title="编辑">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => handleEtlOpenEditModal(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              {record.is_enabled ? (
+                <Tooltip title="下线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PauseOutlined />}
+                    loading={etlDisabling === record.id}
+                    onClick={() => handleEtlDisable(record)}
+                    style={{ color: '#faad14', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              ) : (
+                <Tooltip title="上线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    onClick={() => handleEtlOpenEnableModal(record)}
+                    style={{ color: '#52c41a', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              )}
+              <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
+                <Button
+                  type="link"
+                  size="small"
+                  danger={!record.is_enabled}
+                  disabled={record.is_enabled}
+                  icon={<DeleteOutlined />}
+                  loading={etlDeleting === record.id}
+                  onClick={() => handleEtlDelete(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+            </>
           )}
-          <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
-            <Button
-              type="link"
-              size="small"
-              danger={!record.is_enabled}
-              disabled={record.is_enabled}
-              icon={<DeleteOutlined />}
-              loading={deleting === record.id}
-              onClick={() => handleDelete(record)}
-              style={{ padding: '0 4px' }}
-            />
-          </Tooltip>
         </Space>
       ),
     },
   ]
 
-  const onlineCount = schedules.filter((s) => s.is_enabled).length
-  const offlineCount = schedules.filter((s) => !s.is_enabled).length
+  const onlineCount = allSchedules.filter((s) => s.is_enabled).length
+  const offlineCount = allSchedules.filter((s) => !s.is_enabled).length
+
+  // 根据搜索关键词过滤
+  const filteredSchedules = allSchedules.filter((s) => {
+    if (!searchKeyword) return true
+    const keyword = searchKeyword.toLowerCase()
+    // 支持精准搜索 etl:id 格式
+    if (keyword.startsWith('etl:')) {
+      const etlId = keyword.replace('etl:', '')
+      return s.type === 'etl' && s.id.toString() === etlId
+    }
+    // 普通搜索：名称、任务详情
+    return (
+      s.name.toLowerCase().includes(keyword) ||
+      s.taskName.toLowerCase().includes(keyword) ||
+      s.taskDetail.toLowerCase().includes(keyword)
+    )
+  })
 
   return (
     <div>
@@ -671,15 +1070,15 @@ export default function Scheduler() {
           <Tag>{offlineCount} 未上线</Tag>
         </Space>
         <Space>
-          {selectedIds.length > 0 && (
+          {selectedKeys.length > 0 && (
             <>
               <Button
                 type="primary"
                 icon={<PlayCircleOutlined />}
                 loading={batchEnabling}
                 onClick={() => {
-                  const offlineCount = schedules.filter(s => selectedIds.includes(s.id) && !s.is_enabled).length
-                  if (offlineCount === 0) {
+                  const toEnableCount = getSelectedSchedules().filter(s => !s.is_enabled).length
+                  if (toEnableCount === 0) {
                     message.warning('选中的调度都已上线')
                     return
                   }
@@ -693,7 +1092,7 @@ export default function Scheduler() {
                         </div>
                         <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>批量上线</div>
                         <div style={{ fontSize: 13, color: '#666' }}>
-                          确定要上线选中的 {offlineCount} 个调度吗？
+                          确定要上线选中的 {toEnableCount} 个调度吗？
                         </div>
                       </div>
                     ),
@@ -716,8 +1115,8 @@ export default function Scheduler() {
                 icon={<PauseOutlined />}
                 loading={batchDisabling}
                 onClick={() => {
-                  const onlineCount = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled).length
-                  if (onlineCount === 0) {
+                  const toDisableCount = getSelectedSchedules().filter(s => s.is_enabled).length
+                  if (toDisableCount === 0) {
                     message.warning('选中的调度都未上线')
                     return
                   }
@@ -731,7 +1130,7 @@ export default function Scheduler() {
                         </div>
                         <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>批量下线</div>
                         <div style={{ fontSize: 13, color: '#666' }}>
-                          确定要下线选中的 {onlineCount} 个调度吗？
+                          确定要下线选中的 {toDisableCount} 个调度吗？
                         </div>
                       </div>
                     ),
@@ -755,7 +1154,7 @@ export default function Scheduler() {
                 icon={<DeleteOutlined />}
                 loading={batchDeleting}
                 onClick={() => {
-                  const enabledCount = schedules.filter(s => selectedIds.includes(s.id) && s.is_enabled).length
+                  const enabledCount = getSelectedSchedules().filter(s => s.is_enabled).length
                   if (enabledCount > 0) {
                     message.warning(`有 ${enabledCount} 个调度已上线，请先下线后再删除`)
                     return
@@ -770,7 +1169,7 @@ export default function Scheduler() {
                         </div>
                         <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>批量删除</div>
                         <div style={{ fontSize: 13, color: '#666' }}>
-                          确定要删除选中的 {selectedIds.length} 个调度吗？
+                          确定要删除选中的 {selectedKeys.length} 个调度吗？
                         </div>
                       </div>
                     ),
@@ -794,10 +1193,22 @@ export default function Scheduler() {
           <Button icon={<ReloadOutlined />} onClick={loadSchedules}>
             刷新
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={handleOpenAddModal}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={handleOpenAddModal}
+            disabled={adding || batchEnabling || batchDisabling || batchDeleting}
+          >
             添加调度
           </Button>
         </Space>
+        <Input.Search
+          placeholder="搜索任务名称"
+          allowClear
+          value={searchKeyword}
+          onChange={(e) => setSearchKeyword(e.target.value)}
+          style={{ width: 200 }}
+        />
       </div>
 
       <Card bodyStyle={{ padding: 0 }}>
@@ -805,29 +1216,39 @@ export default function Scheduler() {
           activeKey={statusFilter || 'all'}
           onChange={(key) => setStatusFilter(key === 'all' ? undefined : (key === 'online' ? 'enabled' : 'disabled'))}
           items={[
-            { key: 'all', label: `全部 (${schedules.length})` },
+            { key: 'all', label: `全部 (${allSchedules.length})` },
             { key: 'online', label: `已上线 (${onlineCount})` },
             { key: 'offline', label: `未上线 (${offlineCount})` },
           ]}
           style={{ padding: '0 16px' }}
         />
         <Table
-          columns={columns}
-          dataSource={schedules}
-          rowKey="id"
+          columns={unifiedColumns}
+          dataSource={filteredSchedules}
+          rowKey={(record) => `${record.type}-${record.id}`}
           loading={loading}
           size="small"
           scroll={{ x: 'max-content' }}
           tableLayout="auto"
           rowSelection={{
-            selectedRowKeys: selectedIds,
-            onChange: (keys) => setSelectedIds(keys as number[]),
+            selectedRowKeys: selectedKeys,
+            onChange: (keys) => setSelectedKeys(keys as string[]),
           }}
           pagination={{
             showSizeChanger: true,
             showQuickJumper: true,
             showTotal: (total) => `共 ${total} 条`,
           }}
+          onRow={(record) => ({
+            onDoubleClick: () => {
+              if (record.type === 'etl') {
+                navigate(`/etl-tasks?id=${record.taskId}`)
+              } else {
+                navigate(`/data-sync?id=${record.taskId}`)
+              }
+            },
+            style: { cursor: 'pointer' },
+          })}
         />
       </Card>
 
@@ -848,25 +1269,42 @@ export default function Scheduler() {
               <Button
                 type="primary"
                 size="small"
-                disabled={selectedTasks.length === 0}
+                disabled={addTaskType === 'sync' ? selectedTasks.length === 0 : selectedEtlTasks.length === 0}
                 style={{ borderRadius: 6 }}
                 onClick={handleOpenCronPopover}
               >
-                <ScheduleOutlined /> 创建调度 ({selectedTasks.length})
+                <ScheduleOutlined /> 创建调度 ({addTaskType === 'sync' ? selectedTasks.length : selectedEtlTasks.length})
               </Button>
             </Space>
           </div>
         }
       >
+        {/* 任务类型选择 */}
+        <Tabs
+          activeKey={addTaskType}
+          onChange={(key) => {
+            setAddTaskType(key as 'sync' | 'etl')
+            setLeftSelected([])
+            setRightSelected([])
+          }}
+          items={[
+            { key: 'sync', label: <span><SyncOutlined /> 同步任务 ({availableTasks.length})</span> },
+            { key: 'etl', label: <span><CodeOutlined /> ETL任务 ({availableEtlTasks.length})</span> },
+          ]}
+          style={{ marginBottom: 12 }}
+        />
+
         {/* 穿梭框 */}
-        <div style={{ display: 'flex', gap: 10, height: 420 }}>
-          {/* 左侧：可调度的同步任务列表 */}
+        <div style={{ display: 'flex', gap: 10, height: 380 }}>
+          {/* 左侧：可调度任务列表 */}
           <Card
             title={
               <Space size={4} style={{ fontSize: 12 }}>
-                <SyncOutlined />
+                {addTaskType === 'sync' ? <SyncOutlined /> : <CodeOutlined />}
                 可调度任务
-                <Tag style={{ margin: 0, fontSize: 10 }}>{availableTasks.length}</Tag>
+                <Tag style={{ margin: 0, fontSize: 10 }}>
+                  {addTaskType === 'sync' ? availableTasks.length : availableEtlTasks.length}
+                </Tag>
               </Space>
             }
             size="small"
@@ -878,51 +1316,90 @@ export default function Scheduler() {
                 size="small"
                 style={{ padding: '0 4px', fontSize: 12 }}
                 onClick={() => {
-                  if (leftSelected.length === availableTasks.length) {
+                  const tasks = addTaskType === 'sync' ? availableTasks : availableEtlTasks
+                  if (leftSelected.length === tasks.length) {
                     setLeftSelected([])
                   } else {
-                    setLeftSelected(availableTasks.map(t => t.id))
+                    setLeftSelected(tasks.map(t => t.id))
                   }
                 }}
-                disabled={availableTasks.length === 0}
+                disabled={(addTaskType === 'sync' ? availableTasks : availableEtlTasks).length === 0}
               >
-                {leftSelected.length === availableTasks.length && availableTasks.length > 0 ? '取消' : '全选'}
+                {leftSelected.length === (addTaskType === 'sync' ? availableTasks : availableEtlTasks).length &&
+                 (addTaskType === 'sync' ? availableTasks : availableEtlTasks).length > 0 ? '取消' : '全选'}
               </Button>
             }
           >
-            {availableTasks.length > 0 ? (
-              availableTasks.map((task) => (
-                <Tooltip
-                  key={task.id}
-                  title={<div><div>{task.name}</div><div>{task.source_table} → {task.target_table}</div></div>}
-                  placement="top"
-                >
-                  <div
-                    onClick={() => handleLeftClick(task.id)}
-                    style={{
-                      padding: '6px 10px',
-                      cursor: 'pointer',
-                      borderRadius: 4,
-                      marginBottom: 3,
-                      fontSize: 12,
-                      background: leftSelected.includes(task.id) ? '#e6f4ff' : '#fafafa',
-                      border: leftSelected.includes(task.id) ? '1px solid #91caff' : '1px solid transparent',
-                      transition: 'all 0.15s',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      overflow: 'hidden',
-                    }}
+            {addTaskType === 'sync' ? (
+              availableTasks.length > 0 ? (
+                availableTasks.map((task) => (
+                  <Tooltip
+                    key={task.id}
+                    title={<div><div>{task.name}</div><div>{task.source_table} → {task.target_table}</div></div>}
+                    placement="top"
                   >
-                    <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
-                    <Tag color="blue" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>{task.sync_mode}</Tag>
-                  </div>
-                </Tooltip>
-              ))
+                    <div
+                      onClick={() => handleLeftClick(task.id)}
+                      style={{
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        borderRadius: 4,
+                        marginBottom: 3,
+                        fontSize: 12,
+                        background: leftSelected.includes(task.id) ? '#e6f4ff' : '#fafafa',
+                        border: leftSelected.includes(task.id) ? '1px solid #91caff' : '1px solid transparent',
+                        transition: 'all 0.15s',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
+                      <Tag color="blue" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>{task.sync_mode}</Tag>
+                    </div>
+                  </Tooltip>
+                ))
+              ) : (
+                <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
+                  暂无可调度的同步任务
+                </div>
+              )
             ) : (
-              <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
-                暂无可调度的任务
-              </div>
+              availableEtlTasks.length > 0 ? (
+                availableEtlTasks.map((task) => (
+                  <Tooltip
+                    key={task.id}
+                    title={<div><div>{task.name}</div><div style={{ fontSize: 11 }}>{task.sql_preview}</div></div>}
+                    placement="top"
+                  >
+                    <div
+                      onClick={() => handleLeftClick(task.id)}
+                      style={{
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        borderRadius: 4,
+                        marginBottom: 3,
+                        fontSize: 12,
+                        background: leftSelected.includes(task.id) ? '#e6f4ff' : '#fafafa',
+                        border: leftSelected.includes(task.id) ? '1px solid #91caff' : '1px solid transparent',
+                        transition: 'all 0.15s',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
+                      <Tag color="purple" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>ETL</Tag>
+                    </div>
+                  </Tooltip>
+                ))
+              ) : (
+                <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
+                  暂无可调度的ETL任务
+                </div>
+              )
             )}
           </Card>
 
@@ -950,7 +1427,9 @@ export default function Scheduler() {
               <Space size={4} style={{ fontSize: 12 }}>
                 <ScheduleOutlined style={{ color: '#52c41a' }} />
                 待创建调度
-                <Tag color="green" style={{ margin: 0, fontSize: 10 }}>{selectedTasks.length}</Tag>
+                <Tag color="green" style={{ margin: 0, fontSize: 10 }}>
+                  {addTaskType === 'sync' ? selectedTasks.length : selectedEtlTasks.length}
+                </Tag>
               </Space>
             }
             size="small"
@@ -962,51 +1441,90 @@ export default function Scheduler() {
                 size="small"
                 style={{ padding: '0 4px', fontSize: 12 }}
                 onClick={() => {
-                  if (rightSelected.length === selectedTasks.length) {
+                  const tasks = addTaskType === 'sync' ? selectedTasks : selectedEtlTasks
+                  if (rightSelected.length === tasks.length) {
                     setRightSelected([])
                   } else {
-                    setRightSelected(selectedTasks.map(t => t.id))
+                    setRightSelected(tasks.map(t => t.id))
                   }
                 }}
-                disabled={selectedTasks.length === 0}
+                disabled={(addTaskType === 'sync' ? selectedTasks : selectedEtlTasks).length === 0}
               >
-                {rightSelected.length === selectedTasks.length && selectedTasks.length > 0 ? '取消' : '全选'}
+                {rightSelected.length === (addTaskType === 'sync' ? selectedTasks : selectedEtlTasks).length &&
+                 (addTaskType === 'sync' ? selectedTasks : selectedEtlTasks).length > 0 ? '取消' : '全选'}
               </Button>
             }
           >
-            {selectedTasks.length > 0 ? (
-              selectedTasks.map((task) => (
-                <Tooltip
-                  key={task.id}
-                  title={<div><div>{task.name}</div><div>{task.source_table} → {task.target_table}</div></div>}
-                  placement="top"
-                >
-                  <div
-                    onClick={() => handleRightClick(task.id)}
-                    style={{
-                      padding: '6px 10px',
-                      cursor: 'pointer',
-                      borderRadius: 4,
-                      marginBottom: 3,
-                      fontSize: 12,
-                      background: rightSelected.includes(task.id) ? '#f6ffed' : '#fafafa',
-                      border: rightSelected.includes(task.id) ? '1px solid #b7eb8f' : '1px solid transparent',
-                      transition: 'all 0.15s',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      overflow: 'hidden',
-                    }}
+            {addTaskType === 'sync' ? (
+              selectedTasks.length > 0 ? (
+                selectedTasks.map((task) => (
+                  <Tooltip
+                    key={task.id}
+                    title={<div><div>{task.name}</div><div>{task.source_table} → {task.target_table}</div></div>}
+                    placement="top"
                   >
-                    <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
-                    <Tag color="blue" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>{task.sync_mode}</Tag>
-                  </div>
-                </Tooltip>
-              ))
+                    <div
+                      onClick={() => handleRightClick(task.id)}
+                      style={{
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        borderRadius: 4,
+                        marginBottom: 3,
+                        fontSize: 12,
+                        background: rightSelected.includes(task.id) ? '#f6ffed' : '#fafafa',
+                        border: rightSelected.includes(task.id) ? '1px solid #b7eb8f' : '1px solid transparent',
+                        transition: 'all 0.15s',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
+                      <Tag color="blue" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>{task.sync_mode}</Tag>
+                    </div>
+                  </Tooltip>
+                ))
+              ) : (
+                <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
+                  从左侧选择任务添加
+                </div>
+              )
             ) : (
-              <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
-                从左侧选择任务添加
-              </div>
+              selectedEtlTasks.length > 0 ? (
+                selectedEtlTasks.map((task) => (
+                  <Tooltip
+                    key={task.id}
+                    title={<div><div>{task.name}</div><div style={{ fontSize: 11 }}>{task.sql_preview}</div></div>}
+                    placement="top"
+                  >
+                    <div
+                      onClick={() => handleRightClick(task.id)}
+                      style={{
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        borderRadius: 4,
+                        marginBottom: 3,
+                        fontSize: 12,
+                        background: rightSelected.includes(task.id) ? '#f6ffed' : '#fafafa',
+                        border: rightSelected.includes(task.id) ? '1px solid #b7eb8f' : '1px solid transparent',
+                        transition: 'all 0.15s',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.name}</span>
+                      <Tag color="purple" style={{ margin: 0, fontSize: 10, flexShrink: 0 }}>ETL</Tag>
+                    </div>
+                  </Tooltip>
+                ))
+              ) : (
+                <div style={{ textAlign: 'center', padding: 40, color: '#999', fontSize: 12 }}>
+                  从左侧选择任务添加
+                </div>
+              )
             )}
           </Card>
         </div>
@@ -1068,13 +1586,14 @@ export default function Scheduler() {
                 <HolderOutlined style={{ color: '#bfbfbf', fontSize: 12 }} />
                 <Text strong style={{ fontSize: 14 }}>调度设置</Text>
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  已选 {selectedTasks.length} 个任务
+                  已选 {addTaskType === 'sync' ? selectedTasks.length : selectedEtlTasks.length} 个任务
                 </Text>
               </div>
               <div style={{ display: 'flex', gap: 6 }}>
                 <Button
                   size="small"
                   loading={adding}
+                  disabled={adding}
                   onClick={() => {
                     setCronPopoverOpen(false)
                     handleCreateSchedules(false)
@@ -1095,6 +1614,7 @@ export default function Scheduler() {
                   size="small"
                   type="primary"
                   loading={adding}
+                  disabled={adding}
                   onClick={() => {
                     setCronPopoverOpen(false)
                     handleCreateSchedules(true)
@@ -1105,7 +1625,7 @@ export default function Scheduler() {
                     borderRadius: 13,
                     fontSize: 12,
                     fontWeight: 400,
-                    background: '#34c759',
+                    background: adding ? undefined : '#34c759',
                     border: 'none',
                     boxShadow: 'none',
                   }}
@@ -1260,6 +1780,127 @@ export default function Scheduler() {
           />
         )}
       </Modal>
+
+      {/* ETL View Modal */}
+      <Modal
+        title={
+          <Space>
+            <EyeOutlined />
+            <span>ETL任务详情</span>
+          </Space>
+        }
+        open={etlViewModalVisible}
+        onCancel={() => setEtlViewModalVisible(false)}
+        footer={<Button onClick={() => setEtlViewModalVisible(false)}>关闭</Button>}
+        width={650}
+      >
+        {viewingEtl && (
+          <Descriptions column={2} bordered size="small">
+            <Descriptions.Item label="任务名称" span={2}>{viewingEtl.name}</Descriptions.Item>
+            <Descriptions.Item label="描述" span={2}>{viewingEtl.description || '-'}</Descriptions.Item>
+            <Descriptions.Item label="SQL预览" span={2}>
+              <Text code style={{ fontSize: 11 }}>{viewingEtl.taskDetail}</Text>
+            </Descriptions.Item>
+            <Descriptions.Item label="Cron 表达式">
+              <Text code>{viewingEtl.cron_expression}</Text>
+            </Descriptions.Item>
+            <Descriptions.Item label="状态">
+              {viewingEtl.is_enabled ? (
+                <Tag icon={<CheckCircleOutlined />} color="green">已上线</Tag>
+              ) : (
+                <Tag>未上线</Tag>
+              )}
+            </Descriptions.Item>
+            <Descriptions.Item label="DAG ID">{viewingEtl.dag_id || '-'}</Descriptions.Item>
+            <Descriptions.Item label="Airflow 状态">{viewingEtl.airflow_status || '-'}</Descriptions.Item>
+            <Descriptions.Item label="上次执行">
+              {viewingEtl.last_run_at ? new Date(viewingEtl.last_run_at).toLocaleString() : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="影响行数">{viewingEtl.last_run_rows ?? '-'}</Descriptions.Item>
+            <Descriptions.Item label="创建时间" span={2}>
+              {new Date(viewingEtl.created_at).toLocaleString()}
+            </Descriptions.Item>
+          </Descriptions>
+        )}
+      </Modal>
+
+      {/* ETL Edit Modal */}
+      <Modal
+        title={
+          <Space>
+            <EditOutlined />
+            <span>编辑ETL调度</span>
+          </Space>
+        }
+        open={etlEditModalVisible}
+        onCancel={() => setEtlEditModalVisible(false)}
+        onOk={handleEtlSaveEdit}
+        confirmLoading={etlEnabling === editingEtl?.id}
+        okText="保存"
+        width={600}
+      >
+        <Alert
+          message="修改Cron表达式将会重新部署DAG"
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>任务名称：</Text>
+          <Text style={{ marginLeft: 8 }}>{editingEtl?.name}</Text>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <Text strong>SQL预览：</Text>
+          <div style={{ marginTop: 4 }}>
+            <Text code style={{ fontSize: 11 }}>{editingEtl?.taskDetail}</Text>
+          </div>
+        </div>
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>Cron 表达式：</Text>
+        </div>
+        <CronExpressionInput
+          value={etlEditCron}
+          onChange={(v) => setEtlEditCron(v)}
+        />
+      </Modal>
+
+      {/* ETL Enable Modal */}
+      <Modal
+        title={
+          <Space>
+            <ScheduleOutlined />
+            <span>上线ETL任务 - {enablingEtl?.name}</span>
+          </Space>
+        }
+        open={etlEnableModalVisible}
+        onCancel={() => setEtlEnableModalVisible(false)}
+        onOk={handleEtlEnable}
+        confirmLoading={etlEnabling === enablingEtl?.id}
+        okText="确定上线"
+        width={550}
+      >
+        <Alert
+          message="上线后将生成 Airflow DAG 并开始定时执行"
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>任务信息：</Text>
+        </div>
+        <Space direction="vertical" style={{ marginBottom: 16, width: '100%' }}>
+          <Text>任务名称：<Tag color="purple">{enablingEtl?.name}</Tag></Text>
+          <Text>SQL预览：<Text code style={{ fontSize: 11 }}>{enablingEtl?.taskDetail}</Text></Text>
+        </Space>
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>Cron 表达式：</Text>
+        </div>
+        <CronExpressionInput
+          value={etlEditCron}
+          onChange={(v) => setEtlEditCron(v)}
+        />
+      </Modal>
+
     </div>
   )
 }

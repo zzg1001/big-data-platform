@@ -3,7 +3,7 @@ API v1 router.
 """
 from fastapi import APIRouter
 
-from app.api.v1 import auth, datasources, queries, files, schedules, ai, lineage, users, sync, sync_schedule, system_config, warehouse
+from app.api.v1 import auth, datasources, queries, files, schedules, ai, lineage, users, sync, sync_schedule, system_config, warehouse, etl, dw_layers, task_dependencies
 
 api_router = APIRouter()
 
@@ -19,3 +19,6 @@ api_router.include_router(schedules.router, prefix="/schedules", tags=["Schedule
 api_router.include_router(ai.router, prefix="/ai", tags=["AI Assistant"])
 api_router.include_router(lineage.router, prefix="/lineage", tags=["Lineage"])
 api_router.include_router(system_config.router, prefix="/config", tags=["System Config"])
+api_router.include_router(etl.router, prefix="/etl", tags=["ETL Tasks"])
+api_router.include_router(dw_layers.router, prefix="/dw-layers", tags=["DW Layers"])
+api_router.include_router(task_dependencies.router, prefix="/task-dependencies", tags=["Task Dependencies"])

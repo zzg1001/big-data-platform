@@ -140,7 +140,7 @@ function WarehouseConfig() {
       setSaving(true)
       const res = await configApi.setWarehouse(values)
       setCurrentConfig(res.data)
-      message.success('数仓配置保存成功')
+      message.success('平台数据库配置保存成功')
       setTestPassed(false)
     } catch (error: any) {
       if (error.errorFields) return
@@ -161,7 +161,7 @@ function WarehouseConfig() {
   return (
     <div>
       <Alert
-        message="数仓/数据湖配置"
+        message="平台数据库/数据湖配置"
         description="配置数据同步的目标数据库连接信息。此配置独立于数据源管理，后续可扩展支持数据湖(Iceberg、Hudi、Delta Lake)。"
         type="info"
         showIcon
@@ -201,7 +201,7 @@ function WarehouseConfig() {
         title={
           <Space>
             <DatabaseOutlined />
-            <span>{currentConfig?.configured ? '修改配置' : '配置数仓连接'}</span>
+            <span>{currentConfig?.configured ? '修改配置' : '配置平台数据库连接'}</span>
           </Space>
         }
       >
@@ -216,10 +216,10 @@ function WarehouseConfig() {
               <Col span={12}>
                 <Form.Item
                   name="name"
-                  label="数仓名称"
-                  rules={[{ required: true, message: '请输入数仓名称' }]}
+                  label="平台数据库名称"
+                  rules={[{ required: true, message: '请输入平台数据库名称' }]}
                 >
-                  <Input placeholder="生产数仓" />
+                  <Input placeholder="生产平台数据库" />
                 </Form.Item>
               </Col>
               <Col span={12}>
@@ -338,7 +338,7 @@ function WarehouseConfig() {
 
       <Card title="说明" size="small">
         <ul style={{ paddingLeft: 20, margin: 0 }}>
-          <li>数仓配置是全局唯一的，所有数据同步任务共用此目标</li>
+          <li>平台数据库配置是全局唯一的，所有数据同步任务共用此目标</li>
           <li>修改配置后，新创建的同步任务将使用新的目标数据库</li>
           <li>密码将加密存储，不会明文保存</li>
           <li>
@@ -363,7 +363,7 @@ export default function Admin() {
       label: (
         <span>
           <GoldOutlined />
-          数仓配置
+          平台数据库配置
         </span>
       ),
       children: <WarehouseConfig />,

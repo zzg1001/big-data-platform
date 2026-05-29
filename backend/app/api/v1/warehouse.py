@@ -3,7 +3,7 @@ Warehouse data exploration API endpoints.
 """
 import json
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -15,6 +15,7 @@ from app.core.security import decrypt_password
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.system_config import SystemConfig
+from app.models.datasource import DataSourceType
 from app.services.db_connector import DatabaseConnector
 
 
@@ -46,7 +47,7 @@ async def get_warehouse_engine(db: AsyncSession):
     if not config or not config.config_value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="数仓未配置，请先在系统管理中配置目标数仓"
+            detail="平台数据库未配置，请先在系统管理中配置目标平台数据库"
         )
 
     try:
@@ -54,21 +55,31 @@ async def get_warehouse_engine(db: AsyncSession):
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="数仓配置格式错误"
+            detail="平台数据库配置格式错误"
         )
 
     password = decrypt_password(data.get("encrypted_password", ""))
     if not password:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="数仓密码未配置"
+            detail="平台数据库密码未配置"
+        )
+
+    # Convert string type to DataSourceType enum
+    db_type_str = data.get("type", "").lower()
+    try:
+        db_type = DataSourceType(db_type_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"不支持的数据库类型: {db_type_str}"
         )
 
     return DatabaseConnector.get_engine(
         datasource_id=-1,
-        db_type=data.get("type"),
+        db_type=db_type,
         host=data.get("host"),
-        port=data.get("port"),
+        port=int(data.get("port", 0)),
         database=data.get("database"),
         username=data.get("username"),
         encrypted_password=data.get("encrypted_password"),
@@ -181,53 +192,83 @@ async def preview_warehouse_table_data(
         )
 
 
-@router.post("/query", response_model=WarehouseQueryResult)
+class WarehouseExecuteResult(BaseModel):
+    """Response schema for warehouse SQL execution (supports all SQL types)."""
+    columns: List[str]
+    rows: List[List]
+    row_count: int
+    affected_rows: Optional[int] = None
+    execution_time_ms: float
+    has_more: bool = False
+    sql_type: str = "SELECT"  # SELECT, INSERT, UPDATE, DELETE, DDL
+
+
+@router.post("/query", response_model=WarehouseExecuteResult)
 async def execute_warehouse_query(
     query_data: WarehouseQueryRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Execute a SQL query on the warehouse."""
+    """Execute a SQL statement on the warehouse (supports SELECT, INSERT, UPDATE, DELETE, DDL)."""
     engine, config = await get_warehouse_engine(db)
 
     try:
         start_time = time.time()
 
         sql = query_data.sql.strip()
-
-        # Add LIMIT if not present (for safety)
         sql_upper = sql.upper()
-        if not sql_upper.startswith("SELECT"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="只支持 SELECT 查询"
-            )
+
+        # Determine SQL type
+        if sql_upper.startswith("SELECT"):
+            sql_type = "SELECT"
+        elif sql_upper.startswith("INSERT"):
+            sql_type = "INSERT"
+        elif sql_upper.startswith("UPDATE"):
+            sql_type = "UPDATE"
+        elif sql_upper.startswith("DELETE"):
+            sql_type = "DELETE"
+        elif sql_upper.startswith(("CREATE", "DROP", "ALTER", "TRUNCATE")):
+            sql_type = "DDL"
+        else:
+            sql_type = "OTHER"
 
         with engine.connect() as conn:
             result = conn.execute(text(sql))
-            columns = list(result.keys())
 
-            # Fetch with limit
-            all_rows = result.fetchmany(query_data.limit + 1)
-            has_more = len(all_rows) > query_data.limit
-            rows = all_rows[:query_data.limit]
-
-            # Convert to list of lists
-            rows_data = [list(row) for row in rows]
+            if sql_type == "SELECT":
+                # SELECT query - return result set
+                columns = list(result.keys())
+                all_rows = result.fetchmany(query_data.limit + 1)
+                has_more = len(all_rows) > query_data.limit
+                rows = all_rows[:query_data.limit]
+                rows_data = [list(row) for row in rows]
+                affected_rows = None
+            else:
+                # DML/DDL - commit and return affected rows
+                conn.commit()
+                columns = []
+                rows_data = []
+                has_more = False
+                affected_rows = result.rowcount if result.rowcount >= 0 else 0
 
         execution_time_ms = (time.time() - start_time) * 1000
 
-        return WarehouseQueryResult(
+        return WarehouseExecuteResult(
             columns=columns,
             rows=rows_data,
             row_count=len(rows_data),
+            affected_rows=affected_rows,
             execution_time_ms=round(execution_time_ms, 2),
             has_more=has_more,
+            sql_type=sql_type,
         )
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        import logging
+        logging.error(f"Warehouse query failed: {str(e)}\nSQL: {query_data.sql}\nTraceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"查询执行失败: {str(e)}"
+            detail=f"SQL执行失败: {str(e)}"
         )

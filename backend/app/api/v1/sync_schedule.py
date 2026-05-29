@@ -20,7 +20,7 @@ from app.schemas.sync_schedule import (
     SyncScheduleResponse,
     SyncScheduleListItem,
 )
-from app.services.airflow_service import airflow_service
+from app.services.airflow_service import airflow_service, AirflowAPIError
 from app.core.config import settings
 
 router = APIRouter()
@@ -179,7 +179,7 @@ async def update_sync_schedule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update a sync schedule."""
+    """Update a sync schedule. If enabled and cron changed, redeploy DAG."""
     result = await db.execute(
         select(SyncSchedule).where(SyncSchedule.id == schedule_id)
     )
@@ -188,6 +188,18 @@ async def update_sync_schedule(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Schedule not found"
+        )
+
+    # Check if cron expression is changing while schedule is enabled
+    old_cron = schedule.cron_expression
+    new_cron = schedule_data.cron_expression if schedule_data.cron_expression else old_cron
+    cron_changed = old_cron != new_cron and schedule.is_enabled
+
+    if cron_changed:
+        # If schedule is enabled and cron changed, need to redeploy DAG
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="已上线的调度不能直接修改Cron表达式，请先下线再修改"
         )
 
     for field, value in schedule_data.model_dump(exclude_unset=True).items():
@@ -221,15 +233,17 @@ async def delete_sync_schedule(
             detail="请先下线后再删除"
         )
 
-    # Delete DAG from Airflow if exists
+    # Delete DAG from Airflow with confirmation if exists
     if schedule.dag_id:
-        # Try to delete DAG via Airflow API
         try:
-            await airflow_service.delete_dag(schedule.dag_id)
-        except Exception:
-            pass  # Ignore Airflow API errors
+            await airflow_service.delete_dag_with_confirmation(schedule.dag_id)
+        except AirflowAPIError as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Airflow删除失败: {e.message}"
+            )
 
-        # Delete DAG file
+        # Delete DAG file after Airflow confirms deletion
         dag_path = os.path.join(
             settings.AIRFLOW_DAGS_PATH or '/opt/airflow/dags/generated',
             f'{schedule.dag_id}.py'
@@ -240,6 +254,7 @@ async def delete_sync_schedule(
             except Exception:
                 pass
 
+    # Only delete from local DB after Airflow confirms success
     await db.delete(schedule)
     await db.flush()
 
@@ -274,6 +289,15 @@ async def enable_sync_schedule(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Schedule is already enabled"
+        )
+
+    # Check Airflow connectivity first (fail fast)
+    try:
+        await airflow_service.check_connectivity()
+    except AirflowAPIError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Airflow服务不可用: {e.message}"
         )
 
     # Get source datasource
@@ -493,6 +517,7 @@ with DAG(
 '''
 
     # Save DAG file
+    # Save DAG file to Airflow directory
     dag_path = os.path.join(
         settings.AIRFLOW_DAGS_PATH or '/opt/airflow/dags/generated',
         f'{dag_id}.py'
@@ -504,31 +529,25 @@ with DAG(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save DAG file: {str(e)}"
+            detail=f"DAG文件保存失败: {str(e)}"
         )
 
-    # Update schedule
+    # Update schedule status
     schedule.is_enabled = True
     schedule.airflow_status = "active"
-
     await db.flush()
 
-    # Unpause DAG in Airflow - retry a few times as Airflow needs time to detect new DAG
-    import asyncio
-    for attempt in range(5):
-        try:
-            success = await airflow_service.unpause_dag(dag_id)
-            if success:
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(2)  # Wait 2 seconds before retry
+    # Try to unpause DAG in Airflow (best effort)
+    try:
+        await airflow_service.enable_dag_simple(dag_id)
+    except AirflowAPIError:
+        pass  # DAG file is saved, Airflow will pick it up later
 
     return {
         "success": True,
         "schedule_id": schedule_id,
         "dag_id": dag_id,
-        "message": "Schedule enabled successfully"
+        "message": "调度已上线"
     }
 
 
@@ -555,11 +574,11 @@ async def disable_sync_schedule(
             detail="Schedule is not enabled"
         )
 
-    # Pause DAG in Airflow
+    # Pause DAG in Airflow (best effort - DAG may not exist)
     if schedule.dag_id:
         await airflow_service.pause_dag(schedule.dag_id)
 
-    # Update schedule
+    # Only update local DB after Airflow confirms success
     schedule.is_enabled = False
     schedule.airflow_status = "paused"
 

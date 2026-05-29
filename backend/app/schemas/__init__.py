@@ -46,6 +46,14 @@ from app.schemas.ai import (
     AIGenerateDAGRequest,
     AIGenerateDAGResponse,
 )
+from app.schemas.etl_task import (
+    EtlTaskCreate,
+    EtlTaskUpdate,
+    EtlTaskResponse,
+    EtlLogResponse,
+    EtlTaskEnableRequest,
+    EtlTaskListItem,
+)
 
 __all__ = [
     # User
@@ -87,4 +95,11 @@ __all__ = [
     "AISQLOptimizeResponse",
     "AIGenerateDAGRequest",
     "AIGenerateDAGResponse",
+    # ETL
+    "EtlTaskCreate",
+    "EtlTaskUpdate",
+    "EtlTaskResponse",
+    "EtlLogResponse",
+    "EtlTaskEnableRequest",
+    "EtlTaskListItem",
 ]

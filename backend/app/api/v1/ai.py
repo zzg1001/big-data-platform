@@ -214,7 +214,7 @@ async def convert_ddl(
     if not target_ds.is_warehouse:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Target datasource must be marked as a warehouse (数仓)"
+            detail="Target datasource must be marked as a warehouse (平台数据库)"
         )
 
     # Get source table DDL
@@ -295,7 +295,7 @@ async def execute_ddl(
     if not datasource.is_warehouse:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Target datasource must be marked as a warehouse (数仓)"
+            detail="Target datasource must be marked as a warehouse (平台数据库)"
         )
 
     try:

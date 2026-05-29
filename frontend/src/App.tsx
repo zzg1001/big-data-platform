@@ -8,8 +8,10 @@ import FileManager from './pages/FileManager'
 import DataSync from './pages/DataSync'
 import FieldTemplates from './pages/FieldTemplates'
 import DataExplorer from './pages/DataExplorer'
+import EtlTasks from './pages/EtlTasks'
 import Scheduler from './pages/Scheduler'
 import Admin from './pages/Admin'
+import DwLayers from './pages/DwLayers'
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuthStore()
@@ -34,7 +36,9 @@ function App() {
         <Route path="data-sync" element={<DataSync />} />
         <Route path="field-templates" element={<FieldTemplates />} />
         <Route path="data-explorer" element={<DataExplorer />} />
+        <Route path="etl-tasks" element={<EtlTasks />} />
         <Route path="scheduler" element={<Scheduler />} />
+        <Route path="dw-layers" element={<DwLayers />} />
         <Route path="admin" element={<Admin />} />
       </Route>
     </Routes>

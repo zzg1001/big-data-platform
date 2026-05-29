@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class WarehouseConfigUpdate(BaseModel):
     """Request for updating warehouse configuration."""
-    name: str = Field(..., max_length=100, description="数仓名称")
+    name: str = Field(..., max_length=100, description="平台数据库名称")
     type: str = Field(..., description="数据库类型: mysql, postgresql, hive, clickhouse, etc.")
     host: str = Field(..., max_length=255)
     port: int = Field(..., ge=1, le=65535)

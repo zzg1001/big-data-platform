@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Card,
   Button,
@@ -14,6 +14,7 @@ import {
   Tooltip,
   Input,
   Table,
+  Popconfirm,
 } from 'antd'
 import {
   RightOutlined,
@@ -38,7 +39,7 @@ import {
   FullscreenOutlined,
   FullscreenExitOutlined,
 } from '@ant-design/icons'
-import { datasourceApi, syncApi, configApi, warehouseApi, aiApi } from '../services/api'
+import { datasourceApi, syncApi, configApi, warehouseApi, aiApi, dwLayerApi } from '../services/api'
 import { useFieldTemplateStore } from '../stores/fieldTemplateStore'
 import Editor from '@monaco-editor/react'
 
@@ -50,7 +51,7 @@ interface SyncTaskItem {
   description?: string
   source_datasource_id: number
   source_table: string
-  target_datasource_id?: number | null  // 为空时使用系统数仓配置
+  target_datasource_id?: number | null  // 为空时使用平台数据库配置
   target_table: string
   sync_mode: string
   status: string
@@ -59,6 +60,17 @@ interface SyncTaskItem {
   last_sync_at?: string
   last_sync_rows?: number
   last_error?: string
+  dw_layer_id?: number
+  dw_layer_name?: string
+  dw_layer_color?: string
+}
+
+interface DwLayer {
+  id: number
+  name: string
+  display_name: string
+  color?: string
+  level: number
 }
 
 interface ColumnMapping {
@@ -90,8 +102,12 @@ export default function DataSync() {
   // 数据源
   const [datasources, setDatasources] = useState<any[]>([])
   const [sourceDsId, setSourceDsId] = useState<number | null>(null)
+  const [targetDsId, setTargetDsId] = useState<number | null>(null)  // null表示使用平台数据库
 
-  // 数仓配置（从系统配置读取）
+  // 平台数据库层级
+  const [layers, setLayers] = useState<DwLayer[]>([])
+
+  // 平台数据库配置（从系统配置读取）
   const [warehouseConfig, setWarehouseConfig] = useState<any>(null)
   const [, setLoadingWarehouse] = useState(true)
 
@@ -104,6 +120,7 @@ export default function DataSync() {
   const [rightSelected, setRightSelected] = useState<string[]>([])
   const [creating, setCreating] = useState(false)
   const [tasksCreated, setTasksCreated] = useState(false)
+  const [selectedLayerId, setSelectedLayerId] = useState<number | null>(null)
   const [syncing, setSyncing] = useState(false)
   const [, setCreatedCount] = useState(0) // 已创建的表数量
   const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([])
@@ -121,6 +138,10 @@ export default function DataSync() {
   const [newTables, setNewTables] = useState<{tableName: string, targetTableName: string}[]>([])
   const [conflictResolutions, setConflictResolutions] = useState<Record<string, 'skip' | 'rename' | 'recreate'>>({})
   const [renameValues, setRenameValues] = useState<Record<string, string>>({})
+
+  // 下线提示弹窗
+  const [warningVisible, setWarningVisible] = useState(false)
+  const [warningTaskId, setWarningTaskId] = useState<number | null>(null)
 
   // AI 修复日志弹窗
   const [aiFixLogVisible, setAiFixLogVisible] = useState(false)
@@ -155,15 +176,28 @@ export default function DataSync() {
   // 字段值模板（从共享 Store 获取）
   const { templates: fieldValueTemplates } = useFieldTemplateStore()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [searchKeyword, setSearchKeyword] = useState('')
 
-  // 数仓是否已配置
+  // 平台数据库是否已配置
   const warehouseConfigured = warehouseConfig?.configured || false
 
   useEffect(() => {
     loadDatasources()
     loadSyncTasks()
     loadWarehouseConfig()
+    loadLayers()
   }, [])
+
+  // 从 URL 参数获取 id 并自动搜索
+  useEffect(() => {
+    const id = searchParams.get('id')
+    if (id) {
+      setSearchKeyword(`id:${id}`)
+      // 清除 URL 参数
+      setSearchParams({})
+    }
+  }, [searchParams])
 
   useEffect(() => {
     if (sourceDsId && addModalVisible) {
@@ -208,11 +242,23 @@ export default function DataSync() {
     }
   }
 
+  const loadLayers = async () => {
+    try {
+      const res = await dwLayerApi.list()
+      setLayers(res.data)
+    } catch (err) {
+      console.error('Failed to load layers:', err)
+    }
+  }
+
   const loadSourceTables = async () => {
     if (!sourceDsId) return
     setLoadingTables(true)
     try {
-      const res = await datasourceApi.getTables(sourceDsId)
+      // 如果是平台数据库（sourceDsId === -1），调用平台数据库 API；否则调用数据源 API
+      const res = sourceDsId === -1
+        ? await warehouseApi.getTables()
+        : await datasourceApi.getTables(sourceDsId)
       setSourceTables(res.data)
     } catch (error) {
       message.error('加载表列表失败')
@@ -228,6 +274,10 @@ export default function DataSync() {
     setRightSelected([])
     setTasksCreated(false)
     setCreatedCount(0)
+    setTargetDsId(null)  // 重置目标数据源（null表示使用平台数据库）
+    // 默认选择ODS层级（如果存在）
+    const odsLayer = layers.find((l) => l.name === 'ODS')
+    setSelectedLayerId(odsLayer?.id || (layers.length > 0 ? layers[0].id : null))
     setAddModalVisible(true)
   }
 
@@ -296,9 +346,10 @@ export default function DataSync() {
     for (const table of tables) {
       try {
         const res = await syncApi.generateDdlPreview({
-          source_datasource_id: sourceDsId!,
+          source_datasource_id: sourceDsId === -1 ? undefined : sourceDsId!,
           source_table: table.tableName,
           target_table: table.targetTableName,
+          target_datasource_id: targetDsId,
         })
         // 如果是删除重建，在 DDL 前加 DROP TABLE
         let ddl = res.data.target_ddl
@@ -771,9 +822,10 @@ export default function DataSync() {
       try {
         // 调用和初始化相同的 API
         const res = await syncApi.generateDdlPreview({
-          source_datasource_id: sourceDsId!,
+          source_datasource_id: sourceDsId === -1 ? undefined : sourceDsId!,
           source_table: item.tableName,
           target_table: item.targetTableName,
+          target_datasource_id: targetDsId,
         })
 
         const ddl = res.data.target_ddl
@@ -821,9 +873,10 @@ export default function DataSync() {
     try {
       // 调用和初始化相同的 API
       const res = await syncApi.generateDdlPreview({
-        source_datasource_id: sourceDsId,
+        source_datasource_id: sourceDsId === -1 ? undefined : sourceDsId!,
         source_table: columnMappingTable.tableName,
         target_table: columnMappingTable.targetTableName,
+        target_datasource_id: targetDsId,
       })
 
       const ddl = res.data.target_ddl
@@ -882,7 +935,7 @@ export default function DataSync() {
     // 1. 保存到数据库
     try {
       await syncApi.saveColumnMappings({
-        source_datasource_id: sourceDsId,
+        source_datasource_id: sourceDsId === -1 ? undefined : sourceDsId!,
         source_table: columnMappingTable.tableName,
         target_table: columnMappingTable.targetTableName,
         mappings: columnMappings.map((m) => ({
@@ -944,9 +997,10 @@ export default function DataSync() {
 
     try {
       const res = await syncApi.generateDdlPreview({
-        source_datasource_id: sourceDsId,
+        source_datasource_id: sourceDsId === -1 ? undefined : sourceDsId!,
         source_table: tableName,
         target_table: item.targetTableName,
+        target_datasource_id: targetDsId,
       })
       setSelectedTables((prev) =>
         prev.map((t) =>
@@ -991,7 +1045,7 @@ export default function DataSync() {
       // 先尝试清空目标表数据
       try {
         const truncateSql = `TRUNCATE TABLE ${item.targetTableName}`
-        await syncApi.executeDdlOnWarehouse(truncateSql)
+        await syncApi.executeDdlOnWarehouse(truncateSql, targetDsId)
       } catch (truncateError) {
         console.log(`TRUNCATE跳过 (${item.targetTableName})`)
       }
@@ -1054,20 +1108,22 @@ export default function DataSync() {
 
     try {
       // 执行 DDL 建表
-      const ddlRes = await syncApi.executeDdlOnWarehouse(item.ddl)
+      const ddlRes = await syncApi.executeDdlOnWarehouse(item.ddl, targetDsId)
       if (!ddlRes.data.success) {
         throw new Error(ddlRes.data.message || 'DDL执行失败')
       }
 
-      // 创建同步任务
+      // 创建同步任务（sourceDsId为-1时表示平台数据库，发送null）
       await syncApi.create({
         name: `Sync_${item.targetTableName}`,
         description: `${item.tableName} → ${item.targetTableName}`,
-        source_datasource_id: sourceDsId,
+        source_datasource_id: sourceDsId === -1 ? null : sourceDsId,
         source_table: item.tableName,
+        target_datasource_id: targetDsId,  // null表示使用平台数据库
         target_table: item.targetTableName,
         sync_mode: 'full',
         is_scheduled: false,
+        dw_layer_id: selectedLayerId,
       })
 
       // 成功
@@ -1182,7 +1238,7 @@ export default function DataSync() {
       return
     }
     if (!warehouseConfigured) {
-      message.warning('请先在「系统管理」中配置目标数仓')
+      message.warning('请先在「系统管理」中配置目标平台数据库')
       return
     }
     if (selectedTables.length === 0) {
@@ -1240,20 +1296,22 @@ export default function DataSync() {
         if (!table.ddl) {
           throw new Error('DDL 为空')
         }
-        const ddlRes = await syncApi.executeDdlOnWarehouse(table.ddl)
+        const ddlRes = await syncApi.executeDdlOnWarehouse(table.ddl, targetDsId)
         if (!ddlRes.data.success) {
           throw new Error(ddlRes.data.message || 'DDL执行失败')
         }
 
-        // 第二步：创建同步任务
+        // 第二步：创建同步任务（sourceDsId为-1时表示平台数据库，发送null）
         await syncApi.create({
           name: `Sync_${table.targetTableName}`,
           description: `${table.tableName} → ${table.targetTableName}`,
-          source_datasource_id: sourceDsId,
+          source_datasource_id: sourceDsId === -1 ? null : sourceDsId,
           source_table: table.tableName,
           target_table: table.targetTableName,
           sync_mode: 'full',
           is_scheduled: false,
+          dw_layer_id: selectedLayerId,
+          target_datasource_id: targetDsId,
         })
 
         // 成功
@@ -1350,7 +1408,7 @@ export default function DataSync() {
         // 先尝试清空目标表数据（表不存在则跳过）
         try {
           const truncateSql = `TRUNCATE TABLE ${table.targetTableName}`
-          await syncApi.executeDdlOnWarehouse(truncateSql)
+          await syncApi.executeDdlOnWarehouse(truncateSql, targetDsId)
         } catch (truncateError) {
           console.log(`TRUNCATE跳过 (${table.targetTableName}): 表可能不存在`)
         }
@@ -1412,54 +1470,81 @@ export default function DataSync() {
     }
   }
 
-  // 删除同步任务（同时删除数仓表）
+  // 删除同步任务（同时删除平台数据库表）
   const handleDeleteTask = async (task: SyncTaskItem) => {
+    // 前端判断：如果有调度引用，直接弹框提示
+    if (task.is_scheduled) {
+      setWarningTaskId(task.id)
+      setWarningVisible(true)
+      return
+    }
     try {
-      // 先删除数仓中的表
-      const dropDdl = `DROP TABLE IF EXISTS ${task.target_table}`
-      await syncApi.executeDdlOnWarehouse(dropDdl)
-      // 再删除任务记录
       await syncApi.delete(task.id)
-      message.success('任务和数仓表已删除')
+      // 成功后删除平台数据库中的表
+      try {
+        const dropDdl = `DROP TABLE IF EXISTS ${task.target_table}`
+        await syncApi.executeDdlOnWarehouse(dropDdl, task.target_datasource_id)
+      } catch {
+        // 删除表失败不影响主流程
+      }
+      message.success('任务已删除')
       loadSyncTasks()
     } catch (error: any) {
-      const detail = error.response?.data?.detail || '删除失败'
-      message.error(detail)
+      message.error(error.response?.data?.detail || '删除失败')
     }
   }
 
   // 批量删除
   const handleBatchDelete = async () => {
     if (selectedTaskIds.length === 0) return
+
+    const tasksToDelete = syncTasks.filter((t) => selectedTaskIds.includes(t.id))
+    const scheduledTasks = tasksToDelete.filter((t) => t.is_scheduled)
+    const deletableTasks = tasksToDelete.filter((t) => !t.is_scheduled)
+
+    // 如果有已调度的任务，弹框提示并支持跳转
+    if (scheduledTasks.length > 0 && deletableTasks.length === 0) {
+      Modal.confirm({
+        title: '请先下线再删除',
+        content: `选中的 ${scheduledTasks.length} 个任务均已调度`,
+        okText: '去下线',
+        cancelText: '取消',
+        onOk: () => {
+          // 跳转到调度管理，带上sync_id参数
+          const ids = scheduledTasks.map(t => t.id).join(',')
+          navigate(`/scheduler?sync_ids=${ids}`)
+        },
+      })
+      return
+    }
+
     setBatchDeleting(true)
     let success = 0
     let fail = 0
-    const errors: string[] = []
 
-    const tasksToDelete = syncTasks.filter((t) => selectedTaskIds.includes(t.id))
-
-    for (const task of tasksToDelete) {
+    for (const task of deletableTasks) {
       try {
-        const dropDdl = `DROP TABLE IF EXISTS ${task.target_table}`
-        await syncApi.executeDdlOnWarehouse(dropDdl)
         await syncApi.delete(task.id)
-        success++
-      } catch (error: any) {
-        fail++
-        const detail = error.response?.data?.detail
-        if (detail && !errors.includes(detail)) {
-          errors.push(detail)
+        try {
+          const dropDdl = `DROP TABLE IF EXISTS ${task.target_table}`
+          await syncApi.executeDdlOnWarehouse(dropDdl, task.target_datasource_id)
+        } catch {
+          // 删除表失败不影响主流程
         }
+        success++
+      } catch {
+        fail++
       }
     }
 
     setBatchDeleting(false)
     setSelectedTaskIds([])
+    loadSyncTasks()
 
-    if (fail === 0) {
+    if (scheduledTasks.length > 0) {
+      message.warning(`已删除 ${success} 个，${scheduledTasks.length} 个需先下线`)
+    } else if (fail === 0) {
       message.success(`已删除 ${success} 个任务`)
-    } else if (errors.length > 0) {
-      message.warning(`成功 ${success} 个，失败 ${fail} 个：${errors.join('; ')}`)
     } else {
       message.warning(`成功 ${success} 个，失败 ${fail} 个`)
     }
@@ -1482,7 +1567,7 @@ export default function DataSync() {
     }
   }
 
-  // AI 生成 DDL（使用 sync API，会自动读取系统数仓配置）
+  // AI 生成 DDL（使用 sync API，会自动读取平台数据库配置）
   const [, setCurrentDdlTaskId] = useState<number | null>(null)
 
   const handleShowDdl = async (task: SyncTaskItem) => {
@@ -1502,13 +1587,13 @@ export default function DataSync() {
     }
   }
 
-  // 执行 DDL（在系统数仓上执行）
+  // 执行 DDL（在目标数据源或平台数据库上执行）
   const handleExecuteDdl = async () => {
     if (!currentDdl) return
 
     setExecuting(true)
     try {
-      const res = await syncApi.executeDdlOnWarehouse(currentDdl)
+      const res = await syncApi.executeDdlOnWarehouse(currentDdl, targetDsId)
       if (res.data.success) {
         message.success(`表 ${res.data.table_name || currentDdlTable} 创建成功`)
         setDdlModalVisible(false)
@@ -1522,17 +1607,23 @@ export default function DataSync() {
     }
   }
 
-  const sourceDs = datasources.find((d) => d.id === sourceDsId)
+  // sourceDs: 如果是平台数据库（sourceDsId === -1），从 warehouseConfig 构建；否则从 datasources 获取
+  const sourceDs = sourceDsId === -1
+    ? { id: -1, name: warehouseConfig?.name || '平台数据库', type: warehouseConfig?.type || 'mysql', database: warehouseConfig?.database || 'warehouse' }
+    : datasources.find((d) => d.id === sourceDsId)
   const availableTables = sourceTables.filter(
     (t) => !selectedTables.find((st) => st.tableName === t)
   )
 
-  // 生成目标表名: ods_类型_库名_表名
+  // 生成目标表名: 层名_类型_库名_表名
   const generateTargetTableName = (tableName: string) => {
     if (!sourceDs) return tableName
+    // 获取层名（默认 ods）
+    const selectedLayer = layers.find(l => l.id === selectedLayerId)
+    const layerName = (selectedLayer?.name || 'ods').toLowerCase()
     const dbType = (sourceDs.type || 'unknown').toLowerCase()
     const dbName = (sourceDs.database || 'db').toLowerCase().replace(/[^a-z0-9]/g, '_')
-    return `ods_${dbType}_${dbName}_${tableName}`
+    return `${layerName}_${dbType}_${dbName}_${tableName}`
   }
 
   // 检查表是否已有同步任务（返回所有匹配的任务）
@@ -1588,7 +1679,7 @@ export default function DataSync() {
           ? datasources.find((d) => d.id === record.target_datasource_id)?.name
           : warehouseConfig?.name
         return (
-          <Tooltip title={`${targetName || '系统数仓'} / ${record.target_table}`}>
+          <Tooltip title={`${targetName || '平台数据库'} / ${record.target_table}`}>
             <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               <Space size={4}>
                 <GoldOutlined style={{ color: '#d4af37', fontSize: 12 }} />
@@ -1628,6 +1719,18 @@ export default function DataSync() {
       },
     },
     {
+      title: '层级',
+      dataIndex: 'dw_layer_name',
+      key: 'dw_layer_name',
+      width: 80,
+      render: (_: string, record: SyncTaskItem) =>
+        record.dw_layer_name ? (
+          <Tag color={record.dw_layer_color || 'default'}>{record.dw_layer_name}</Tag>
+        ) : (
+          <Text type="secondary">-</Text>
+        ),
+    },
+    {
       title: '上次同步',
       key: 'last_sync',
       width: 150,
@@ -1663,21 +1766,43 @@ export default function DataSync() {
               onClick={() => handleShowDdl(record)}
             />
           </Tooltip>
-          {!record.is_scheduled && (
+          <Popconfirm
+            title="确认删除该任务？"
+            onConfirm={() => handleDeleteTask(record)}
+            okText="删除"
+            cancelText="取消"
+          >
             <Tooltip title="删除">
               <Button
                 type="text"
                 size="small"
                 danger
                 icon={<DeleteOutlined />}
-                onClick={() => handleDeleteTask(record)}
               />
             </Tooltip>
-          )}
+          </Popconfirm>
         </Space>
       ),
     },
   ]
+
+  // 根据搜索关键词过滤
+  const filteredSyncTasks = syncTasks.filter((t) => {
+    if (!searchKeyword) return true
+    const keyword = searchKeyword.toLowerCase()
+    // 支持精准搜索 id:xxx 格式
+    if (keyword.startsWith('id:')) {
+      const id = keyword.replace('id:', '')
+      return t.id.toString() === id
+    }
+    // 普通搜索：名称、描述、源表、目标表
+    return (
+      t.name.toLowerCase().includes(keyword) ||
+      (t.description || '').toLowerCase().includes(keyword) ||
+      t.source_table.toLowerCase().includes(keyword) ||
+      t.target_table.toLowerCase().includes(keyword)
+    )
+  })
 
   return (
     <div style={{ padding: '0 4px' }}>
@@ -1706,7 +1831,7 @@ export default function DataSync() {
               color: '#856404',
             }}>
               <GoldOutlined />
-              <span>{warehouseConfig.name}</span>
+              <span>平台数据库</span>
               <span style={{ opacity: 0.7 }}>({warehouseConfig.type})</span>
             </div>
           ) : (
@@ -1717,27 +1842,23 @@ export default function DataSync() {
               fontSize: 12,
               color: '#856404',
             }}>
-              未配置数仓
+              未配置平台数据库
             </div>
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {selectedTaskIds.length > 0 && (() => {
-            const selectedTasks = syncTasks.filter((t) => selectedTaskIds.includes(t.id))
-            const deletableCount = selectedTasks.filter((t) => !t.is_scheduled).length
-            return deletableCount > 0 ? (
-              <Button
-                danger
-                size="small"
-                icon={<DeleteOutlined />}
-                loading={batchDeleting}
-                onClick={handleBatchDelete}
-                style={{ borderRadius: 6 }}
-              >
-                删除 ({deletableCount})
-              </Button>
-            ) : null
-          })()}
+          {selectedTaskIds.length > 0 && (
+            <Button
+              danger
+              size="small"
+              icon={<DeleteOutlined />}
+              loading={batchDeleting}
+              onClick={handleBatchDelete}
+              style={{ borderRadius: 6 }}
+            >
+              删除 ({selectedTaskIds.length})
+            </Button>
+          )}
           <Button
             size="small"
             icon={<ReloadOutlined />}
@@ -1765,6 +1886,14 @@ export default function DataSync() {
           >
             新增任务
           </Button>
+          <Input.Search
+            placeholder="搜索任务名称"
+            allowClear
+            value={searchKeyword}
+            onChange={(e) => setSearchKeyword(e.target.value)}
+            style={{ width: 180 }}
+            size="small"
+          />
         </div>
       </div>
 
@@ -1779,7 +1908,7 @@ export default function DataSync() {
       >
         <Table
           columns={taskColumns}
-          dataSource={syncTasks}
+          dataSource={filteredSyncTasks}
           rowKey="id"
           loading={loadingTasks}
           size="small"
@@ -1846,7 +1975,7 @@ export default function DataSync() {
           ),
         ]}
       >
-        {/* 顶部：源库 → 目标数仓 - 苹果风格 */}
+        {/* 顶部：源库 → 目标平台数据库 - 苹果风格 */}
         <div style={{
           display: 'flex',
           alignItems: 'center',
@@ -1868,10 +1997,18 @@ export default function DataSync() {
                 setSourceDsId(v)
                 setSelectedTables([])
               }}
-              options={datasources.map((ds) => ({
-                value: ds.id,
-                label: `${ds.name} (${ds.type})`,
-              }))}
+              options={[
+                // 平台数据库选项
+                ...(warehouseConfig?.configured ? [{
+                  value: -1,
+                  label: `平台数据库 (${warehouseConfig.type})`,
+                }] : []),
+                // 其他数据源
+                ...datasources.map((ds) => ({
+                  value: ds.id,
+                  label: `${ds.name} (${ds.type})`,
+                })),
+              ]}
             />
           </div>
           <div style={{
@@ -1887,14 +2024,50 @@ export default function DataSync() {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <GoldOutlined style={{ fontSize: 16, color: '#d4af37' }} />
-            {warehouseConfig?.configured ? (
-              <span style={{ fontSize: 13, fontWeight: 500 }}>
-                {warehouseConfig.name}
-                <span style={{ color: '#999', fontWeight: 400, marginLeft: 6 }}>({warehouseConfig.type})</span>
-              </span>
-            ) : (
-              <span style={{ color: '#faad14', fontSize: 13 }}>未配置数仓</span>
-            )}
+            <Select
+              size="small"
+              style={{ width: 180 }}
+              placeholder="选择目标数据库"
+              value={targetDsId}
+              onChange={(v) => {
+                setTargetDsId(v)
+                setSelectedTables([])
+              }}
+              allowClear
+              options={[
+                // 平台数据库选项
+                ...(warehouseConfig?.configured ? [{
+                  value: null as any,
+                  label: `平台数据库 (${warehouseConfig.type})`,
+                }] : []),
+                // 其他数据源（不做互斥）
+                ...datasources.map((ds) => ({
+                  value: ds.id,
+                  label: `${ds.name} (${ds.type})`,
+                })),
+              ]}
+            />
+          </div>
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>层级:</Text>
+            <Select
+              size="small"
+              style={{ width: 120 }}
+              placeholder="选择层级"
+              allowClear
+              value={selectedLayerId}
+              onChange={setSelectedLayerId}
+              options={layers.map((l) => ({
+                value: l.id,
+                label: (
+                  <Space size={4}>
+                    <Tag color={l.color || 'default'} style={{ marginRight: 0, fontSize: 11 }}>
+                      {l.name}
+                    </Tag>
+                  </Space>
+                ),
+              }))}
+            />
           </div>
         </div>
 
@@ -3271,6 +3444,29 @@ export default function DataSync() {
             </Button>
           </Space>
         </div>
+      </Modal>
+
+      {/* 下线提示弹窗 */}
+      <Modal
+        open={warningVisible}
+        onCancel={() => setWarningVisible(false)}
+        closable={true}
+        footer={null}
+        width={280}
+        centered
+        styles={{ body: { textAlign: 'center', padding: '20px 24px' } }}
+      >
+        <ExclamationCircleOutlined style={{ fontSize: 32, color: '#faad14', marginBottom: 12 }} />
+        <div style={{ fontSize: 14, marginBottom: 16 }}>请先下线再删除</div>
+        <Button
+          type="primary"
+          onClick={() => {
+            setWarningVisible(false)
+            navigate(`/scheduler?sync_ids=${warningTaskId}`)
+          }}
+        >
+          去下线
+        </Button>
       </Modal>
 
     </div>

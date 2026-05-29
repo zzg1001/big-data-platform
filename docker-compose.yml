@@ -69,11 +69,11 @@ services:
       dockerfile: Dockerfile
     container_name: bigdata-backend
     environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=${POSTGRES_DB:-bigdata_platform}
-      - POSTGRES_USER=${POSTGRES_USER:-admin}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-admin123}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=${DB_USER:-ai_agent}
+      - DB_PASSWORD=${DB_PASSWORD:-ai_agent123}
+      - DB_NAME=${DB_NAME:-ai_agent}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
@@ -91,7 +91,7 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -133,6 +133,7 @@ services:
       - _AIRFLOW_WWW_USER_CREATE=true
       - _AIRFLOW_WWW_USER_USERNAME=${AIRFLOW_ADMIN_USER:-admin}
       - _AIRFLOW_WWW_USER_PASSWORD=${AIRFLOW_ADMIN_PASSWORD:-admin}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-your_32_byte_encryption_key_here}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
@@ -165,6 +166,7 @@ services:
       - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin123}@postgres:5432/airflow
       - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW__CORE__FERNET_KEY:-}
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-your_32_byte_encryption_key_here}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
@@ -186,6 +188,7 @@ services:
       - AIRFLOW__CELERY__BROKER_URL=redis://:${REDIS_PASSWORD:-redis123}@redis:6379/0
       - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin123}@postgres:5432/airflow
       - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW__CORE__FERNET_KEY:-}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-your_32_byte_encryption_key_here}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins

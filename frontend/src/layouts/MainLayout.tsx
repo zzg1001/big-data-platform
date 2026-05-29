@@ -14,6 +14,7 @@ import {
   SyncOutlined,
   GoldOutlined,
   TagsOutlined,
+  AppstoreOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 
@@ -31,9 +32,18 @@ const menuItems = [
       { key: '/field-templates', icon: <TagsOutlined />, label: '字段模板' },
     ],
   },
-  { key: '/data-explorer', icon: <GoldOutlined />, label: '数据探索' },
+  {
+    key: 'explorer-group',
+    icon: <GoldOutlined />,
+    label: '数据探索',
+    children: [
+      { key: '/data-explorer', icon: <GoldOutlined />, label: '业务探索' },
+      { key: '/etl-tasks', icon: <SyncOutlined />, label: 'ETL任务' },
+    ],
+  },
   { key: '/files', icon: <FileOutlined />, label: '文件管理' },
   { key: '/scheduler', icon: <ScheduleOutlined />, label: '调度管理' },
+  { key: '/dw-layers', icon: <AppstoreOutlined />, label: '平台数据库层级' },
   { key: '/admin', icon: <SettingOutlined />, label: '系统管理' },
 ]
 
@@ -87,7 +97,7 @@ export default function MainLayout() {
           theme="dark"
           mode="inline"
           selectedKeys={[location.pathname]}
-          defaultOpenKeys={['sync-group']}
+          defaultOpenKeys={['sync-group', 'explorer-group']}
           items={menuItems}
           onClick={handleMenuClick}
         />
@@ -115,7 +125,7 @@ export default function MainLayout() {
           </Dropdown>
         </Header>
         <Content
-          style={location.pathname === '/data-explorer' ? {
+          style={(location.pathname === '/data-explorer' || location.pathname === '/etl-tasks') ? {
             margin: 0,
             padding: 0,
             background: token.colorBgContainer,

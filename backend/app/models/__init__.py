@@ -9,6 +9,9 @@ from app.models.file import File
 from app.models.audit import AuditLog
 from app.models.sync_task import SyncTask, SyncLog, ColumnMapping
 from app.models.sync_schedule import SyncSchedule
+from app.models.etl_task import EtlTask, EtlLog
+from app.models.dw_layer import DwLayer
+from app.models.task_dependency import TaskDependency
 
 __all__ = [
     "User",
@@ -28,4 +31,8 @@ __all__ = [
     "SyncLog",
     "SyncSchedule",
     "ColumnMapping",
+    "EtlTask",
+    "EtlLog",
+    "DwLayer",
+    "TaskDependency",
 ]

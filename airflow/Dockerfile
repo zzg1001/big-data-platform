@@ -17,7 +17,9 @@ RUN pip install --no-cache-dir \
     apache-airflow-providers-common-sql \
     apache-airflow-providers-http \
     pandas \
-    sqlalchemy
+    sqlalchemy \
+    pymysql \
+    cryptography
 
 # Create directories
 RUN mkdir -p /opt/airflow/dags/generated

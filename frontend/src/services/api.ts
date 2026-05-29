@@ -2,7 +2,7 @@ import axios from 'axios'
 
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '',
-  timeout: 30000,
+  timeout: 60000,  // 增加到 60 秒，支持 Airflow 事务操作
   headers: {
     'Content-Type': 'application/json',
   },
@@ -230,18 +230,23 @@ export const syncApi = {
   generateDdl: (id: number) => api.post(`/api/v1/sync/${id}/generate-ddl`),
   generateDdlAi: (id: number) => api.post(`/api/v1/sync/${id}/generate-ddl-ai`),
   generateDag: (id: number) => api.post(`/api/v1/sync/${id}/generate-dag`),
-  executeDdlOnWarehouse: (ddl: string) => api.post('/api/v1/sync/execute-ddl-warehouse', { ddl }),
+  executeDdlOnWarehouse: (ddl: string, targetDatasourceId?: number | null) =>
+    api.post('/api/v1/sync/execute-ddl-warehouse', {
+      ddl,
+      target_datasource_id: targetDatasourceId
+    }),
   // 预览 DDL（无需创建任务）
   generateDdlPreview: (data: {
-    source_datasource_id: number
+    source_datasource_id?: number  // 为空时使用平台数据库
     source_table: string
     source_schema?: string
     target_table?: string
     target_schema?: string
+    target_datasource_id?: number | null
   }) => api.post('/api/v1/sync/generate-ddl-preview', data),
   // 字段映射
   saveColumnMappings: (data: {
-    source_datasource_id: number
+    source_datasource_id?: number  // 为空时使用平台数据库
     source_table: string
     target_table: string
     mappings: { source_column: string; source_type: string; target_column: string; target_type: string; is_new_column?: boolean }[]
@@ -255,6 +260,26 @@ export const syncApi = {
     api.delete('/api/v1/sync/column-mappings', {
       params: { source_datasource_id: sourceDatasourceId, source_table: sourceTable, target_table: targetTable },
     }),
+}
+
+// ETL任务 API
+export const etlApi = {
+  list: (statusFilter?: string) =>
+    api.get('/api/v1/etl/', { params: { status_filter: statusFilter } }),
+  get: (id: number) => api.get(`/api/v1/etl/${id}`),
+  create: (data: { name: string; description?: string; sql_content: string; datasource_id?: number }) =>
+    api.post('/api/v1/etl/', data),
+  update: (id: number, data: any) => api.put(`/api/v1/etl/${id}`, data),
+  delete: (id: number) => api.delete(`/api/v1/etl/${id}`),
+  execute: (id: number) => api.post(`/api/v1/etl/${id}/execute`),
+  getLogs: (id: number, limit?: number) =>
+    api.get(`/api/v1/etl/${id}/logs`, { params: { limit } }),
+  schedule: (id: number, cronExpression: string) =>
+    api.post(`/api/v1/etl/${id}/schedule`, { cron_expression: cronExpression }),
+  enable: (id: number, cronExpression: string) =>
+    api.post(`/api/v1/etl/${id}/enable`, { cron_expression: cronExpression }),
+  disable: (id: number) => api.post(`/api/v1/etl/${id}/disable`),
+  unschedule: (id: number) => api.post(`/api/v1/etl/${id}/unschedule`),
 }
 
 // 调度管理 API (独立实体，封装 sync task)
@@ -278,4 +303,37 @@ export const syncScheduleApi = {
   enable: (id: number) => api.post(`/api/v1/sync-schedules/${id}/enable`),
   // 下线调度（暂停 DAG）
   disable: (id: number) => api.post(`/api/v1/sync-schedules/${id}/disable`),
+}
+
+// 平台数据库层级 API
+export const dwLayerApi = {
+  list: () => api.get('/api/v1/dw-layers/'),
+  get: (id: number) => api.get(`/api/v1/dw-layers/${id}`),
+  create: (data: { name: string; display_name: string; description?: string; level: number; color?: string }) =>
+    api.post('/api/v1/dw-layers/', data),
+  update: (id: number, data: { name?: string; display_name?: string; description?: string; level?: number; color?: string }) =>
+    api.put(`/api/v1/dw-layers/${id}`, data),
+  delete: (id: number) => api.delete(`/api/v1/dw-layers/${id}`),
+  initDefaults: () => api.post('/api/v1/dw-layers/init-defaults'),
+}
+
+// 任务依赖 API
+export const taskDependencyApi = {
+  getForTask: (taskType: string, taskId: number) =>
+    api.get(`/api/v1/task-dependencies/task/${taskType}/${taskId}`),
+  create: (data: {
+    task_type: string;
+    task_id: number;
+    upstream_task_type: string;
+    upstream_task_id: number;
+    dependency_type?: string;
+    source_table?: string;
+  }) => api.post('/api/v1/task-dependencies/', data),
+  delete: (id: number) => api.delete(`/api/v1/task-dependencies/${id}`),
+  searchTasks: (q: string, excludeType?: string, excludeId?: number) =>
+    api.get('/api/v1/task-dependencies/search-tasks', {
+      params: { q, exclude_type: excludeType, exclude_id: excludeId },
+    }),
+  parseSql: (sqlContent: string) =>
+    api.post('/api/v1/task-dependencies/parse-sql', { sql_content: sqlContent }),
 }

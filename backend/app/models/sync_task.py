@@ -32,15 +32,18 @@ class SyncTask(Base):
     name = Column(String(100), nullable=False)
     description = Column(String(500))
 
-    # Source
-    source_datasource_id = Column(BigInteger, ForeignKey("big_datasources.id"), nullable=False)
+    # Source (使用系统平台数据库配置时可为空)
+    source_datasource_id = Column(BigInteger, ForeignKey("big_datasources.id"), nullable=True)
     source_table = Column(String(200), nullable=False)
     source_schema = Column(String(100))
 
-    # Target (使用系统数仓配置时可为空)
+    # Target (使用系统平台数据库配置时可为空)
     target_datasource_id = Column(BigInteger, ForeignKey("big_datasources.id"), nullable=True)
     target_table = Column(String(200), nullable=False)
     target_schema = Column(String(100))
+
+    # Data warehouse layer (ODS, DW, DWS, ADS)
+    dw_layer_id = Column(BigInteger, ForeignKey("big_dw_layers.id"), nullable=True)
 
     # Sync config
     sync_mode = Column(Enum(SyncMode), default=SyncMode.FULL)
@@ -85,6 +88,17 @@ class SyncTask(Base):
 
     # Relationships (cascade delete: 删除任务时同时删除日志)
     logs = relationship("SyncLog", back_populates="sync_task", cascade="all, delete-orphan")
+    dw_layer = relationship("DwLayer", back_populates="sync_tasks", lazy="joined")
+
+    @property
+    def dw_layer_name(self) -> str | None:
+        """Get the data warehouse layer name."""
+        return self.dw_layer.name if self.dw_layer else None
+
+    @property
+    def dw_layer_color(self) -> str | None:
+        """Get the data warehouse layer color."""
+        return self.dw_layer.color if self.dw_layer else None
 
 
 class SyncLog(Base):

@@ -13,15 +13,18 @@ class SyncTaskCreate(BaseModel):
     name: str = Field(..., max_length=100)
     description: Optional[str] = Field(None, max_length=500)
 
-    # 源配置
-    source_datasource_id: int
+    # 源配置（source_datasource_id 为空时使用系统平台数据库配置）
+    source_datasource_id: Optional[int] = None  # 为空时使用系统平台数据库配置
     source_table: str = Field(..., max_length=200)
     source_schema: Optional[str] = Field(None, max_length=100)
 
-    # 目标配置（使用系统配置的数仓，target_datasource_id 可选）
-    target_datasource_id: Optional[int] = None  # 为空时使用系统数仓配置
+    # 目标配置（使用系统配置的平台数据库，target_datasource_id 可选）
+    target_datasource_id: Optional[int] = None  # 为空时使用系统平台数据库配置
     target_table: str = Field(..., max_length=200)
     target_schema: Optional[str] = Field(None, max_length=100)
+
+    # Data warehouse layer
+    dw_layer_id: Optional[int] = None
 
     # 同步配置
     sync_mode: SyncMode = SyncMode.FULL
@@ -56,6 +59,7 @@ class SyncTaskUpdate(BaseModel):
     source_schema: Optional[str] = Field(None, max_length=100)
     target_table: Optional[str] = Field(None, max_length=200)
     target_schema: Optional[str] = Field(None, max_length=100)
+    dw_layer_id: Optional[int] = None
     sync_mode: Optional[SyncMode] = None
     incremental_column: Optional[str] = Field(None, max_length=100)
     where_condition: Optional[str] = None
@@ -91,9 +95,13 @@ class SyncTaskResponse(BaseModel):
     source_table: str
     source_schema: Optional[str] = None
 
-    target_datasource_id: Optional[int] = None  # 为空时使用系统数仓配置
+    target_datasource_id: Optional[int] = None  # 为空时使用系统平台数据库配置
     target_table: str
     target_schema: Optional[str] = None
+
+    dw_layer_id: Optional[int] = None
+    dw_layer_name: Optional[str] = None
+    dw_layer_color: Optional[str] = None
 
     sync_mode: SyncMode
     incremental_column: Optional[str] = None
@@ -195,6 +203,10 @@ class SyncTaskSchedulerView(BaseModel):
     source_datasource_id: int
     source_table: str
     target_table: str
+
+    dw_layer_id: Optional[int] = None
+    dw_layer_name: Optional[str] = None
+    dw_layer_color: Optional[str] = None
 
     sync_mode: SyncMode
     is_scheduled: bool

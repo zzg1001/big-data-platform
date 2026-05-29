@@ -77,7 +77,7 @@ async def get_warehouse_engine(db: AsyncSession):
     if not config or not config.config_value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="数仓未配置，请先在系统管理中配置目标数仓"
+            detail="平台数据库未配置，请先在系统管理中配置目标平台数据库"
         )
 
     import json
@@ -86,18 +86,18 @@ async def get_warehouse_engine(db: AsyncSession):
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="数仓配置格式错误"
+            detail="平台数据库配置格式错误"
         )
 
     password = decrypt_password(data.get("encrypted_password", ""))
     if not password:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="数仓密码未配置"
+            detail="平台数据库密码未配置"
         )
 
     return DatabaseConnector.get_engine(
-        datasource_id=-1,  # 使用特殊ID标识数仓
+        datasource_id=-1,  # 使用特殊ID标识平台数据库
         db_type=data.get("type"),
         host=data.get("host"),
         port=data.get("port"),
@@ -117,22 +117,30 @@ async def create_sync_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new sync task."""
-    # Validate source datasource exists
-    await get_datasource(db, task_data.source_datasource_id)
+    # 获取平台数据库配置（可能作为源或目标使用）
+    wh_result = await db.execute(
+        select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
+    )
+    wh_config = wh_result.scalar_one_or_none()
+
+    # Validate source datasource if provided, otherwise check warehouse config
+    if task_data.source_datasource_id:
+        await get_datasource(db, task_data.source_datasource_id)
+    else:
+        if not wh_config or not wh_config.config_value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="未指定源数据源且系统平台数据库未配置，请先在系统管理中配置平台数据库"
+            )
 
     # Validate target datasource if provided, otherwise check warehouse config
     if task_data.target_datasource_id:
         await get_datasource(db, task_data.target_datasource_id)
     else:
-        # Verify warehouse is configured
-        result = await db.execute(
-            select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
-        )
-        config = result.scalar_one_or_none()
-        if not config or not config.config_value:
+        if not wh_config or not wh_config.config_value:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="未指定目标数据源且系统数仓未配置，请先在系统管理中配置目标数仓"
+                detail="未指定目标数据源且系统平台数据库未配置，请先在系统管理中配置目标平台数据库"
             )
 
     sync_task = SyncTask(
@@ -167,13 +175,29 @@ async def list_sync_tasks(
     db: AsyncSession = Depends(get_db),
 ):
     """List all sync tasks."""
-    query = select(SyncTask)
+    from sqlalchemy.orm import joinedload
+    from app.models.dw_layer import DwLayer
+    from app.models.sync_schedule import SyncSchedule
+
+    query = select(SyncTask).options(joinedload(SyncTask.dw_layer))
     if status_filter:
         query = query.where(SyncTask.status == status_filter)
     query = query.order_by(SyncTask.created_at.desc())
 
     result = await db.execute(query)
-    return list(result.scalars().all())
+    tasks = list(result.scalars().unique().all())
+
+    # 查询所有有调度的任务ID
+    schedule_result = await db.execute(
+        select(SyncSchedule.sync_task_id).distinct()
+    )
+    scheduled_task_ids = set(row[0] for row in schedule_result.fetchall())
+
+    # 更新 is_scheduled 字段（基于实际调度关系）
+    for task in tasks:
+        task.is_scheduled = task.id in scheduled_task_ids
+
+    return tasks
 
 
 @router.get("/table-columns", response_model=List[dict])
@@ -203,7 +227,11 @@ async def get_sync_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Get sync task by ID."""
-    result = await db.execute(select(SyncTask).where(SyncTask.id == task_id))
+    from sqlalchemy.orm import joinedload
+
+    result = await db.execute(
+        select(SyncTask).options(joinedload(SyncTask.dw_layer)).where(SyncTask.id == task_id)
+    )
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
@@ -249,7 +277,7 @@ async def delete_sync_task(
     from sqlalchemy.orm import selectinload
     from app.models.sync_schedule import SyncSchedule
 
-    # Check if any schedule references this task
+    # Check if any schedule references this task (后端保护层)
     schedule_result = await db.execute(
         select(SyncSchedule).where(SyncSchedule.sync_task_id == task_id)
     )
@@ -257,7 +285,7 @@ async def delete_sync_task(
     if schedule:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"无法删除：此同步任务已被调度任务 '{schedule.name}' 引用，请先删除调度任务"
+            detail=f"无法删除：此同步任务已被调度任务引用，请先下线"
         )
 
     # 使用 selectinload 预加载 logs，以便级联删除
@@ -321,10 +349,13 @@ async def get_source_columns(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
 
-    source_ds = await get_datasource(db, task.source_datasource_id)
-
     try:
-        source_engine = get_engine_for_datasource(source_ds)
+        # 如果有 source_datasource_id 则使用，否则使用平台数据库
+        if task.source_datasource_id:
+            source_ds = await get_datasource(db, task.source_datasource_id)
+            source_engine = get_engine_for_datasource(source_ds)
+        else:
+            source_engine = await get_warehouse_engine(db)
         sync_service = SyncService(source_engine, source_engine)
         columns = sync_service.get_table_columns(task.source_table, task.source_schema)
         return columns
@@ -348,9 +379,6 @@ async def execute_sync_task(
     if task.status == SyncStatus.RUNNING:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task is already running")
 
-    # Get datasources
-    source_ds = await get_datasource(db, task.source_datasource_id)
-
     # Create log entry
     log = SyncLog(
         sync_task_id=task.id,
@@ -365,8 +393,14 @@ async def execute_sync_task(
 
     # Execute sync
     try:
-        source_engine = get_engine_for_datasource(source_ds)
-        # 如果有 target_datasource_id 则使用，否则使用系统数仓配置
+        # 如果有 source_datasource_id 则使用，否则使用平台数据库
+        if task.source_datasource_id:
+            source_ds = await get_datasource(db, task.source_datasource_id)
+            source_engine = get_engine_for_datasource(source_ds)
+        else:
+            source_engine = await get_warehouse_engine(db)
+
+        # 如果有 target_datasource_id 则使用，否则使用平台数据库
         if task.target_datasource_id:
             target_ds = await get_datasource(db, task.target_datasource_id)
             target_engine = get_engine_for_datasource(target_ds)
@@ -431,10 +465,14 @@ async def generate_target_ddl(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
 
-    source_ds = await get_datasource(db, task.source_datasource_id)
-
     try:
-        source_engine = get_engine_for_datasource(source_ds)
+        # 如果有 source_datasource_id 则使用，否则使用平台数据库
+        if task.source_datasource_id:
+            source_ds = await get_datasource(db, task.source_datasource_id)
+            source_engine = get_engine_for_datasource(source_ds)
+        else:
+            source_engine = await get_warehouse_engine(db)
+
         if task.target_datasource_id:
             target_ds = await get_datasource(db, task.target_datasource_id)
             target_engine = get_engine_for_datasource(target_ds)
@@ -476,24 +514,19 @@ async def generate_sync_dag(
             detail="Task must have a cron expression to generate DAG"
         )
 
-    source_ds = await get_datasource(db, task.source_datasource_id)
+    # Get source name for DAG description
+    if task.source_datasource_id:
+        source_ds = await get_datasource(db, task.source_datasource_id)
+        source_name = source_ds.name
+    else:
+        source_name = "平台数据库"
 
     # Get target name for DAG description
     if task.target_datasource_id:
         target_ds = await get_datasource(db, task.target_datasource_id)
         target_name = target_ds.name
     else:
-        # Get from warehouse config
-        wh_result = await db.execute(
-            select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
-        )
-        wh_config = wh_result.scalar_one_or_none()
-        if wh_config and wh_config.config_value:
-            import json as json_module
-            wh_data = json_module.loads(wh_config.config_value)
-            target_name = wh_data.get("name", "数仓")
-        else:
-            target_name = "数仓"
+        target_name = "平台数据库"
 
     # Generate DAG content
     dag_id = f"sync_{task.id}_{task.source_table.replace('.', '_')}"
@@ -587,30 +620,41 @@ async def generate_target_ddl_ai(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync task not found")
 
-    source_ds = await get_datasource(db, task.source_datasource_id)
-    source_db_type = source_ds.type.value if hasattr(source_ds.type, 'value') else str(source_ds.type)
+    # 获取平台数据库配置（可能作为源或目标使用）
+    import json as json_module
+    wh_result = await db.execute(
+        select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
+    )
+    wh_config = wh_result.scalar_one_or_none()
+    wh_data = json_module.loads(wh_config.config_value) if wh_config and wh_config.config_value else None
+
+    # Get source db type
+    if task.source_datasource_id:
+        source_ds = await get_datasource(db, task.source_datasource_id)
+        source_db_type = source_ds.type.value if hasattr(source_ds.type, 'value') else str(source_ds.type)
+        source_engine = get_engine_for_datasource(source_ds)
+    else:
+        if not wh_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="平台数据库未配置"
+            )
+        source_db_type = wh_data.get("type", "mysql")
+        source_engine = await get_warehouse_engine(db)
 
     # Get target db type
     if task.target_datasource_id:
         target_ds = await get_datasource(db, task.target_datasource_id)
         target_db_type = target_ds.type.value if hasattr(target_ds.type, 'value') else str(target_ds.type)
     else:
-        # Get from warehouse config
-        wh_result = await db.execute(
-            select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
-        )
-        wh_config = wh_result.scalar_one_or_none()
-        if not wh_config or not wh_config.config_value:
+        if not wh_data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="数仓未配置，请先在系统管理中配置目标数仓"
+                detail="平台数据库未配置"
             )
-        import json as json_module
-        wh_data = json_module.loads(wh_config.config_value)
         target_db_type = wh_data.get("type", "mysql")
 
     try:
-        source_engine = get_engine_for_datasource(source_ds)
 
         # Get table metadata and generate source DDL
         metadata = DatabaseConnector.get_table_metadata(
@@ -704,17 +748,19 @@ from typing import Optional
 
 
 class ExecuteDDLRequest(BaseModel):
-    """Request body for executing DDL on warehouse."""
+    """Request body for executing DDL on warehouse or specific datasource."""
     ddl: str
+    target_datasource_id: Optional[int] = None  # None表示使用系统平台数据库
 
 
 class GenerateDDLRequest(BaseModel):
     """Request body for generating DDL."""
-    source_datasource_id: int
+    source_datasource_id: Optional[int] = None  # None表示使用系统平台数据库
     source_table: str
     source_schema: Optional[str] = None
     target_table: Optional[str] = None
     target_schema: Optional[str] = None
+    target_datasource_id: Optional[int] = None  # None表示使用系统平台数据库
 
 
 @router.post("/execute-ddl-warehouse", response_model=dict)
@@ -723,13 +769,18 @@ async def execute_ddl_on_warehouse(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Execute DDL on the system warehouse configuration."""
+    """Execute DDL on the system warehouse or a specific datasource."""
     try:
-        warehouse_engine = await get_warehouse_engine(db)
+        # 如果指定了目标数据源，使用该数据源；否则使用系统平台数据库
+        if request.target_datasource_id:
+            target_ds = await get_datasource(db, request.target_datasource_id)
+            engine = get_engine_for_datasource(target_ds)
+        else:
+            engine = await get_warehouse_engine(db)
 
         # Execute DDL
         from sqlalchemy import text
-        with warehouse_engine.connect() as conn:
+        with engine.connect() as conn:
             conn.execute(text(request.ddl))
             conn.commit()
 
@@ -764,26 +815,42 @@ async def generate_ddl_preview(
     db: AsyncSession = Depends(get_db),
 ):
     """Generate DDL for a table. If source and target db types are the same, skip AI conversion."""
-    source_ds = await get_datasource(db, request.source_datasource_id)
+    import json as json_module
 
-    # Get target db type from warehouse config
+    # 获取平台数据库配置（可能作为源或目标使用）
     wh_result = await db.execute(
         select(SystemConfig).where(SystemConfig.config_key == "warehouse_config")
     )
     wh_config = wh_result.scalar_one_or_none()
-    if not wh_config or not wh_config.config_value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="数仓未配置，请先在系统管理中配置目标数仓"
-        )
+    wh_data = json_module.loads(wh_config.config_value) if wh_config and wh_config.config_value else None
 
-    import json as json_module
-    wh_data = json_module.loads(wh_config.config_value)
-    target_db_type = wh_data.get("type", "mysql")
-    source_db_type = source_ds.type.value if hasattr(source_ds.type, 'value') else str(source_ds.type)
+    # 如果指定了源数据源，从该数据源获取；否则使用平台数据库
+    if request.source_datasource_id:
+        source_ds = await get_datasource(db, request.source_datasource_id)
+        source_db_type = source_ds.type.value if hasattr(source_ds.type, 'value') else str(source_ds.type)
+        source_engine = get_engine_for_datasource(source_ds)
+    else:
+        if not wh_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="平台数据库未配置，请先在系统管理中配置平台数据库"
+            )
+        source_db_type = wh_data.get("type", "mysql")
+        source_engine = await get_warehouse_engine(db)
+
+    # 如果指定了目标数据源，从该数据源获取类型；否则从平台数据库配置获取
+    if request.target_datasource_id:
+        target_ds = await get_datasource(db, request.target_datasource_id)
+        target_db_type = target_ds.type.value if hasattr(target_ds.type, 'value') else str(target_ds.type)
+    else:
+        if not wh_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="平台数据库未配置，请先在系统管理中配置目标平台数据库"
+            )
+        target_db_type = wh_data.get("type", "mysql")
 
     try:
-        source_engine = get_engine_for_datasource(source_ds)
 
         # Get table metadata and generate source DDL
         metadata = DatabaseConnector.get_table_metadata(
@@ -1246,7 +1313,12 @@ async def backfill_sync_task(
     # For full backfill, just execute the sync
     if request.mode == "full":
         try:
-            source_ds = await get_datasource(db, task.source_datasource_id)
+            # Get source engine
+            if task.source_datasource_id:
+                source_ds = await get_datasource(db, task.source_datasource_id)
+                source_engine = get_engine_for_datasource(source_ds)
+            else:
+                source_engine = await get_warehouse_engine(db)
 
             # Get target engine
             if task.target_datasource_id:
@@ -1254,8 +1326,6 @@ async def backfill_sync_task(
                 target_engine = get_engine_for_datasource(target_ds)
             else:
                 target_engine = await get_warehouse_engine(db)
-
-            source_engine = get_engine_for_datasource(source_ds)
             sync_service = SyncService(source_engine, target_engine)
 
             # Create log entry
@@ -1359,9 +1429,6 @@ async def internal_execute_sync_task(
     if task.status == SyncStatus.RUNNING:
         return {"success": False, "message": "Task is already running", "task_id": task_id}
 
-    # Get datasources
-    source_ds = await get_datasource(db, task.source_datasource_id)
-
     # Create log entry
     log = SyncLog(
         sync_task_id=task.id,
@@ -1376,7 +1443,14 @@ async def internal_execute_sync_task(
 
     # Execute sync
     try:
-        source_engine = get_engine_for_datasource(source_ds)
+        # Get source engine
+        if task.source_datasource_id:
+            source_ds = await get_datasource(db, task.source_datasource_id)
+            source_engine = get_engine_for_datasource(source_ds)
+        else:
+            source_engine = await get_warehouse_engine(db)
+
+        # Get target engine
         if task.target_datasource_id:
             target_ds = await get_datasource(db, task.target_datasource_id)
             target_engine = get_engine_for_datasource(target_ds)

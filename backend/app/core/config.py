@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str = "change_this_to_32_byte_key_xxxxx"
 
     # Airflow
-    AIRFLOW_API_URL: str = "http://localhost:8080/api/v1"
+    AIRFLOW_API_URL: str = "http://localhost:8080"
     AIRFLOW_USERNAME: str = "admin"
     AIRFLOW_PASSWORD: str = "admin"
     AIRFLOW_DAGS_PATH: str = "/opt/airflow/dags/generated"

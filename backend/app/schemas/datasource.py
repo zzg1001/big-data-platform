@@ -40,7 +40,7 @@ class DataSourceCreate(BaseModel):
     group_id: Optional[int] = None
     pool_size: int = Field(default=5, ge=1, le=50)
     max_overflow: int = Field(default=10, ge=0, le=100)
-    is_warehouse: bool = False  # 是否为数仓
+    is_warehouse: bool = False  # 是否为平台数据库
 
 
 class DataSourceUpdate(BaseModel):
@@ -58,7 +58,7 @@ class DataSourceUpdate(BaseModel):
     is_active: Optional[bool] = None
     pool_size: Optional[int] = Field(None, ge=1, le=50)
     max_overflow: Optional[int] = Field(None, ge=0, le=100)
-    is_warehouse: Optional[bool] = None  # 是否为数仓
+    is_warehouse: Optional[bool] = None  # 是否为平台数据库
 
 
 class DataSourceResponse(BaseModel):
@@ -73,7 +73,7 @@ class DataSourceResponse(BaseModel):
     schema_name: Optional[str] = None
     service_name: Optional[str] = None
     is_active: bool
-    is_warehouse: bool = False  # 是否为数仓
+    is_warehouse: bool = False  # 是否为平台数据库
     connection_status: str
     last_connected_at: Optional[datetime] = None
     group_id: Optional[int] = None
