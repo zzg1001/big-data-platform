@@ -92,13 +92,20 @@ with DAG(
         tasks = []
 
         # Add dependency sensors
+        # 使用 check_existence=True 确保上游DAG存在
+        # 同一logical_date的任务会自动关联（适用于每日调度场景）
         if dependencies:
             for i, dep_dag in enumerate(dependencies):
                 tasks.append(f'''    wait_for_{dep_dag} = ExternalTaskSensor(
         task_id="wait_for_{dep_dag}",
         external_dag_id="{dep_dag}",
-        mode="reschedule",
-        timeout=3600,
+        check_existence=True,  # 检查上游DAG是否存在
+        mode="reschedule",     # 释放worker，定时重试
+        poke_interval=300,     # 每5分钟检查一次
+        timeout=7200,          # 最多等待2小时
+        allowed_states=["success"],  # 只有成功才通过
+        failed_states=["failed", "skipped"],  # 失败或跳过则终止
+        soft_fail=False,       # 超时后标记失败（触发告警）
     )
 ''')
 

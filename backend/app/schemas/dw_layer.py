@@ -13,6 +13,7 @@ class DwLayerCreate(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
     level: int = Field(..., ge=0)
     color: Optional[str] = Field(None, max_length=20)
+    requires_dependency: bool = True  # ODS=False, others=True
 
 
 class DwLayerUpdate(BaseModel):
@@ -22,6 +23,7 @@ class DwLayerUpdate(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
     level: Optional[int] = Field(None, ge=0)
     color: Optional[str] = Field(None, max_length=20)
+    requires_dependency: Optional[bool] = None
 
 
 class DwLayerResponse(BaseModel):
@@ -32,6 +34,7 @@ class DwLayerResponse(BaseModel):
     description: Optional[str] = None
     level: int
     color: Optional[str] = None
+    requires_dependency: bool = True
     created_by: Optional[int] = None
     created_at: datetime
     updated_at: datetime
@@ -48,6 +51,7 @@ class DwLayerListItem(BaseModel):
     description: Optional[str] = None
     level: int
     color: Optional[str] = None
+    requires_dependency: bool = True
     sync_task_count: int = 0
     etl_task_count: int = 0
 

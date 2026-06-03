@@ -106,6 +106,7 @@ class EtlTaskListItem(BaseModel):
     status: EtlStatus
     last_run_at: Optional[datetime] = None
     last_run_rows: Optional[int] = None
+    dependency_count: int = 0  # 上游依赖数量
 
     created_at: datetime
 

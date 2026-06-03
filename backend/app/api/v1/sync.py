@@ -15,6 +15,9 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.datasource import DataSource
 from app.models.sync_task import SyncTask, SyncLog, SyncStatus, SyncMode, ColumnMapping
+from app.models.dw_layer import DwLayer
+from app.models.task_dependency import TaskDependency
+from app.models.etl_task import EtlTask
 from app.schemas.sync_task import (
     SyncTaskCreate,
     SyncTaskUpdate,
@@ -110,6 +113,95 @@ async def get_warehouse_engine(db: AsyncSession):
     )
 
 
+async def auto_add_sync_dependency(db: AsyncSession, task: SyncTask, user_id: int):
+    """
+    自动为非 ODS 层的同步任务添加依赖。
+    根据 source_table 查找产出该表的上游任务。
+    """
+    if not task.dw_layer_id:
+        return  # 没有指定层级，不处理
+
+    # 获取任务的层级
+    layer_result = await db.execute(
+        select(DwLayer).where(DwLayer.id == task.dw_layer_id)
+    )
+    layer = layer_result.scalar_one_or_none()
+
+    if not layer or not layer.requires_dependency:
+        return  # ODS 层或不需要依赖的层级
+
+    # 根据 source_table 查找产出该表的同步任务
+    # 匹配逻辑：上游任务的 target_table = 当前任务的 source_table
+    source_table = task.source_table.lower()
+
+    # 查找同步任务
+    upstream_sync = await db.execute(
+        select(SyncTask).where(
+            SyncTask.target_table.ilike(f"%{source_table}%"),
+            SyncTask.id != task.id  # 排除自己
+        )
+    )
+    upstream_sync_task = upstream_sync.scalar_one_or_none()
+
+    if upstream_sync_task:
+        # 检查依赖是否已存在
+        existing = await db.execute(
+            select(TaskDependency).where(
+                TaskDependency.task_type == "sync",
+                TaskDependency.task_id == task.id,
+                TaskDependency.upstream_task_type == "sync",
+                TaskDependency.upstream_task_id == upstream_sync_task.id,
+            )
+        )
+        if not existing.scalar_one_or_none():
+            # 创建依赖
+            dep = TaskDependency(
+                task_type="sync",
+                task_id=task.id,
+                upstream_task_type="sync",
+                upstream_task_id=upstream_sync_task.id,
+                dependency_type="auto",
+                source_table=task.source_table,
+                created_by=user_id,
+            )
+            db.add(dep)
+        return
+
+    # 如果没找到同步任务，查找 ETL 任务（ETL 任务可能产出这张表）
+    # ETL 任务没有明确的 target_table，这里暂不处理
+    # 用户可以手动添加 ETL 任务作为依赖
+
+
+async def check_downstream_dependencies(db: AsyncSession, task_type: str, task_id: int) -> list:
+    """检查是否有下游任务依赖此任务。返回下游任务列表。"""
+    result = await db.execute(
+        select(TaskDependency).where(
+            TaskDependency.upstream_task_type == task_type,
+            TaskDependency.upstream_task_id == task_id,
+        )
+    )
+    dependencies = result.scalars().all()
+
+    downstream_tasks = []
+    for dep in dependencies:
+        if dep.task_type == "sync":
+            task_result = await db.execute(
+                select(SyncTask).where(SyncTask.id == dep.task_id)
+            )
+            task = task_result.scalar_one_or_none()
+            if task:
+                downstream_tasks.append({"type": "sync", "id": task.id, "name": task.name})
+        elif dep.task_type == "etl":
+            task_result = await db.execute(
+                select(EtlTask).where(EtlTask.id == dep.task_id)
+            )
+            task = task_result.scalar_one_or_none()
+            if task:
+                downstream_tasks.append({"type": "etl", "id": task.id, "name": task.name})
+
+    return downstream_tasks
+
+
 @router.post("/", response_model=SyncTaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_sync_task(
     task_data: SyncTaskCreate,
@@ -152,6 +244,7 @@ async def create_sync_task(
         target_datasource_id=task_data.target_datasource_id,
         target_table=task_data.target_table,
         target_schema=task_data.target_schema,
+        dw_layer_id=task_data.dw_layer_id,
         sync_mode=task_data.sync_mode,
         incremental_column=task_data.incremental_column,
         where_condition=task_data.where_condition,
@@ -165,6 +258,11 @@ async def create_sync_task(
     db.add(sync_task)
     await db.flush()
     await db.refresh(sync_task)
+
+    # 自动添加依赖（非 ODS 层的同步任务）
+    await auto_add_sync_dependency(db, sync_task, current_user.id)
+    await db.flush()
+
     return sync_task
 
 
@@ -285,7 +383,16 @@ async def delete_sync_task(
     if schedule:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"无法删除：此同步任务已被调度任务引用，请先下线"
+            detail="请删除引用"
+        )
+
+    # 检查是否有下游任务依赖此任务
+    downstream_tasks = await check_downstream_dependencies(db, "sync", task_id)
+    if downstream_tasks:
+        task_names = ", ".join([f"{t['type']}:{t['name']}" for t in downstream_tasks])
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"无法删除：以下任务依赖此任务：{task_names}，请先删除依赖关系"
         )
 
     # 使用 selectinload 预加载 logs，以便级联删除
@@ -307,6 +414,15 @@ async def delete_sync_task(
         except Exception as e:
             # 记录错误但不阻止删除任务
             print(f"Warning: Failed to delete DAG file {dag_path}: {e}")
+
+    # 删除此任务作为下游的依赖关系
+    from sqlalchemy import delete
+    await db.execute(
+        delete(TaskDependency).where(
+            TaskDependency.task_type == "sync",
+            TaskDependency.task_id == task_id
+        )
+    )
 
     await db.delete(task)
     await db.flush()

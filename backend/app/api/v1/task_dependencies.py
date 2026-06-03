@@ -297,20 +297,30 @@ async def parse_sql_dependencies(
     """Parse SQL to extract table dependencies and match with existing tasks."""
     import re
 
-    sql = data.sql_content.upper()
+    sql = data.sql_content
 
     # Simple regex to find table names after FROM, JOIN, INTO
-    # This is a basic implementation - could be enhanced with proper SQL parsing
-    table_pattern = r'(?:FROM|JOIN|INTO)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)'
+    # Supports: table, schema.table, `table`, `schema`.`table`
+    table_pattern = r'(?:FROM|JOIN|INTO)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?(?:\.`?([a-zA-Z_][a-zA-Z0-9_]*)`?)?'
     matches = re.findall(table_pattern, sql, re.IGNORECASE)
 
     # Extract unique table names (lowercase for matching)
-    source_tables = list(set([m.lower() for m in matches]))
+    # If schema.table format, use table part; otherwise use the match
+    source_tables_raw = []
+    for m in matches:
+        if m[1]:  # schema.table format
+            source_tables_raw.append(m[1].lower())  # Use table name only
+        else:
+            source_tables_raw.append(m[0].lower())
+    source_tables = list(set(source_tables_raw))
 
     # Try to detect target table (INSERT INTO, CREATE TABLE)
-    target_pattern = r'(?:INSERT\s+INTO|CREATE\s+TABLE)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)'
+    target_pattern = r'(?:INSERT\s+INTO|CREATE\s+TABLE)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?(?:\.`?([a-zA-Z_][a-zA-Z0-9_]*)`?)?'
     target_match = re.search(target_pattern, sql, re.IGNORECASE)
-    target_table = target_match.group(1).lower() if target_match else None
+    if target_match:
+        target_table = target_match.group(2).lower() if target_match.group(2) else target_match.group(1).lower()
+    else:
+        target_table = None
 
     # Remove target from source if present
     if target_table and target_table in source_tables:
@@ -319,9 +329,10 @@ async def parse_sql_dependencies(
     # Match tables with sync tasks (by target_table)
     matched_tasks = []
     unmatched_tables = []
+    matched_task_ids = set()  # 避免重复
 
     for table in source_tables:
-        # Search in sync tasks
+        # Search in sync tasks - match by target_table
         sync_result = await db.execute(
             select(SyncTask, DwLayer)
             .outerjoin(DwLayer, SyncTask.dw_layer_id == DwLayer.id)
@@ -331,16 +342,19 @@ async def parse_sql_dependencies(
 
         if sync_matches:
             for task, layer in sync_matches:
-                matched_tasks.append(TaskSearchResult(
-                    task_type="sync",
-                    task_id=task.id,
-                    name=task.name,
-                    detail=f"{task.source_table} → {task.target_table}",
-                    layer_id=layer.id if layer else None,
-                    layer_name=layer.display_name if layer else None,
-                    layer_color=layer.color if layer else None,
-                    is_scheduled=task.is_scheduled,
-                ))
+                task_key = f"sync-{task.id}"
+                if task_key not in matched_task_ids:
+                    matched_task_ids.add(task_key)
+                    matched_tasks.append(TaskSearchResult(
+                        task_type="sync",
+                        task_id=task.id,
+                        name=task.name,
+                        detail=f"{task.source_table} → {task.target_table}",
+                        layer_id=layer.id if layer else None,
+                        layer_name=layer.display_name if layer else None,
+                        layer_color=layer.color if layer else None,
+                        is_scheduled=task.is_scheduled,
+                    ))
         else:
             # Search in ETL tasks (check if any ETL produces this table)
             # This is harder without proper SQL parsing of ETL output

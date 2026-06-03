@@ -24,10 +24,10 @@ router = APIRouter()
 
 # Default layers configuration
 DEFAULT_LAYERS = [
-    {"name": "ODS", "display_name": "原始数据层", "level": 1, "color": "#8c8c8c", "description": "Operational Data Store - 原始数据同步"},
-    {"name": "DW", "display_name": "数据仓库层", "level": 2, "color": "#1890ff", "description": "Data Warehouse - 数据清洗转换"},
-    {"name": "DWS", "display_name": "汇总数据层", "level": 3, "color": "#52c41a", "description": "Data Warehouse Summary - 轻度汇总"},
-    {"name": "ADS", "display_name": "应用数据层", "level": 4, "color": "#722ed1", "description": "Application Data Store - 业务指标"},
+    {"name": "ODS", "display_name": "原始数据层", "level": 1, "color": "#8c8c8c", "description": "Operational Data Store - 原始数据同步", "requires_dependency": False},
+    {"name": "DW", "display_name": "数据仓库层", "level": 2, "color": "#1890ff", "description": "Data Warehouse - 数据清洗转换", "requires_dependency": True},
+    {"name": "DWS", "display_name": "汇总数据层", "level": 3, "color": "#52c41a", "description": "Data Warehouse Summary - 轻度汇总", "requires_dependency": True},
+    {"name": "ADS", "display_name": "应用数据层", "level": 4, "color": "#722ed1", "description": "Application Data Store - 业务指标", "requires_dependency": True},
 ]
 
 
@@ -65,6 +65,7 @@ async def list_layers(
             description=layer.description,
             level=layer.level,
             color=layer.color,
+            requires_dependency=layer.requires_dependency if layer.requires_dependency is not None else True,
             sync_task_count=sync_count,
             etl_task_count=etl_count,
         ))

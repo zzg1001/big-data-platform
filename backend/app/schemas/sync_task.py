@@ -91,7 +91,7 @@ class SyncTaskResponse(BaseModel):
     name: str
     description: Optional[str] = None
 
-    source_datasource_id: int
+    source_datasource_id: Optional[int] = None  # 为空时使用系统平台数据库配置
     source_table: str
     source_schema: Optional[str] = None
 
@@ -200,7 +200,7 @@ class SyncTaskSchedulerView(BaseModel):
     name: str
     description: Optional[str] = None
 
-    source_datasource_id: int
+    source_datasource_id: Optional[int] = None  # 为空时使用系统平台数据库配置
     source_table: str
     target_table: str
 

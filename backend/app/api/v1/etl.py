@@ -15,6 +15,8 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.datasource import DataSource, DataSourceType
 from app.models.etl_task import EtlTask, EtlLog, EtlStatus, EtlLogStatus
+from app.models.sync_task import SyncTask
+from app.models.task_dependency import TaskDependency
 from app.schemas.etl_task import (
     EtlTaskCreate,
     EtlTaskUpdate,
@@ -30,6 +32,73 @@ from app.models.system_config import SystemConfig
 from app.services.airflow_service import airflow_service, AirflowAPIError
 
 router = APIRouter()
+
+
+async def check_downstream_dependencies(db: AsyncSession, task_type: str, task_id: int) -> list:
+    """检查是否有下游任务依赖此任务。返回下游任务列表。"""
+    result = await db.execute(
+        select(TaskDependency).where(
+            TaskDependency.upstream_task_type == task_type,
+            TaskDependency.upstream_task_id == task_id,
+        )
+    )
+    dependencies = result.scalars().all()
+
+    downstream_tasks = []
+    for dep in dependencies:
+        if dep.task_type == "sync":
+            task_result = await db.execute(
+                select(SyncTask).where(SyncTask.id == dep.task_id)
+            )
+            task = task_result.scalar_one_or_none()
+            if task:
+                downstream_tasks.append({"type": "sync", "id": task.id, "name": task.name})
+        elif dep.task_type == "etl":
+            task_result = await db.execute(
+                select(EtlTask).where(EtlTask.id == dep.task_id)
+            )
+            task = task_result.scalar_one_or_none()
+            if task:
+                downstream_tasks.append({"type": "etl", "id": task.id, "name": task.name})
+
+    return downstream_tasks
+
+
+async def check_online_downstream_dependencies(db: AsyncSession, task_type: str, task_id: int) -> list:
+    """检查是否有已上线的下游任务依赖此任务。返回已上线的下游任务列表。"""
+    from app.models.sync_schedule import SyncSchedule
+
+    result = await db.execute(
+        select(TaskDependency).where(
+            TaskDependency.upstream_task_type == task_type,
+            TaskDependency.upstream_task_id == task_id,
+        )
+    )
+    dependencies = result.scalars().all()
+
+    online_downstream = []
+    for dep in dependencies:
+        if dep.task_type == "sync":
+            # 检查同步任务的调度是否已上线
+            sched_result = await db.execute(
+                select(SyncSchedule, SyncTask)
+                .join(SyncTask, SyncSchedule.sync_task_id == SyncTask.id)
+                .where(SyncSchedule.sync_task_id == dep.task_id, SyncSchedule.is_enabled == True)
+            )
+            row = sched_result.first()
+            if row:
+                schedule, task = row
+                online_downstream.append({"type": "sync", "id": task.id, "name": task.name})
+        elif dep.task_type == "etl":
+            # 检查ETL任务是否已上线
+            etl_result = await db.execute(
+                select(EtlTask).where(EtlTask.id == dep.task_id, EtlTask.is_scheduled == True)
+            )
+            etl = etl_result.scalar_one_or_none()
+            if etl:
+                online_downstream.append({"type": "etl", "id": etl.id, "name": etl.name})
+
+    return online_downstream
 
 
 async def get_warehouse_engine(db: AsyncSession):
@@ -137,6 +206,7 @@ async def list_etl_tasks(
 ):
     """List all ETL tasks with datasource names."""
     from app.models.dw_layer import DwLayer
+    from sqlalchemy import func
 
     query = select(
         EtlTask,
@@ -155,6 +225,21 @@ async def list_etl_tasks(
     query = query.order_by(EtlTask.created_at.desc())
     result = await db.execute(query)
     rows = result.all()
+
+    # 获取所有ETL任务的依赖数量
+    task_ids = [row[0].id for row in rows]
+    dep_counts = {}
+    if task_ids:
+        dep_query = select(
+            TaskDependency.task_id,
+            func.count(TaskDependency.id).label("count")
+        ).where(
+            TaskDependency.task_type == "etl",
+            TaskDependency.task_id.in_(task_ids)
+        ).group_by(TaskDependency.task_id)
+        dep_result = await db.execute(dep_query)
+        for task_id, count in dep_result.all():
+            dep_counts[task_id] = count
 
     tasks = []
     for task, ds_name, layer_name, layer_color in rows:
@@ -179,6 +264,7 @@ async def list_etl_tasks(
             status=task.status,
             last_run_at=task.last_run_at,
             last_run_rows=task.last_run_rows,
+            dependency_count=dep_counts.get(task.id, 0),
             created_at=task.created_at,
         ))
 
@@ -207,17 +293,22 @@ async def update_etl_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Update an ETL task."""
+    print(f"[ETL UPDATE] task_id={task_id}, task_data={task_data}")
+
     result = await db.execute(select(EtlTask).where(EtlTask.id == task_id))
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ETL task not found")
 
     update_data = task_data.model_dump(exclude_unset=True)
+    print(f"[ETL UPDATE] update_data={update_data}")
+
     for field, value in update_data.items():
         setattr(task, field, value)
 
-    await db.flush()
+    await db.commit()
     await db.refresh(task)
+    print(f"[ETL UPDATE] saved, sql_content[:50]={task.sql_content[:50] if task.sql_content else None}")
     return task
 
 
@@ -237,6 +328,23 @@ async def delete_etl_task(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ETL task not found")
 
+    # 检查是否有调度引用（后端保护层）
+    # dag_id 存在表示有调度记录，无论是否已上线都不能删除
+    if task.dag_id or task.cron_expression:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请删除引用"
+        )
+
+    # 检查是否有下游任务依赖此任务
+    downstream_tasks = await check_downstream_dependencies(db, "etl", task_id)
+    if downstream_tasks:
+        task_names = ", ".join([f"{t['type']}:{t['name']}" for t in downstream_tasks])
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"无法删除：以下任务依赖此任务：{task_names}，请先删除依赖关系"
+        )
+
     # Delete DAG file if exists
     if task.dag_id:
         dag_path = os.path.join(settings.AIRFLOW_DAGS_PATH or '/opt/airflow/dags/generated', f'{task.dag_id}.py')
@@ -245,6 +353,15 @@ async def delete_etl_task(
                 os.remove(dag_path)
             except Exception as e:
                 print(f"Warning: Failed to delete DAG file {dag_path}: {e}")
+
+    # 删除此任务作为下游的依赖关系
+    from sqlalchemy import delete
+    await db.execute(
+        delete(TaskDependency).where(
+            TaskDependency.task_type == "etl",
+            TaskDependency.task_id == task_id
+        )
+    )
 
     await db.delete(task)
     await db.flush()
@@ -396,6 +513,8 @@ async def enable_etl_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Enable/schedule an ETL task - generate DAG and activate."""
+    from app.models.sync_schedule import SyncSchedule
+
     result = await db.execute(select(EtlTask).where(EtlTask.id == task_id))
     task = result.scalar_one_or_none()
     if not task:
@@ -442,6 +561,76 @@ async def enable_etl_task(
     import json
     wh_data = json.loads(wh_config.config_value)
 
+    # Query dependencies for this ETL task
+    dep_result = await db.execute(
+        select(TaskDependency).where(
+            TaskDependency.task_type == "etl",
+            TaskDependency.task_id == task_id,
+        )
+    )
+    dependencies = dep_result.scalars().all()
+
+    # Get DAG IDs for upstream tasks and check if they are scheduled
+    upstream_dag_ids = []
+    unscheduled_deps = []  # 未上线的依赖
+    for dep in dependencies:
+        if dep.upstream_task_type == "sync":
+            # Find the sync task and its schedule
+            up_task_result = await db.execute(
+                select(SyncTask).where(SyncTask.id == dep.upstream_task_id)
+            )
+            up_task = up_task_result.scalar_one_or_none()
+            up_sched_result = await db.execute(
+                select(SyncSchedule).where(SyncSchedule.sync_task_id == dep.upstream_task_id)
+            )
+            up_schedule = up_sched_result.scalar_one_or_none()
+            if up_schedule and up_schedule.dag_id and up_schedule.is_enabled:
+                upstream_dag_ids.append(up_schedule.dag_id)
+            else:
+                task_name = up_task.name if up_task else f"sync:{dep.upstream_task_id}"
+                unscheduled_deps.append(f"同步任务「{task_name}」")
+        elif dep.upstream_task_type == "etl":
+            # ETL tasks have their own dag_id
+            up_etl_result = await db.execute(
+                select(EtlTask).where(EtlTask.id == dep.upstream_task_id)
+            )
+            up_etl = up_etl_result.scalar_one_or_none()
+            if up_etl and up_etl.dag_id and up_etl.is_scheduled:
+                upstream_dag_ids.append(up_etl.dag_id)
+            else:
+                task_name = up_etl.name if up_etl else f"etl:{dep.upstream_task_id}"
+                unscheduled_deps.append(f"ETL任务「{task_name}」")
+
+    # 如果有未上线的依赖，阻止上线
+    if unscheduled_deps:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"以下依赖任务尚未上线调度，请先上线它们：{', '.join(unscheduled_deps)}"
+        )
+
+    # Build extra imports and sensors for dependencies
+    extra_imports = ""
+    sensor_code = ""
+    sensor_chain = ""
+    if upstream_dag_ids:
+        extra_imports = "from airflow.sensors.external_task import ExternalTaskSensor"
+        sensor_tasks = []
+        for i, upstream_dag_id in enumerate(upstream_dag_ids):
+            sensor_name = f"wait_for_{upstream_dag_id.replace('-', '_').replace('.', '_')}"
+            sensor_code += f'''
+    {sensor_name} = ExternalTaskSensor(
+        task_id="{sensor_name}",
+        external_dag_id="{upstream_dag_id}",
+        mode="reschedule",
+        timeout=3600,
+        poke_interval=60,
+    )
+'''
+            sensor_tasks.append(sensor_name)
+        # Build dependency chain: sensors >> etl_task
+        if sensor_tasks:
+            sensor_chain = f"\n    [{', '.join(sensor_tasks)}] >> etl_task"
+
     # Escape SQL content for Python string
     escaped_sql = task.sql_content.replace('\\', '\\\\').replace("'''", "\\'\\'\\'").replace('"""', '\\"\\"\\"')
 
@@ -450,10 +639,12 @@ async def enable_etl_task(
 Auto-generated Airflow DAG for ETL task: {task.name}
 Description: {task.description or 'N/A'}
 Task ID: {task.id}
+Dependencies: {len(upstream_dag_ids)} upstream DAGs
 """
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+{extra_imports}
 
 default_args = {{
     'owner': 'data_platform',
@@ -543,11 +734,12 @@ with DAG(
     is_paused_upon_creation=False,
     tags=['etl', 'auto_generated'],
 ) as dag:
-
+{sensor_code}
     etl_task = PythonOperator(
         task_id='execute_etl',
         python_callable=execute_etl,
     )
+{sensor_chain}
 '''
 
     # Save DAG file to Airflow directory
@@ -574,17 +766,19 @@ with DAG(
         # Airflow not reachable, but DAG file is saved, Airflow will pick it up later
         pass
 
+    dep_msg = f"，包含{len(upstream_dag_ids)}个上游依赖" if upstream_dag_ids else ""
     return {
         "success": True,
         "task_id": task_id,
         "dag_id": dag_id,
-        "message": f"ETL任务已上线，DAG文件已生成"
+        "message": f"ETL任务已上线，DAG文件已生成{dep_msg}"
     }
 
 
 @router.post("/{task_id}/disable", response_model=dict)
 async def disable_etl_task(
     task_id: int,
+    force: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -596,6 +790,15 @@ async def disable_etl_task(
 
     if not task.is_scheduled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task is not scheduled")
+
+    # 检查是否有已上线的下游任务依赖此任务
+    online_downstream = await check_online_downstream_dependencies(db, "etl", task_id)
+    if online_downstream and not force:
+        task_names = ", ".join([f"{t['name']}" for t in online_downstream])
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"警告：以下已上线的任务依赖此任务：{task_names}。下线后这些任务将无法获取最新数据。确定要下线吗？"
+        )
 
     # Pause DAG in Airflow (best effort - DAG may not exist)
     if task.dag_id:

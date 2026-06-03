@@ -2,7 +2,7 @@
 Data warehouse layer model for organizing tasks into layers (ODS, DW, DWS, ADS).
 """
 from datetime import datetime
-from sqlalchemy import Column, BigInteger, String, DateTime, ForeignKey, Integer
+from sqlalchemy import Column, BigInteger, String, DateTime, ForeignKey, Integer, Boolean
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -18,6 +18,7 @@ class DwLayer(Base):
     description = Column(String(500))
     level = Column(Integer, nullable=False, default=0)  # Sort order: ODS=1, DW=2, DWS=3, ADS=4
     color = Column(String(20))  # UI display color, e.g., "#52c41a"
+    requires_dependency = Column(Boolean, default=True)  # ODS=False, others=True
 
     # Audit fields
     created_by = Column(BigInteger, ForeignKey("big_users.id"))
