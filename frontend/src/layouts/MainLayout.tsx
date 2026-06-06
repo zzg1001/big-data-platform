@@ -15,21 +15,22 @@ import {
   GoldOutlined,
   TagsOutlined,
   AppstoreOutlined,
+  HomeOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 
 const { Header, Sider, Content } = Layout
 
 const menuItems = [
-  { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
-  { key: '/datasources', icon: <DatabaseOutlined />, label: '数据源管理' },
+  { key: '/bigdata', icon: <DashboardOutlined />, label: '仪表盘' },
+  { key: '/bigdata/datasources', icon: <DatabaseOutlined />, label: '数据源管理' },
   {
     key: 'sync-group',
     icon: <SyncOutlined />,
     label: '数据同步',
     children: [
-      { key: '/data-sync', icon: <SyncOutlined />, label: '同步任务' },
-      { key: '/field-templates', icon: <TagsOutlined />, label: '字段模板' },
+      { key: '/bigdata/data-sync', icon: <SyncOutlined />, label: '同步任务' },
+      { key: '/bigdata/field-templates', icon: <TagsOutlined />, label: '字段模板' },
     ],
   },
   {
@@ -37,14 +38,14 @@ const menuItems = [
     icon: <GoldOutlined />,
     label: '数据探索',
     children: [
-      { key: '/data-explorer', icon: <GoldOutlined />, label: '业务探索' },
-      { key: '/etl-tasks', icon: <SyncOutlined />, label: 'ETL任务' },
+      { key: '/bigdata/data-explorer', icon: <GoldOutlined />, label: '业务探索' },
+      { key: '/bigdata/etl-tasks', icon: <SyncOutlined />, label: 'ETL任务' },
     ],
   },
-  { key: '/files', icon: <FileOutlined />, label: '文件管理' },
-  { key: '/scheduler', icon: <ScheduleOutlined />, label: '调度管理' },
-  { key: '/dw-layers', icon: <AppstoreOutlined />, label: '平台数据库层级' },
-  { key: '/admin', icon: <SettingOutlined />, label: '系统管理' },
+  { key: '/bigdata/files', icon: <FileOutlined />, label: '文件管理' },
+  { key: '/bigdata/scheduler', icon: <ScheduleOutlined />, label: '调度管理' },
+  { key: '/bigdata/dw-layers', icon: <AppstoreOutlined />, label: '平台数据库层级' },
+  { key: '/bigdata/admin', icon: <SettingOutlined />, label: '系统管理' },
 ]
 
 export default function MainLayout() {
@@ -112,11 +113,20 @@ export default function MainLayout() {
             justifyContent: 'space-between',
           }}
         >
-          <Button
-            type="text"
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            onClick={() => setCollapsed(!collapsed)}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Button
+              type="text"
+              icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+              onClick={() => setCollapsed(!collapsed)}
+            />
+            <Button
+              type="text"
+              icon={<HomeOutlined />}
+              onClick={() => navigate('/')}
+            >
+              返回首页
+            </Button>
+          </div>
           <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
             <div style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
               <Avatar icon={<UserOutlined />} />
@@ -125,7 +135,7 @@ export default function MainLayout() {
           </Dropdown>
         </Header>
         <Content
-          style={(location.pathname === '/data-explorer' || location.pathname === '/etl-tasks') ? {
+          style={(location.pathname === '/bigdata/data-explorer' || location.pathname === '/bigdata/etl-tasks') ? {
             margin: 0,
             padding: 0,
             background: token.colorBgContainer,

@@ -2,6 +2,8 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from './stores/authStore'
 import MainLayout from './layouts/MainLayout'
 import Login from './pages/Login'
+import Portal from './pages/Portal'
+import TagSystem from './pages/TagSystem'
 import Dashboard from './pages/Dashboard'
 import DataSources from './pages/DataSources'
 import FileManager from './pages/FileManager'
@@ -24,6 +26,22 @@ function App() {
       <Route path="/login" element={<Login />} />
       <Route
         path="/"
+        element={
+          <PrivateRoute>
+            <Portal />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/tags"
+        element={
+          <PrivateRoute>
+            <TagSystem />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/bigdata"
         element={
           <PrivateRoute>
             <MainLayout />
