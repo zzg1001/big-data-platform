@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   Table,
   Typography,
@@ -17,6 +17,9 @@ import {
   Splitter,
   Modal,
   Form,
+  Select,
+  Divider,
+  Dropdown,
 } from 'antd'
 import {
   GoldOutlined,
@@ -34,13 +37,16 @@ import {
   CloseOutlined,
   CaretRightOutlined,
   SaveOutlined,
+  SyncOutlined,
+  FolderOpenOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons'
 import Editor, { Monaco } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
-import { configApi, warehouseApi, aiApi, etlApi } from '../services/api'
+import { configApi, warehouseApi, aiApi, etlApi, dwLayerApi, taskDependencyApi, sqlScriptApi } from '../services/api'
 
 const { Title, Text } = Typography
-const { Search, TextArea } = Input
+const { Search } = Input
 
 interface ColumnInfo {
   name: string
@@ -51,8 +57,27 @@ interface ColumnInfo {
   comment?: string
 }
 
+interface DwLayer {
+  id: number
+  name: string
+  level: number
+  color?: string
+  requires_dependency?: boolean
+}
+
+interface ParsedDependency {
+  task_type: string
+  task_id: number
+  task_name?: string
+  table_name?: string
+  layer_name?: string
+  layer_color?: string
+  is_scheduled?: boolean
+}
+
 export default function DataExplorer() {
   const [searchParams, setSearchParams] = useSearchParams()
+  const navigate = useNavigate()
 
   // 平台数据库配置
   const [warehouseConfig, setWarehouseConfig] = useState<any>(null)
@@ -74,22 +99,32 @@ export default function DataExplorer() {
   // SQL 编辑器多Tab
   interface EditorTab {
     id: string
-    title: string
+    title: string  // 文件名（不含.sql后缀）
     sql: string
-    savedSql: string  // 上次保存的内容，用于比较是否有修改
+    savedSql: string  // 服务器上保存的内容，用于比较是否有修改
+    isNew: boolean    // 是否是新建的（未保存到服务器）
+    etlId?: number    // 如果是ETL任务的SQL，保存ETL任务ID
   }
 
-  // 从localStorage读取保存的Tab数据
+  // 从localStorage读取当前打开的Tab状态（用于恢复会话）
+  // 如果URL有etl_id参数，不恢复localStorage，从空白开始
   const loadSavedTabs = (): { tabs: EditorTab[], activeId: string, counter: number } => {
+    // 检查URL是否有etl_id参数，如果有则不恢复localStorage
+    const urlParams = new URLSearchParams(window.location.search)
+    if (urlParams.get('etl_id')) {
+      return { tabs: [{ id: '1', title: 'SQL 1', sql: '', savedSql: '', isNew: true }], activeId: '1', counter: 1 }
+    }
+
     try {
       const saved = localStorage.getItem('dataExplorer_tabs')
       if (saved) {
         const data = JSON.parse(saved)
         if (data.tabs && data.tabs.length > 0) {
-          // 确保每个tab都有savedSql字段，加载时sql和savedSql相同（已保存状态）
+          // 确保每个 tab 都有 savedSql 和 isNew 字段（兼容旧数据）
           const tabs = data.tabs.map((t: any) => ({
             ...t,
-            savedSql: t.sql  // 加载时认为是已保存的
+            savedSql: t.savedSql ?? '',  // 旧数据可能没有这个字段
+            isNew: t.isNew ?? true,      // 默认视为新建
           }))
           return {
             tabs,
@@ -101,15 +136,39 @@ export default function DataExplorer() {
     } catch (e) {
       console.error('Failed to load saved tabs:', e)
     }
-    return { tabs: [{ id: '1', title: 'SQL 1', sql: '', savedSql: '' }], activeId: '1', counter: 1 }
+    return { tabs: [{ id: '1', title: 'SQL 1', sql: '', savedSql: '', isNew: true }], activeId: '1', counter: 1 }
   }
 
   const savedData = loadSavedTabs()
   const [editorTabs, setEditorTabs] = useState<EditorTab[]>(savedData.tabs)
   const [activeEditorTab, setActiveEditorTab] = useState(savedData.activeId)
   const [tabCounter, setTabCounter] = useState(savedData.counter)
+  const [serverScripts, setServerScripts] = useState<{name: string, size: number, modified_at: string}[]>([])
 
-  // 保存Tab数据到localStorage
+  // 用 ref 保存最新的 tabs 状态，供 Monaco 快捷键回调使用
+  const editorTabsRef = useRef(editorTabs)
+  const activeEditorTabRef = useRef(activeEditorTab)
+  useEffect(() => {
+    editorTabsRef.current = editorTabs
+    activeEditorTabRef.current = activeEditorTab
+  }, [editorTabs, activeEditorTab])
+
+  // 加载服务器上的脚本列表
+  const loadServerScripts = async () => {
+    try {
+      const res = await sqlScriptApi.list()
+      setServerScripts(res.data)
+    } catch (e) {
+      console.error('Failed to load server scripts:', e)
+    }
+  }
+
+  // 初始化加载服务器脚本
+  useEffect(() => {
+    loadServerScripts()
+  }, [])
+
+  // 保存Tab状态到localStorage（用于恢复会话）
   useEffect(() => {
     try {
       localStorage.setItem('dataExplorer_tabs', JSON.stringify({
@@ -122,24 +181,31 @@ export default function DataExplorer() {
     }
   }, [editorTabs, activeEditorTab, tabCounter])
 
+  // 防止重复加载 ETL 任务
+  const etlLoadedRef = useRef(false)
+
   // 从 URL 参数加载 ETL 任务的 SQL
   useEffect(() => {
     const etlId = searchParams.get('etl_id')
     const etlName = searchParams.get('etl_name')
-    if (etlId) {
+    if (etlId && !etlLoadedRef.current) {
+      etlLoadedRef.current = true
       // 获取 ETL 任务的 SQL
       etlApi.get(parseInt(etlId)).then(res => {
         const task = res.data
-        const newId = String(tabCounter + 1)
-        setTabCounter(prev => prev + 1)
-        setEditorTabs(prev => [...prev, {
-          id: newId,
-          title: etlName || task.name || `ETL ${etlId}`,
+        const title = etlName || task.name || `ETL ${etlId}`
+        // 直接替换所有tabs，只保留这一个ETL任务
+        setEditorTabs([{
+          id: '1',
+          title,
           sql: task.sql_content || '',
           savedSql: task.sql_content || '',
+          isNew: false,  // ETL任务已存在
+          etlId: parseInt(etlId),  // 关联ETL任务ID
         }])
-        setActiveEditorTab(newId)
-        message.success(`已加载 ETL 任务: ${etlName || task.name}`)
+        setActiveEditorTab('1')
+        setTabCounter(1)
+        message.success(`已加载 ETL 任务: ${title}`)
       }).catch(() => {
         message.error('加载 ETL 任务失败')
       })
@@ -177,12 +243,18 @@ export default function DataExplorer() {
   const [saveEtlModalVisible, setSaveEtlModalVisible] = useState(false)
   const [saveEtlForm] = Form.useForm()
   const [savingEtl, setSavingEtl] = useState(false)
+  const [layers, setLayers] = useState<DwLayer[]>([])
+  const [parsedDeps, setParsedDeps] = useState<ParsedDependency[]>([])
+  const [parsingDeps, setParsingDeps] = useState(false)
+  const [parsedTables, setParsedTables] = useState<{name: string, exists: boolean, checking: boolean}[]>([])
+  const [manualTableInput, setManualTableInput] = useState('')
+  const [showAddTableInput, setShowAddTableInput] = useState(false)
 
   // 添加新编辑器Tab
   const addEditorTab = () => {
     const newId = String(tabCounter + 1)
     setTabCounter(tabCounter + 1)
-    setEditorTabs([...editorTabs, { id: newId, title: `SQL ${tabCounter + 1}`, sql: '', savedSql: '' }])
+    setEditorTabs([...editorTabs, { id: newId, title: `SQL ${tabCounter + 1}`, sql: '', savedSql: '', isNew: true }])
     setActiveEditorTab(newId)
   }
 
@@ -196,11 +268,127 @@ export default function DataExplorer() {
     }
   }
 
-  // 保存当前Tab（清除修改标记）
-  const saveCurrentTab = () => {
-    setEditorTabs(tabs => tabs.map(t =>
-      t.id === activeEditorTab ? { ...t, savedSql: t.sql } : t
-    ))
+  // 关闭右侧所有Tab
+  const closeTabsToRight = (id: string) => {
+    const idx = editorTabs.findIndex(t => t.id === id)
+    if (idx === -1 || idx === editorTabs.length - 1) return
+    const newTabs = editorTabs.slice(0, idx + 1)
+    setEditorTabs(newTabs)
+    // 如果当前激活的tab被关闭，切换到点击的tab
+    if (!newTabs.find(t => t.id === activeEditorTab)) {
+      setActiveEditorTab(id)
+    }
+  }
+
+  // 关闭全部Tab（保留一个默认）
+  const closeAllTabs = () => {
+    const newTab = { id: '1', title: 'SQL 1', sql: '', savedSql: '', isNew: true }
+    setEditorTabs([newTab])
+    setActiveEditorTab('1')
+    setTabCounter(1)
+  }
+
+  // Tab右键菜单
+  const getTabContextMenu = (tabId: string) => {
+    const idx = editorTabs.findIndex(t => t.id === tabId)
+    const hasTabsToRight = idx < editorTabs.length - 1
+    return {
+      items: [
+        {
+          key: 'close',
+          label: '关闭当前',
+          disabled: editorTabs.length <= 1,
+          onClick: () => closeEditorTab(tabId),
+        },
+        {
+          key: 'closeRight',
+          label: '关闭右侧',
+          disabled: !hasTabsToRight,
+          onClick: () => closeTabsToRight(tabId),
+        },
+        {
+          key: 'closeAll',
+          label: '关闭全部',
+          onClick: () => closeAllTabs(),
+        },
+      ],
+    }
+  }
+
+  // 保存当前Tab到服务器（使用 ref 获取最新状态，避免闭包问题）
+  const saveCurrentTab = async () => {
+    const tabs = editorTabsRef.current
+    const activeId = activeEditorTabRef.current
+    const tab = tabs.find(t => t.id === activeId)
+    if (!tab) return
+
+    console.log('saveCurrentTab:', { etlId: tab.etlId, title: tab.title, isNew: tab.isNew })
+
+    try {
+      if (tab.etlId) {
+        // ETL任务的SQL，保存回ETL任务
+        console.log('Saving to ETL task:', tab.etlId)
+        await etlApi.update(tab.etlId, { sql_content: tab.sql })
+        message.success('ETL任务已保存')
+      } else if (tab.isNew) {
+        // 新建脚本
+        await sqlScriptApi.create(tab.title, tab.sql)
+        message.success('已保存')
+        loadServerScripts()  // 刷新脚本列表
+      } else {
+        // 更新现有脚本
+        await sqlScriptApi.update(tab.title, tab.sql)
+        message.success('已保存')
+        loadServerScripts()  // 刷新脚本列表
+      }
+      setEditorTabs(tabs => tabs.map(t =>
+        t.id === activeEditorTab ? { ...t, savedSql: t.sql, isNew: false } : t
+      ))
+    } catch (err: any) {
+      message.error('保存失败: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
+  // 打开服务器上的脚本
+  const openServerScript = async (name: string) => {
+    // 检查是否已打开
+    const existingTab = editorTabs.find(t => t.title === name && !t.isNew)
+    if (existingTab) {
+      setActiveEditorTab(existingTab.id)
+      return
+    }
+
+    try {
+      const res = await sqlScriptApi.get(name)
+      const newId = String(tabCounter + 1)
+      setTabCounter(tabCounter + 1)
+      setEditorTabs([...editorTabs, {
+        id: newId,
+        title: name,
+        sql: res.data.content,
+        savedSql: res.data.content,
+        isNew: false,
+      }])
+      setActiveEditorTab(newId)
+    } catch (err: any) {
+      message.error('打开失败: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
+  // 删除服务器上的脚本
+  const deleteServerScript = async (name: string) => {
+    try {
+      await sqlScriptApi.delete(name)
+      message.success('已删除')
+      // 如果当前打开了这个脚本，关闭它
+      const tab = editorTabs.find(t => t.title === name && !t.isNew)
+      if (tab) {
+        closeEditorTab(tab.id)
+      }
+      loadServerScripts()
+    } catch (err: any) {
+      message.error('删除失败: ' + (err.response?.data?.detail || err.message))
+    }
   }
 
   // 检查Tab是否有未保存修改
@@ -220,8 +408,21 @@ export default function DataExplorer() {
     setEditingTitle(currentTitle)
   }
 
-  const finishRenameTab = () => {
+  const finishRenameTab = async () => {
     if (editingTabId && editingTitle.trim()) {
+      const tab = editorTabs.find(t => t.id === editingTabId)
+      if (tab && !tab.isNew && tab.title !== editingTitle.trim()) {
+        // 服务器上的文件需要重命名
+        try {
+          await sqlScriptApi.rename(tab.title, editingTitle.trim())
+          loadServerScripts()
+        } catch (err: any) {
+          message.error('重命名失败: ' + (err.response?.data?.detail || err.message))
+          setEditingTabId(null)
+          setEditingTitle('')
+          return
+        }
+      }
       setEditorTabs(tabs => tabs.map(t =>
         t.id === editingTabId ? { ...t, title: editingTitle.trim() } : t
       ))
@@ -235,6 +436,7 @@ export default function DataExplorer() {
 
   useEffect(() => {
     loadWarehouseConfig()
+    loadLayers()
   }, [])
 
   useEffect(() => {
@@ -281,6 +483,15 @@ export default function DataExplorer() {
       message.error(error.response?.data?.detail || '加载表列表失败')
     } finally {
       setLoadingTables(false)
+    }
+  }
+
+  const loadLayers = async () => {
+    try {
+      const res = await dwLayerApi.list()
+      setLayers(res.data)
+    } catch (err) {
+      console.error('Failed to load layers:', err)
     }
   }
 
@@ -516,8 +727,101 @@ export default function DataExplorer() {
     }
   }
 
+  // 校验单个表是否存在
+  const checkTableExists = async (tableName: string): Promise<boolean> => {
+    try {
+      const allTables = tables.length > 0 ? tables : (await warehouseApi.getTables()).data
+      return allTables.some((t: string) => t.toLowerCase() === tableName.toLowerCase())
+    } catch {
+      return false
+    }
+  }
+
+  // 解析SQL依赖
+  const parseSqlDependencies = async () => {
+    if (!sql.trim()) return
+    setParsingDeps(true)
+    setParsedTables([])
+    setParsedDeps([])
+    try {
+      const res = await taskDependencyApi.parseSql(sql)
+      const { source_tables, matched_tasks } = res.data
+
+      // 初始化表列表，开始校验
+      const tableList = (source_tables || []).map((t: string) => ({ name: t, exists: false, checking: true }))
+      setParsedTables(tableList)
+
+      // 逐个校验表是否存在
+      for (let i = 0; i < tableList.length; i++) {
+        const exists = await checkTableExists(tableList[i].name)
+        setParsedTables(prev => prev.map((t, idx) =>
+          idx === i ? { ...t, exists, checking: false } : t
+        ))
+      }
+
+      setParsedDeps((matched_tasks || []).map((t: any) => ({
+        task_type: t.task_type,
+        task_id: t.task_id,
+        task_name: t.name,
+        table_name: t.detail?.split(' → ')[1] || t.detail,
+        layer_name: t.layer_name,
+        layer_color: t.layer_color,
+        is_scheduled: t.is_scheduled,
+      })))
+    } catch (err) {
+      console.warn('SQL解析失败:', err)
+    } finally {
+      setParsingDeps(false)
+    }
+  }
+
+  // 手动添加表
+  const handleAddTable = async () => {
+    const tableName = manualTableInput.trim()
+    if (!tableName) return
+    if (parsedTables.some(t => t.name.toLowerCase() === tableName.toLowerCase())) {
+      message.warning('该表已在列表中')
+      return
+    }
+
+    // 添加到列表并校验
+    setParsedTables(prev => [...prev, { name: tableName, exists: false, checking: true }])
+    setManualTableInput('')
+
+    const exists = await checkTableExists(tableName)
+    setParsedTables(prev => prev.map(t =>
+      t.name === tableName ? { ...t, exists, checking: false } : t
+    ))
+
+    // 如果表存在，尝试匹配依赖
+    if (exists) {
+      try {
+        const res = await taskDependencyApi.parseSql(`SELECT * FROM ${tableName}`)
+        const { matched_tasks } = res.data
+        if (matched_tasks?.length > 0) {
+          const newDeps = matched_tasks.filter((t: any) =>
+            !parsedDeps.some(d => d.task_type === t.task_type && d.task_id === t.task_id)
+          ).map((t: any) => ({
+            task_type: t.task_type,
+            task_id: t.task_id,
+            task_name: t.name,
+            table_name: t.detail?.split(' → ')[1] || t.detail,
+            layer_name: t.layer_name,
+            layer_color: t.layer_color,
+            is_scheduled: t.is_scheduled,
+          }))
+          if (newDeps.length > 0) {
+            setParsedDeps(prev => [...prev, ...newDeps])
+          }
+        }
+      } catch (err) {
+        console.warn('匹配依赖失败:', err)
+      }
+    }
+  }
+
   // 保存为ETL任务
-  const handleSaveAsEtl = () => {
+  const handleSaveAsEtl = async () => {
     if (!sql.trim()) {
       message.warning('请输入SQL')
       return
@@ -527,22 +831,53 @@ export default function DataExplorer() {
     saveEtlForm.setFieldsValue({
       name: defaultName,
       description: '',
+      dw_layer_id: undefined,
     })
     setSaveEtlModalVisible(true)
+    // 自动解析依赖
+    await parseSqlDependencies()
   }
 
   const handleSaveEtlSubmit = async () => {
     try {
       const values = await saveEtlForm.validateFields()
       setSavingEtl(true)
-      await etlApi.create({
+
+      // 创建ETL任务
+      const res = await etlApi.create({
         name: values.name,
         description: values.description,
         sql_content: sql,
+        dw_layer_id: values.dw_layer_id,
       })
-      message.success('已保存为ETL任务')
+      const taskId = res.data.id
+
+      // 保存依赖关系
+      if (parsedDeps.length > 0) {
+        for (const dep of parsedDeps) {
+          try {
+            await taskDependencyApi.create({
+              task_type: 'etl',
+              task_id: taskId,
+              upstream_task_type: dep.task_type,
+              upstream_task_id: dep.task_id,
+            })
+          } catch (err) {
+            console.error('Failed to create dependency:', err)
+          }
+        }
+        message.success(`已保存，添加 ${parsedDeps.length} 个依赖`)
+      } else {
+        message.success('已保存为ETL任务')
+      }
+
       setSaveEtlModalVisible(false)
       saveEtlForm.resetFields()
+      setParsedDeps([])
+      setParsedTables([])
+
+      // 跳转到 ETL 任务页面
+      navigate(`/etl-tasks?id=${taskId}`)
     } catch (error: any) {
       if (error.errorFields) return
       message.error('保存失败: ' + (error.response?.data?.detail || error.message))
@@ -721,10 +1056,9 @@ export default function DataExplorer() {
       handleExecute()
     })
 
-    // 添加快捷键：Ctrl+S 保存
+    // 添加快捷键：Ctrl+S 保存到服务器
     editorInstance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       saveCurrentTab()
-      message.success('已保存')
     })
   }
 
@@ -956,61 +1290,69 @@ export default function DataExplorer() {
                   overflow: 'auto',
                 }}>
                   {editorTabs.map(tab => (
-                    <div
+                    <Dropdown
                       key={tab.id}
-                      onClick={() => switchEditorTab(tab.id)}
-                      onDoubleClick={() => startRenameTab(tab.id, tab.title)}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        padding: '0 8px',
-                        height: 28,
-                        cursor: 'pointer',
-                        borderRight: '1px solid #e8e8e8',
-                        background: activeEditorTab === tab.id ? '#fff' : 'transparent',
-                        borderBottom: activeEditorTab === tab.id ? '2px solid #1890ff' : '2px solid transparent',
-                        fontSize: 12,
-                        gap: 4,
-                        whiteSpace: 'nowrap',
-                      }}
+                      menu={getTabContextMenu(tab.id)}
+                      trigger={['contextMenu']}
                     >
-                      {editingTabId === tab.id ? (
-                        <input
-                          autoFocus
-                          value={editingTitle}
-                          onChange={(e) => setEditingTitle(e.target.value)}
-                          onBlur={finishRenameTab}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') finishRenameTab()
-                            if (e.key === 'Escape') {
-                              setEditingTabId(null)
-                              setEditingTitle('')
-                            }
-                          }}
-                          onClick={(e) => e.stopPropagation()}
-                          style={{
-                            width: 60,
-                            height: 18,
-                            fontSize: 12,
-                            border: '1px solid #1890ff',
-                            borderRadius: 2,
-                            outline: 'none',
-                            padding: '0 4px',
-                          }}
-                        />
-                      ) : (
-                        <span>{isTabDirty(tab) ? '*' : ''}{tab.title}</span>
-                      )}
-                      {editorTabs.length > 1 && (
-                        <CloseOutlined
-                          style={{ fontSize: 10, color: '#999' }}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            closeEditorTab(tab.id)
-                          }}
-                        />
-                      )}
-                    </div>
+                      <div
+                        onClick={() => switchEditorTab(tab.id)}
+                        onDoubleClick={() => startRenameTab(tab.id, tab.title)}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          padding: '0 8px',
+                          height: 28,
+                          cursor: 'pointer',
+                          borderRight: '1px solid #e8e8e8',
+                          background: activeEditorTab === tab.id ? '#fff' : 'transparent',
+                          borderBottom: activeEditorTab === tab.id ? '2px solid #1890ff' : '2px solid transparent',
+                          fontSize: 12,
+                          gap: 4,
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {editingTabId === tab.id ? (
+                          <input
+                            autoFocus
+                            value={editingTitle}
+                            onChange={(e) => setEditingTitle(e.target.value)}
+                            onBlur={finishRenameTab}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') finishRenameTab()
+                              if (e.key === 'Escape') {
+                                setEditingTabId(null)
+                                setEditingTitle('')
+                              }
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                              width: 60,
+                              height: 18,
+                              fontSize: 12,
+                              border: '1px solid #1890ff',
+                              borderRadius: 2,
+                              outline: 'none',
+                              padding: '0 4px',
+                            }}
+                          />
+                        ) : (
+                          <span>
+                            {isTabDirty(tab) && <span style={{ color: '#ff4d4f', marginRight: 2 }}>*</span>}
+                            {tab.title}
+                          </span>
+                        )}
+                        {editorTabs.length > 1 && (
+                          <CloseOutlined
+                            style={{ fontSize: 10, color: '#999' }}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              closeEditorTab(tab.id)
+                            }}
+                          />
+                        )}
+                      </div>
+                    </Dropdown>
                   ))}
                   <Tooltip title="新建">
                     <div
@@ -1072,7 +1414,6 @@ export default function DataExplorer() {
                       style={{ width: 26, height: 26, padding: 0 }}
                     />
                   </Tooltip>
-                  <div style={{ flex: 1 }} />
                   <Tooltip title="保存为ETL任务" placement="right">
                     <Button
                       size="small"
@@ -1081,6 +1422,60 @@ export default function DataExplorer() {
                       style={{ width: 26, height: 26, padding: 0 }}
                     />
                   </Tooltip>
+                  <Divider style={{ margin: '4px 0', borderColor: '#e0e0e0' }} />
+                  <Dropdown
+                    trigger={['click']}
+                    placement="topRight"
+                    menu={{
+                      items: [
+                        {
+                          key: 'header',
+                          type: 'group',
+                          label: <span style={{ fontWeight: 500 }}>已保存的脚本</span>,
+                        },
+                        ...(serverScripts.length > 0
+                          ? serverScripts.map(s => ({
+                              key: s.name,
+                              onClick: () => openServerScript(s.name),
+                              label: (
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, minWidth: 140 }}>
+                                  <span style={{ flex: 1 }}>{s.name}.sql</span>
+                                  <DeleteOutlined
+                                    style={{ color: '#ff4d4f', fontSize: 12 }}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      Modal.confirm({
+                                        title: '删除脚本',
+                                        content: `确定要删除 ${s.name}.sql 吗？`,
+                                        okText: '删除',
+                                        okButtonProps: { danger: true },
+                                        onOk: () => deleteServerScript(s.name),
+                                      })
+                                    }}
+                                  />
+                                </div>
+                              ),
+                            }))
+                          : [{ key: 'empty', label: <Text type="secondary">暂无保存的脚本</Text>, disabled: true }]
+                        ),
+                        { type: 'divider' },
+                        {
+                          key: 'refresh',
+                          icon: <ReloadOutlined />,
+                          label: '刷新列表',
+                          onClick: () => loadServerScripts(),
+                        },
+                      ],
+                    }}
+                  >
+                    <Tooltip title="已保存的脚本" placement="right">
+                      <Button
+                        size="small"
+                        icon={<FolderOpenOutlined style={{ fontSize: 14 }} />}
+                        style={{ width: 26, height: 26, padding: 0 }}
+                      />
+                    </Tooltip>
+                  </Dropdown>
                 </div>
 
                 {/* SQL编辑器 */}
@@ -1396,32 +1791,255 @@ export default function DataExplorer() {
         </Splitter.Panel>
       </Splitter>
 
-      {/* 保存为ETL任务的Modal */}
+      {/* 保存为ETL任务的Modal - 苹果风格 */}
       <Modal
-        title="保存为ETL任务"
+        title={null}
         open={saveEtlModalVisible}
-        onOk={handleSaveEtlSubmit}
-        onCancel={() => setSaveEtlModalVisible(false)}
-        okText="保存"
-        cancelText="取消"
-        confirmLoading={savingEtl}
+        onCancel={() => {
+          setSaveEtlModalVisible(false)
+          setParsedDeps([])
+          setParsedTables([])
+          setManualTableInput('')
+          setShowAddTableInput(false)
+        }}
+        footer={null}
+        width={420}
+        centered
+        styles={{
+          content: { borderRadius: 16, padding: 0, overflow: 'hidden' },
+          body: { padding: 0 },
+        }}
       >
-        <Form form={saveEtlForm} layout="vertical">
-          <Form.Item
-            name="name"
-            label="任务名称"
-            rules={[{ required: true, message: '请输入任务名称' }]}
-          >
-            <Input placeholder="输入ETL任务名称" />
-          </Form.Item>
-          <Form.Item name="description" label="描述">
-            <TextArea rows={2} placeholder="任务描述（可选）" />
-          </Form.Item>
-        </Form>
-        <div style={{ marginTop: 8 }}>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            当前SQL将被保存为ETL任务，可在「数据探索 &gt; ETL任务」中管理和执行。
-          </Text>
+        {/* 头部 */}
+        <div style={{
+          padding: '12px 20px',
+          borderBottom: '1px solid #f0f0f0',
+          background: 'linear-gradient(to bottom, #fafafa, #fff)',
+        }}>
+          <Text strong style={{ fontSize: 13 }}>保存为 ETL 任务</Text>
+        </div>
+
+        {/* 表单区域 */}
+        <div style={{ padding: '16px 20px' }}>
+          <Form form={saveEtlForm} layout="vertical" style={{ marginBottom: 0 }}>
+            <Form.Item
+              name="name"
+              rules={[{ required: true, message: '请输入任务名称' }]}
+              style={{ marginBottom: 12 }}
+            >
+              <Input
+                placeholder="任务名称"
+                style={{ borderRadius: 8, height: 38 }}
+              />
+            </Form.Item>
+            <Form.Item name="description" style={{ marginBottom: 12 }}>
+              <Input
+                placeholder="描述（可选）"
+                style={{ borderRadius: 8, height: 38 }}
+              />
+            </Form.Item>
+            <Form.Item
+              name="dw_layer_id"
+              rules={[{ required: true, message: '请选择层级' }]}
+              style={{ marginBottom: 0 }}
+            >
+              <Select
+                placeholder="选择层级"
+                style={{ width: '100%', height: 38 }}
+                options={layers
+                  .filter((l) => l.level > 1 && l.name.toUpperCase() !== 'ODS')
+                  .map((l) => ({
+                    value: l.id,
+                    label: <Tag color={l.color || 'default'} style={{ margin: 0 }}>{l.name}</Tag>,
+                  }))}
+              />
+            </Form.Item>
+          </Form>
+        </div>
+
+        {/* 依赖表区域 */}
+        <div style={{
+          margin: '0 20px 16px',
+          padding: 12,
+          background: '#f8f8f8',
+          borderRadius: 10,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <Text style={{ fontSize: 12, color: '#666' }}>依赖表</Text>
+            <span
+              onClick={parsingDeps ? undefined : parseSqlDependencies}
+              style={{
+                fontSize: 12,
+                color: parsingDeps ? '#999' : '#007aff',
+                cursor: parsingDeps ? 'default' : 'pointer',
+              }}
+            >
+              {parsingDeps ? <><SyncOutlined spin /> 识别中</> : '重新识别'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {parsedTables.map((t) => (
+              <div
+                key={t.name}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  alignSelf: 'flex-start',
+                  padding: '4px 8px 4px 10px',
+                  borderRadius: 14,
+                  fontSize: 12,
+                  background: t.checking ? '#e6f4ff' : t.exists ? '#f6ffed' : '#fff2f0',
+                  color: t.checking ? '#1890ff' : t.exists ? '#52c41a' : '#ff4d4f',
+                  border: `1px solid ${t.checking ? '#91caff' : t.exists ? '#b7eb8f' : '#ffccc7'}`,
+                }}
+              >
+                {t.checking && <Spin size="small" style={{ marginRight: 4 }} />}
+                {t.name}
+                {!t.checking && <span style={{ marginLeft: 4 }}>{t.exists ? '✓' : '✗'}</span>}
+                <CloseOutlined
+                  style={{ marginLeft: 6, fontSize: 10, cursor: 'pointer', opacity: 0.6 }}
+                  onClick={() => setParsedTables(prev => prev.filter(p => p.name !== t.name))}
+                />
+              </div>
+            ))}
+            {parsedTables.length === 0 && !parsingDeps && (
+              <Text type="secondary" style={{ fontSize: 12 }}>无</Text>
+            )}
+          </div>
+          {/* 手动添加 */}
+          <div style={{ marginTop: 10 }}>
+            {showAddTableInput && (
+              <Input
+                size="small"
+                autoFocus
+                placeholder="输入表名，回车添加"
+                value={manualTableInput}
+                onChange={(e) => setManualTableInput(e.target.value)}
+                onPressEnter={() => {
+                  if (manualTableInput.trim()) {
+                    handleAddTable()
+                  }
+                }}
+                onBlur={() => {
+                  if (manualTableInput.trim()) {
+                    handleAddTable()
+                  }
+                  setShowAddTableInput(false)
+                }}
+                style={{ width: '100%', borderRadius: 8, fontSize: 12, marginBottom: 8 }}
+              />
+            )}
+            <div
+              onClick={() => setShowAddTableInput(true)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                padding: '4px 10px',
+                borderRadius: 14,
+                fontSize: 12,
+                color: '#007aff',
+                background: '#fff',
+                border: '1px dashed #d9d9d9',
+                cursor: 'pointer',
+              }}
+            >
+              <PlusOutlined style={{ fontSize: 10 }} /> 添加
+            </div>
+          </div>
+
+          {/* 匹配到的上游任务（只有未上线的才显示） */}
+          {parsedDeps.some(d => !d.is_scheduled) && (
+            <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px dashed #e0e0e0' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <Text style={{ fontSize: 12, color: '#666' }}>匹配到的上游任务</Text>
+                {parsedDeps.some(d => !d.is_scheduled) && (
+                  <span
+                    onClick={() => {
+                      // 收集未上线的任务
+                      const unscheduled = parsedDeps.filter(d => !d.is_scheduled)
+                      const syncIds = unscheduled.filter(d => d.task_type === 'sync').map(d => d.task_id)
+                      const etlIds = unscheduled.filter(d => d.task_type === 'etl').map(d => d.task_id)
+                      // 构建URL参数
+                      const params = new URLSearchParams()
+                      params.set('add', '1')
+                      if (syncIds.length > 0) params.set('syncIds', syncIds.join(','))
+                      if (etlIds.length > 0) params.set('etlIds', etlIds.join(','))
+                      // 新窗口打开调度管理
+                      window.open(`/scheduler?${params.toString()}`, '_blank')
+                    }}
+                    style={{
+                      fontSize: 11,
+                      color: '#d46b08',
+                      cursor: 'pointer',
+                      textDecoration: 'underline',
+                    }}
+                  >
+                    去上线未调度任务 →
+                  </span>
+                )}
+              </div>
+              {parsedDeps.some(d => !d.is_scheduled) && (
+                <div style={{
+                  marginTop: 6,
+                  padding: '6px 10px',
+                  background: '#fff7e6',
+                  border: '1px solid #ffd591',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  color: '#d46b08',
+                }}>
+                  ⚠️ 有依赖任务尚未上线调度，上线此任务前需先上线它们
+                </div>
+              )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
+                {parsedDeps.filter(d => !d.is_scheduled).map((dep) => (
+                  <div
+                    key={`${dep.task_type}-${dep.task_id}`}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '4px 8px',
+                      background: '#fff',
+                      borderRadius: 6,
+                      fontSize: 12,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {dep.layer_name && (
+                        <Tag color={dep.layer_color || 'default'} style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
+                          {dep.layer_name}
+                        </Tag>
+                      )}
+                      <span style={{ color: '#333' }}>{dep.task_name}</span>
+                    </div>
+                    <Tag color="orange" style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}>
+                      未上线
+                    </Tag>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 底部按钮 */}
+        <div
+          onClick={savingEtl ? undefined : handleSaveEtlSubmit}
+          style={{
+            padding: '12px 0',
+            textAlign: 'center',
+            fontSize: 14,
+            fontWeight: 500,
+            color: '#fff',
+            background: savingEtl ? '#ccc' : '#007aff',
+            cursor: savingEtl ? 'default' : 'pointer',
+            margin: '0 20px 16px',
+            borderRadius: 8,
+          }}
+        >
+          {savingEtl ? '保存中...' : '保存'}
         </div>
       </Modal>
     </div>

@@ -181,7 +181,9 @@ services:
       context: ./airflow
       dockerfile: Dockerfile
     container_name: bigdata-airflow-worker
-    command: celery worker
+    command: bash -c "rm -f /opt/airflow/airflow-worker.pid && airflow celery worker"
+    restart: unless-stopped
+    stop_grace_period: 60s
     environment:
       - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin123}@postgres:5432/airflow

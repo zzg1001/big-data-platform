@@ -14,7 +14,7 @@ import {
   Tooltip,
   Input,
   Table,
-  Popconfirm,
+  Alert,
 } from 'antd'
 import {
   RightOutlined,
@@ -38,10 +38,13 @@ import {
   SaveOutlined,
   FullscreenOutlined,
   FullscreenExitOutlined,
+  CloudUploadOutlined,
+  ScheduleOutlined,
 } from '@ant-design/icons'
-import { datasourceApi, syncApi, configApi, warehouseApi, aiApi, dwLayerApi } from '../services/api'
+import { datasourceApi, syncApi, configApi, warehouseApi, aiApi, dwLayerApi, syncScheduleApi } from '../services/api'
 import { useFieldTemplateStore } from '../stores/fieldTemplateStore'
 import Editor from '@monaco-editor/react'
+import CronExpressionInput from '../components/CronExpressionInput'
 
 const { Text } = Typography
 
@@ -71,6 +74,7 @@ interface DwLayer {
   display_name: string
   color?: string
   level: number
+  requires_dependency?: boolean
 }
 
 interface ColumnMapping {
@@ -113,6 +117,12 @@ export default function DataSync() {
 
   // 新增弹窗
   const [addModalVisible, setAddModalVisible] = useState(false)
+  const [editingTask, setEditingTask] = useState<SyncTaskItem | null>(null)  // 双击编辑的任务
+  // 上线调度弹窗
+  const [scheduleModalVisible, setScheduleModalVisible] = useState(false)
+  const [scheduleTasks, setScheduleTasks] = useState<SyncTaskItem[]>([])  // 支持批量
+  const [scheduleCron, setScheduleCron] = useState('0 2 * * *')
+  const [scheduling, setScheduling] = useState(false)
   const [sourceTables, setSourceTables] = useState<string[]>([])
   const [loadingTables, setLoadingTables] = useState(false)
   const [selectedTables, setSelectedTables] = useState<SelectedTableItem[]>([])
@@ -139,9 +149,6 @@ export default function DataSync() {
   const [conflictResolutions, setConflictResolutions] = useState<Record<string, 'skip' | 'rename' | 'recreate'>>({})
   const [renameValues, setRenameValues] = useState<Record<string, string>>({})
 
-  // 下线提示弹窗
-  const [warningVisible, setWarningVisible] = useState(false)
-  const [warningTaskId, setWarningTaskId] = useState<number | null>(null)
 
   // AI 修复日志弹窗
   const [aiFixLogVisible, setAiFixLogVisible] = useState(false)
@@ -279,6 +286,51 @@ export default function DataSync() {
     const odsLayer = layers.find((l) => l.name === 'ODS')
     setSelectedLayerId(odsLayer?.id || (layers.length > 0 ? layers[0].id : null))
     setAddModalVisible(true)
+  }
+
+  // 双击编辑任务
+  const handleRowDoubleClick = async (task: SyncTaskItem) => {
+    setEditingTask(task)
+    setSelectedTables([])
+    setLeftSelected([])
+    setRightSelected([])
+    setTasksCreated(false)
+    setSyncing(false)
+    setCreating(false)
+    setSourceDsId(task.source_datasource_id || -1)
+    setTargetDsId(task.target_datasource_id || null)
+    setSelectedLayerId(task.dw_layer_id || null)
+
+    // 添加当前任务的表到右侧
+    const tableItem: SelectedTableItem = {
+      tableName: task.source_table,
+      targetTableName: task.target_table,
+      ddl: '',
+      ddlStatus: 'generating',
+    }
+    setSelectedTables([tableItem])
+    setAddModalVisible(true)
+
+    // 生成 DDL
+    try {
+      const ddlRes = await syncApi.generateDdlPreview({
+        source_datasource_id: task.source_datasource_id || undefined,
+        source_table: task.source_table,
+        target_table: task.target_table,
+        target_datasource_id: task.target_datasource_id || undefined,
+      })
+      setSelectedTables([{
+        ...tableItem,
+        ddl: ddlRes.data.target_ddl,
+        ddlStatus: 'success',
+      }])
+    } catch (err: any) {
+      setSelectedTables([{
+        ...tableItem,
+        ddlStatus: 'error',
+        ddlError: err.response?.data?.detail || err.message,
+      }])
+    }
   }
 
   // 移动到右侧并生成 DDL
@@ -1263,6 +1315,23 @@ export default function DataSync() {
     let taskSuccessCount = 0
     let taskFailCount = 0
 
+    // 如果是编辑模式，先删除旧表
+    if (editingTask) {
+      try {
+        // 删除旧表
+        const dropDdl = `DROP TABLE IF EXISTS ${editingTask.target_table}`
+        await syncApi.executeDdlOnWarehouse(dropDdl, editingTask.target_datasource_id)
+        // 如果任务没有调度引用，删除旧任务；否则后面会更新任务
+        if (!editingTask.is_scheduled) {
+          await syncApi.delete(editingTask.id)
+        }
+      } catch (err: any) {
+        message.error('删除旧表失败: ' + (err.response?.data?.detail || err.message))
+        setCreating(false)
+        return
+      }
+    }
+
     // 过滤出未创建的表
     const tablesToCreate = selectedTables.filter((t) => t.createStatus !== 'success')
 
@@ -1301,18 +1370,33 @@ export default function DataSync() {
           throw new Error(ddlRes.data.message || 'DDL执行失败')
         }
 
-        // 第二步：创建同步任务（sourceDsId为-1时表示平台数据库，发送null）
-        await syncApi.create({
-          name: `Sync_${table.targetTableName}`,
-          description: `${table.tableName} → ${table.targetTableName}`,
-          source_datasource_id: sourceDsId === -1 ? null : sourceDsId,
-          source_table: table.tableName,
-          target_table: table.targetTableName,
-          sync_mode: 'full',
-          is_scheduled: false,
-          dw_layer_id: selectedLayerId,
-          target_datasource_id: targetDsId,
-        })
+        // 第二步：创建或更新同步任务
+        if (editingTask && editingTask.is_scheduled && table.tableName === editingTask.source_table) {
+          // 编辑模式且有调度引用：更新任务
+          await syncApi.update(editingTask.id, {
+            name: `Sync_${table.targetTableName}`,
+            description: `${table.tableName} → ${table.targetTableName}`,
+            source_datasource_id: sourceDsId === -1 ? null : sourceDsId,
+            source_table: table.tableName,
+            target_table: table.targetTableName,
+            sync_mode: 'full',
+            dw_layer_id: selectedLayerId,
+            target_datasource_id: targetDsId,
+          })
+        } else {
+          // 新建任务（sourceDsId为-1时表示平台数据库，发送null）
+          await syncApi.create({
+            name: `Sync_${table.targetTableName}`,
+            description: `${table.tableName} → ${table.targetTableName}`,
+            source_datasource_id: sourceDsId === -1 ? null : sourceDsId,
+            source_table: table.tableName,
+            target_table: table.targetTableName,
+            sync_mode: 'full',
+            is_scheduled: false,
+            dw_layer_id: selectedLayerId,
+            target_datasource_id: targetDsId,
+          })
+        }
 
         // 成功
         setSelectedTables((prev) =>
@@ -1346,10 +1430,11 @@ export default function DataSync() {
       loadSourceTables()
 
       if (taskFailCount === 0) {
-        message.success('全部创建成功，可执行同步')
+        message.success(editingTask ? '修改成功，可执行同步' : '全部创建成功，可执行同步')
       } else {
         message.success(`创建成功 ${taskSuccessCount} 个，失败 ${taskFailCount} 个`)
       }
+      setEditingTask(null)  // 清除编辑状态
     } else if (taskFailCount > 0) {
       message.error(`创建失败 ${taskFailCount} 个`)
     }
@@ -1470,12 +1555,72 @@ export default function DataSync() {
     }
   }
 
+  // 打开上线调度弹窗（支持单个或批量）
+  const handleOpenScheduleModal = (tasks: SyncTaskItem | SyncTaskItem[]) => {
+    const taskList = Array.isArray(tasks) ? tasks : [tasks]
+    // 过滤掉已上线的任务
+    const unscheduledTasks = taskList.filter(t => !t.is_scheduled)
+    if (unscheduledTasks.length === 0) {
+      message.warning('所选任务均已上线')
+      return
+    }
+    setScheduleTasks(unscheduledTasks)
+    setScheduleCron('0 2 * * *')
+    setScheduleModalVisible(true)
+  }
+
+  // 确认上线调度（支持批量）
+  const handleConfirmSchedule = async () => {
+    if (scheduleTasks.length === 0) return
+    setScheduling(true)
+    let successCount = 0
+    let failCount = 0
+    try {
+      for (const task of scheduleTasks) {
+        try {
+          await syncScheduleApi.create({
+            name: `${task.name}_调度`,
+            sync_task_id: task.id,
+            cron_expression: scheduleCron,
+          })
+          successCount++
+        } catch {
+          failCount++
+        }
+      }
+      if (failCount === 0) {
+        message.success(`上线成功${scheduleTasks.length > 1 ? ` (${successCount}个)` : ''}`)
+      } else {
+        message.warning(`成功 ${successCount} 个，失败 ${failCount} 个`)
+      }
+      setScheduleModalVisible(false)
+      setSelectedTaskIds([])
+      loadSyncTasks()
+    } catch (err: any) {
+      message.error('上线失败: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setScheduling(false)
+    }
+  }
+
   // 删除同步任务（同时删除平台数据库表）
   const handleDeleteTask = async (task: SyncTaskItem) => {
-    // 前端判断：如果有调度引用，直接弹框提示
+    // 如果有调度引用，提示用户先删除调度
     if (task.is_scheduled) {
-      setWarningTaskId(task.id)
-      setWarningVisible(true)
+      Modal.info({
+        icon: null,
+        title: null,
+        content: (
+          <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
+            <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?sync_ids=${task.id}`, '_blank') }}>前往</Button>
+          </div>
+        ),
+        footer: null,
+        centered: true,
+        closable: true,
+        width: 280,
+      })
       return
     }
     try {
@@ -1502,18 +1647,20 @@ export default function DataSync() {
     const scheduledTasks = tasksToDelete.filter((t) => t.is_scheduled)
     const deletableTasks = tasksToDelete.filter((t) => !t.is_scheduled)
 
-    // 如果有已调度的任务，弹框提示并支持跳转
-    if (scheduledTasks.length > 0 && deletableTasks.length === 0) {
-      Modal.confirm({
-        title: '请先下线再删除',
-        content: `选中的 ${scheduledTasks.length} 个任务均已调度`,
-        okText: '去下线',
-        cancelText: '取消',
-        onOk: () => {
-          // 跳转到调度管理，带上sync_id参数
-          const ids = scheduledTasks.map(t => t.id).join(',')
-          navigate(`/scheduler?sync_ids=${ids}`)
-        },
+    if (scheduledTasks.length > 0) {
+      Modal.info({
+        icon: null,
+        title: null,
+        content: (
+          <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
+            <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?sync_ids=${scheduledTasks.map(t => t.id).join(',')}`, '_blank') }}>前往</Button>
+          </div>
+        ),
+        footer: null,
+        centered: true,
+        closable: true,
+        width: 280,
       })
       return
     }
@@ -1541,14 +1688,11 @@ export default function DataSync() {
     setSelectedTaskIds([])
     loadSyncTasks()
 
-    if (scheduledTasks.length > 0) {
-      message.warning(`已删除 ${success} 个，${scheduledTasks.length} 个需先下线`)
-    } else if (fail === 0) {
+    if (fail === 0) {
       message.success(`已删除 ${success} 个任务`)
     } else {
       message.warning(`成功 ${success} 个，失败 ${fail} 个`)
     }
-    loadSyncTasks()
   }
 
   // 执行同步
@@ -1627,10 +1771,24 @@ export default function DataSync() {
   }
 
   // 检查表是否已有同步任务（返回所有匹配的任务）
+  // 需要同时匹配：源数据源 + 源表 + 目标数据源
   const findExistingTasks = (tableName: string) => {
-    return syncTasks.filter(
-      (task) => task.source_datasource_id === sourceDsId && task.source_table === tableName
-    )
+    return syncTasks.filter((task) => {
+      // 源数据源匹配（-1 表示平台数据库，对应 null）
+      const sourceMatch = sourceDsId === -1
+        ? task.source_datasource_id === null
+        : task.source_datasource_id === sourceDsId
+
+      // 源表匹配
+      const tableMatch = task.source_table === tableName
+
+      // 目标数据源匹配（null 表示平台数据库）
+      const targetMatch = targetDsId === null
+        ? task.target_datasource_id === null
+        : task.target_datasource_id === targetDsId
+
+      return sourceMatch && tableMatch && targetMatch
+    })
   }
 
   // 任务列表列配置
@@ -1747,9 +1905,28 @@ export default function DataSync() {
     {
       title: '操作',
       key: 'actions',
-      width: 220,
+      width: 250,
       render: (_: any, record: SyncTaskItem) => (
         <Space>
+          {record.is_scheduled ? (
+            <Tooltip title="管理调度">
+              <Button
+                type="text"
+                size="small"
+                icon={<ScheduleOutlined style={{ color: '#52c41a' }} />}
+                onClick={() => navigate(`/scheduler?sync_ids=${record.id}`)}
+              />
+            </Tooltip>
+          ) : (
+            <Tooltip title="上线调度">
+              <Button
+                type="text"
+                size="small"
+                icon={<CloudUploadOutlined style={{ color: '#1890ff' }} />}
+                onClick={() => handleOpenScheduleModal(record)}
+              />
+            </Tooltip>
+          )}
           <Tooltip title="执行同步">
             <Button
               type="text"
@@ -1766,21 +1943,15 @@ export default function DataSync() {
               onClick={() => handleShowDdl(record)}
             />
           </Tooltip>
-          <Popconfirm
-            title="确认删除该任务？"
-            onConfirm={() => handleDeleteTask(record)}
-            okText="删除"
-            cancelText="取消"
-          >
-            <Tooltip title="删除">
-              <Button
-                type="text"
-                size="small"
-                danger
-                icon={<DeleteOutlined />}
-              />
-            </Tooltip>
-          </Popconfirm>
+          <Tooltip title="删除">
+            <Button
+              type="text"
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() => handleDeleteTask(record)}
+            />
+          </Tooltip>
         </Space>
       ),
     },
@@ -1848,16 +2019,30 @@ export default function DataSync() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           {selectedTaskIds.length > 0 && (
-            <Button
-              danger
-              size="small"
-              icon={<DeleteOutlined />}
-              loading={batchDeleting}
-              onClick={handleBatchDelete}
-              style={{ borderRadius: 6 }}
-            >
-              删除 ({selectedTaskIds.length})
-            </Button>
+            <>
+              <Button
+                type="primary"
+                size="small"
+                icon={<CloudUploadOutlined />}
+                onClick={() => {
+                  const tasks = syncTasks.filter(t => selectedTaskIds.includes(t.id))
+                  handleOpenScheduleModal(tasks)
+                }}
+                style={{ borderRadius: 6 }}
+              >
+                上线 ({selectedTaskIds.length})
+              </Button>
+              <Button
+                danger
+                size="small"
+                icon={<DeleteOutlined />}
+                loading={batchDeleting}
+                onClick={handleBatchDelete}
+                style={{ borderRadius: 6 }}
+              >
+                删除 ({selectedTaskIds.length})
+              </Button>
+            </>
           )}
           <Button
             size="small"
@@ -1917,6 +2102,10 @@ export default function DataSync() {
             selectedRowKeys: selectedTaskIds,
             onChange: (keys) => setSelectedTaskIds(keys as number[]),
           }}
+          onRow={(record) => ({
+            onDoubleClick: () => handleRowDoubleClick(record),
+            style: { cursor: 'pointer' },
+          })}
           pagination={{
             showSizeChanger: true,
             showQuickJumper: true,
@@ -1930,7 +2119,7 @@ export default function DataSync() {
         title={null}
         closable={true}
         open={addModalVisible}
-        onCancel={() => setAddModalVisible(false)}
+        onCancel={() => { setAddModalVisible(false); setEditingTask(null) }}
         width={960}
         style={{ top: 30 }}
         styles={{
@@ -1938,7 +2127,7 @@ export default function DataSync() {
           content: { borderRadius: 16, overflow: 'hidden' },
         }}
         footer={[
-          <Button key="cancel" size="small" onClick={() => setAddModalVisible(false)}>
+          <Button key="cancel" size="small" onClick={() => { setAddModalVisible(false); setEditingTask(null) }}>
             取消
           </Button>,
           tasksCreated ? (
@@ -1970,7 +2159,9 @@ export default function DataSync() {
             >
               {selectedTables.some((t) => t.ddlStatus === 'generating')
                 ? '生成中...'
-                : `创建 (${selectedTables.filter((t) => t.createStatus !== 'success').length})`}
+                : editingTask
+                  ? '保存'
+                  : `创建 (${selectedTables.filter((t) => t.createStatus !== 'success').length})`}
             </Button>
           ),
         ]}
@@ -1986,11 +2177,11 @@ export default function DataSync() {
           background: 'linear-gradient(to bottom, #fafafa, #f5f5f5)',
           borderRadius: 12,
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <DatabaseOutlined style={{ fontSize: 16, color: '#1890ff' }} />
             <Select
               size="small"
-              style={{ width: 180 }}
+              style={{ width: 140 }}
               placeholder="选择源数据库"
               value={sourceDsId}
               onChange={(v) => {
@@ -2010,6 +2201,13 @@ export default function DataSync() {
                 })),
               ]}
             />
+            {sourceDsId !== undefined && (
+              <Text type="secondary" style={{ fontSize: 11, background: '#f0f0f0', padding: '2px 6px', borderRadius: 4 }}>
+                {sourceDsId === -1
+                  ? (warehouseConfig?.database || 'warehouse')
+                  : (datasources.find(d => d.id === sourceDsId)?.database || '-')}
+              </Text>
+            )}
           </div>
           <div style={{
             display: 'flex',
@@ -2022,11 +2220,11 @@ export default function DataSync() {
           }}>
             <RightOutlined style={{ color: '#1890ff', fontSize: 12 }} />
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <GoldOutlined style={{ fontSize: 16, color: '#d4af37' }} />
             <Select
               size="small"
-              style={{ width: 180 }}
+              style={{ width: 140 }}
               placeholder="选择目标数据库"
               value={targetDsId}
               onChange={(v) => {
@@ -2047,27 +2245,38 @@ export default function DataSync() {
                 })),
               ]}
             />
+            <Text type="secondary" style={{ fontSize: 11, background: '#f0f0f0', padding: '2px 6px', borderRadius: 4 }}>
+              {targetDsId === null || targetDsId === undefined
+                ? (warehouseConfig?.database || 'warehouse')
+                : (datasources.find(d => d.id === targetDsId)?.database || '-')}
+            </Text>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
             <Text type="secondary" style={{ fontSize: 12 }}>层级:</Text>
-            <Select
-              size="small"
-              style={{ width: 120 }}
-              placeholder="选择层级"
-              allowClear
-              value={selectedLayerId}
-              onChange={setSelectedLayerId}
-              options={layers.map((l) => ({
-                value: l.id,
-                label: (
-                  <Space size={4}>
-                    <Tag color={l.color || 'default'} style={{ marginRight: 0, fontSize: 11 }}>
-                      {l.name}
-                    </Tag>
-                  </Space>
-                ),
-              }))}
-            />
+            <Tooltip title={
+              selectedLayerId && layers.find(l => l.id === selectedLayerId)?.name !== 'ODS'
+                ? '非 ODS 层级将根据源表自动添加上游依赖'
+                : 'ODS 层级无需配置依赖'
+            }>
+              <Select
+                size="small"
+                style={{ width: 120 }}
+                placeholder="选择层级"
+                allowClear
+                value={selectedLayerId}
+                onChange={setSelectedLayerId}
+                options={layers.map((l) => ({
+                  value: l.id,
+                  label: (
+                    <Space size={4}>
+                      <Tag color={l.color || 'default'} style={{ marginRight: 0, fontSize: 11 }}>
+                        {l.name}
+                      </Tag>
+                    </Space>
+                  ),
+                }))}
+              />
+            </Tooltip>
           </div>
         </div>
 
@@ -3132,13 +3341,14 @@ export default function DataSync() {
                   key: 'targetType',
                   width: 130,
                   render: (text: string, _: any, index: number) => {
-                    // 解析类型和大小，如 VARCHAR(255) -> VARCHAR, 255
-                    const match = text?.match(/^([A-Za-z]+)(?:\(([^)]+)\))?$/)
-                    const baseType = match ? match[1].toUpperCase() : text?.toUpperCase() || ''
+                    // 解析类型名（支持带 COLLATE 等后缀的类型，如 VARCHAR(36) COLLATE "UTF8MB4_GENERAL_CI"）
+                    const typeMatch = text?.match(/^([A-Za-z]+)/)
+                    const baseType = typeMatch ? typeMatch[1].toUpperCase() : ''
                     return (
                       <Select
                         size="small"
-                        value={baseType}
+                        value={baseType || undefined}
+                        placeholder="类型"
                         onChange={(v) => {
                           // 保留原有大小
                           const sizeMatch = text?.match(/\(([^)]+)\)/)
@@ -3174,10 +3384,11 @@ export default function DataSync() {
                   key: 'typeSize',
                   width: 90,
                   render: (_: any, record: ColumnMapping, index: number) => {
-                    // 解析大小，如 VARCHAR(255) -> 255
-                    const match = record.targetType?.match(/\(([^)]+)\)/)
-                    const size = match ? match[1] : ''
-                    const baseType = record.targetType?.replace(/\([^)]+\)/, '').toUpperCase() || ''
+                    // 解析大小，如 VARCHAR(255) -> 255，支持带 COLLATE 等后缀
+                    const sizeMatch = record.targetType?.match(/\(([^)]+)\)/)
+                    const size = sizeMatch ? sizeMatch[1] : ''
+                    const typeMatch = record.targetType?.match(/^([A-Za-z]+)/)
+                    const baseType = typeMatch ? typeMatch[1].toUpperCase() : ''
                     const needsSize = ['VARCHAR', 'CHAR', 'DECIMAL', 'NUMERIC'].includes(baseType)
 
                     if (!needsSize) {
@@ -3446,27 +3657,52 @@ export default function DataSync() {
         </div>
       </Modal>
 
-      {/* 下线提示弹窗 */}
+      {/* 上线调度弹窗 */}
       <Modal
-        open={warningVisible}
-        onCancel={() => setWarningVisible(false)}
-        closable={true}
-        footer={null}
-        width={280}
-        centered
-        styles={{ body: { textAlign: 'center', padding: '20px 24px' } }}
+        title={
+          <Space>
+            <ScheduleOutlined />
+            <span>上线同步任务{scheduleTasks.length > 1 ? ` (${scheduleTasks.length}个)` : ` - ${scheduleTasks[0]?.name}`}</span>
+          </Space>
+        }
+        open={scheduleModalVisible}
+        onCancel={() => setScheduleModalVisible(false)}
+        onOk={handleConfirmSchedule}
+        confirmLoading={scheduling}
+        okText="确定上线"
+        width={550}
       >
-        <ExclamationCircleOutlined style={{ fontSize: 32, color: '#faad14', marginBottom: 12 }} />
-        <div style={{ fontSize: 14, marginBottom: 16 }}>请先下线再删除</div>
-        <Button
-          type="primary"
-          onClick={() => {
-            setWarningVisible(false)
-            navigate(`/scheduler?sync_ids=${warningTaskId}`)
-          }}
-        >
-          去下线
-        </Button>
+        <Alert
+          message="上线后将生成 Airflow DAG 并开始定时执行"
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>任务信息：</Text>
+        </div>
+        {scheduleTasks.length === 1 ? (
+          <Space direction="vertical" style={{ marginBottom: 16, width: '100%' }}>
+            <Text>任务名称：<Tag color="blue">{scheduleTasks[0]?.name}</Tag></Text>
+            <Text>同步方向：<Text code style={{ fontSize: 11 }}>{scheduleTasks[0]?.source_table} → {scheduleTasks[0]?.target_table}</Text></Text>
+          </Space>
+        ) : (
+          <div style={{ marginBottom: 16, maxHeight: 150, overflow: 'auto' }}>
+            {scheduleTasks.map(task => (
+              <div key={task.id} style={{ padding: '4px 0', borderBottom: '1px solid #f0f0f0' }}>
+                <Tag color="blue" style={{ marginRight: 8 }}>{task.name}</Tag>
+                <Text type="secondary" style={{ fontSize: 11 }}>{task.source_table} → {task.target_table}</Text>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>Cron 表达式：</Text>
+        </div>
+        <CronExpressionInput
+          value={scheduleCron}
+          onChange={(v) => setScheduleCron(v)}
+        />
       </Modal>
 
     </div>

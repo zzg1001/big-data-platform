@@ -46,6 +46,7 @@ interface Props {
   sqlContent?: string
   value?: Dependency[]
   onChange?: (dependencies: Dependency[]) => void
+  readonly?: boolean  // 只读模式，用于显示自动添加的依赖
 }
 
 export default function DependencySelector({
@@ -54,6 +55,7 @@ export default function DependencySelector({
   sqlContent,
   value = [],
   onChange,
+  readonly = false,
 }: Props) {
   const [searchResults, setSearchResults] = useState<TaskSearchResult[]>([])
   const [searching, setSearching] = useState(false)
@@ -199,100 +201,102 @@ export default function DependencySelector({
 
   return (
     <div>
-      {/* Search and AI Parse */}
-      <Space style={{ marginBottom: 12, width: '100%' }} direction="vertical" size={8}>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Select
-            showSearch
-            placeholder="搜索任务名称或表名"
-            style={{ flex: 1 }}
-            value={searchValue || undefined}
-            onSearch={handleSearch}
-            onChange={() => {}}
-            filterOption={false}
-            notFoundContent={
-              searching ? (
-                <Spin size="small" />
-              ) : searchValue && searchResults.length === 0 ? (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="未找到匹配的任务" />
-              ) : null
-            }
-            dropdownRender={(menu) => (
-              <>
-                {menu}
-                {searchResults.length > 0 && (
-                  <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0' }}>
-                    <Text type="secondary" style={{ fontSize: 11 }}>
-                      点击任务添加为依赖
-                    </Text>
-                  </div>
-                )}
-              </>
-            )}
-          >
-            {searchResults.map((task) => (
-              <Select.Option
-                key={`${task.task_type}-${task.task_id}`}
-                value={`${task.task_type}-${task.task_id}`}
-              >
-                <div
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    handleSelectTask(task)
-                  }}
-                  style={{ cursor: 'pointer' }}
-                >
-                  <Space size={4}>
-                    <Tag color={getTaskTypeColor(task.task_type)} style={{ marginRight: 0 }}>
-                      {getTaskTypeLabel(task.task_type)}
-                    </Tag>
-                    <span>{task.task_name}</span>
-                    {task.table_name && (
+      {/* Search and AI Parse - hidden in readonly mode */}
+      {!readonly && (
+        <Space style={{ marginBottom: 12, width: '100%' }} direction="vertical" size={8}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Select
+              showSearch
+              placeholder="搜索任务名称或表名"
+              style={{ flex: 1 }}
+              value={searchValue || undefined}
+              onSearch={handleSearch}
+              onChange={() => {}}
+              filterOption={false}
+              notFoundContent={
+                searching ? (
+                  <Spin size="small" />
+                ) : searchValue && searchResults.length === 0 ? (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="未找到匹配的任务" />
+                ) : null
+              }
+              dropdownRender={(menu) => (
+                <>
+                  {menu}
+                  {searchResults.length > 0 && (
+                    <div style={{ padding: '8px 12px', borderTop: '1px solid #f0f0f0' }}>
                       <Text type="secondary" style={{ fontSize: 11 }}>
-                        ({task.table_name})
+                        点击任务添加为依赖
                       </Text>
-                    )}
-                  </Space>
-                  {task.dw_layer_name && (
-                    <Tag
-                      color={task.dw_layer_color || 'default'}
-                      style={{ marginLeft: 8, fontSize: 10 }}
-                    >
-                      {task.dw_layer_name}
-                    </Tag>
+                    </div>
                   )}
-                </div>
-              </Select.Option>
-            ))}
-          </Select>
-          <Button
-            icon={<RobotOutlined />}
-            loading={aiParsing}
-            onClick={handleAiParse}
-            disabled={!sqlContent}
-            title="AI解析SQL，自动识别上游依赖"
-          >
-            AI解析
-          </Button>
-        </div>
-
-        {/* Parsed tables info */}
-        {parsedTables.length > 0 && (
-          <div style={{ background: '#f6ffed', padding: '8px 12px', borderRadius: 4 }}>
-            <Text style={{ fontSize: 12 }}>
-              <CodeOutlined style={{ marginRight: 4 }} />
-              识别到的源表：
-              {parsedTables.map((t) => (
-                <Tag key={t} style={{ marginLeft: 4 }}>
-                  {t}
-                </Tag>
+                </>
+              )}
+            >
+              {searchResults.map((task) => (
+                <Select.Option
+                  key={`${task.task_type}-${task.task_id}`}
+                  value={`${task.task_type}-${task.task_id}`}
+                >
+                  <div
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleSelectTask(task)
+                    }}
+                    style={{ cursor: 'pointer' }}
+                  >
+                    <Space size={4}>
+                      <Tag color={getTaskTypeColor(task.task_type)} style={{ marginRight: 0 }}>
+                        {getTaskTypeLabel(task.task_type)}
+                      </Tag>
+                      <span>{task.task_name}</span>
+                      {task.table_name && (
+                        <Text type="secondary" style={{ fontSize: 11 }}>
+                          ({task.table_name})
+                        </Text>
+                      )}
+                    </Space>
+                    {task.dw_layer_name && (
+                      <Tag
+                        color={task.dw_layer_color || 'default'}
+                        style={{ marginLeft: 8, fontSize: 10 }}
+                      >
+                        {task.dw_layer_name}
+                      </Tag>
+                    )}
+                  </div>
+                </Select.Option>
               ))}
-            </Text>
+            </Select>
+            <Button
+              icon={<RobotOutlined />}
+              loading={aiParsing}
+              onClick={handleAiParse}
+              disabled={!sqlContent}
+              title="AI解析SQL，自动识别上游依赖"
+            >
+              AI解析
+            </Button>
           </div>
-        )}
-      </Space>
 
-      <Divider style={{ margin: '12px 0' }} />
+          {/* Parsed tables info */}
+          {parsedTables.length > 0 && (
+            <div style={{ background: '#f6ffed', padding: '8px 12px', borderRadius: 4 }}>
+              <Text style={{ fontSize: 12 }}>
+                <CodeOutlined style={{ marginRight: 4 }} />
+                识别到的源表：
+                {parsedTables.map((t) => (
+                  <Tag key={t} style={{ marginLeft: 4 }}>
+                    {t}
+                  </Tag>
+                ))}
+              </Text>
+            </div>
+          )}
+        </Space>
+      )}
+
+      {!readonly && <Divider style={{ margin: '12px 0' }} />}
 
       {/* Selected dependencies */}
       <div>
@@ -340,14 +344,21 @@ export default function DependencySelector({
                       <RobotOutlined /> AI
                     </Tag>
                   )}
+                  {dep.dependency_type === 'auto' && (
+                    <Tag color="cyan" style={{ fontSize: 10 }}>
+                      自动
+                    </Tag>
+                  )}
                 </Space>
-                <Button
-                  type="text"
-                  size="small"
-                  danger
-                  icon={<DeleteOutlined />}
-                  onClick={() => handleRemove(dep)}
-                />
+                {!readonly && (
+                  <Button
+                    type="text"
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={() => handleRemove(dep)}
+                  />
+                )}
               </div>
             ))}
           </div>

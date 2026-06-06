@@ -267,7 +267,7 @@ export const etlApi = {
   list: (statusFilter?: string) =>
     api.get('/api/v1/etl/', { params: { status_filter: statusFilter } }),
   get: (id: number) => api.get(`/api/v1/etl/${id}`),
-  create: (data: { name: string; description?: string; sql_content: string; datasource_id?: number }) =>
+  create: (data: { name: string; description?: string; sql_content: string; datasource_id?: number; dw_layer_id?: number }) =>
     api.post('/api/v1/etl/', data),
   update: (id: number, data: any) => api.put(`/api/v1/etl/${id}`, data),
   delete: (id: number) => api.delete(`/api/v1/etl/${id}`),
@@ -278,7 +278,7 @@ export const etlApi = {
     api.post(`/api/v1/etl/${id}/schedule`, { cron_expression: cronExpression }),
   enable: (id: number, cronExpression: string) =>
     api.post(`/api/v1/etl/${id}/enable`, { cron_expression: cronExpression }),
-  disable: (id: number) => api.post(`/api/v1/etl/${id}/disable`),
+  disable: (id: number, force: boolean = false) => api.post(`/api/v1/etl/${id}/disable`, null, { params: { force } }),
   unschedule: (id: number) => api.post(`/api/v1/etl/${id}/unschedule`),
 }
 
@@ -302,7 +302,7 @@ export const syncScheduleApi = {
   // 上线调度（生成 DAG 并激活）
   enable: (id: number) => api.post(`/api/v1/sync-schedules/${id}/enable`),
   // 下线调度（暂停 DAG）
-  disable: (id: number) => api.post(`/api/v1/sync-schedules/${id}/disable`),
+  disable: (id: number, force: boolean = false) => api.post(`/api/v1/sync-schedules/${id}/disable`, null, { params: { force } }),
 }
 
 // 平台数据库层级 API
@@ -336,4 +336,20 @@ export const taskDependencyApi = {
     }),
   parseSql: (sqlContent: string) =>
     api.post('/api/v1/task-dependencies/parse-sql', { sql_content: sqlContent }),
+}
+
+// SQL 脚本文件 API
+export const sqlScriptApi = {
+  list: () => api.get('/api/v1/sql-scripts/'),
+  get: (name: string) => api.get(`/api/v1/sql-scripts/${encodeURIComponent(name)}`),
+  create: (name: string, content: string) =>
+    api.post('/api/v1/sql-scripts/', { name, content }),
+  update: (name: string, content: string) =>
+    api.put(`/api/v1/sql-scripts/${encodeURIComponent(name)}`, { content }),
+  delete: (name: string) =>
+    api.delete(`/api/v1/sql-scripts/${encodeURIComponent(name)}`),
+  rename: (name: string, newName: string) =>
+    api.post(`/api/v1/sql-scripts/${encodeURIComponent(name)}/rename`, null, {
+      params: { new_name: newName },
+    }),
 }

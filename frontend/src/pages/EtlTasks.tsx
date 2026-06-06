@@ -10,16 +10,19 @@ import {
   Select,
   message,
   Tag,
-  Popconfirm,
   Typography,
   Drawer,
   Timeline,
   Spin,
+  Empty,
+  Tooltip,
 } from 'antd'
 import {
   PlusOutlined,
   ReloadOutlined,
   ExclamationCircleOutlined,
+  CloudUploadOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons'
 import { etlApi, dwLayerApi, taskDependencyApi } from '../services/api'
 import Editor from '@monaco-editor/react'
@@ -39,6 +42,7 @@ interface EtlTask {
   dw_layer_id?: number
   dw_layer_name?: string
   dw_layer_color?: string
+  dependency_count?: number
   is_scheduled: boolean
   cron_expression?: string
   dag_id?: string
@@ -99,6 +103,11 @@ export default function EtlTasks() {
   const [layers, setLayers] = useState<DwLayer[]>([])
   const [dependencies, setDependencies] = useState<Dependency[]>([])
   const [currentSql, setCurrentSql] = useState('')
+  const [viewDepsModalVisible, setViewDepsModalVisible] = useState(false)
+  const [viewingDepsTask, setViewingDepsTask] = useState<EtlTask | null>(null)
+  const [viewingDeps, setViewingDeps] = useState<Dependency[]>([])
+  const [loadingDeps, setLoadingDeps] = useState(false)
+  const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([])
 
   useEffect(() => {
     loadTasks()
@@ -207,18 +216,71 @@ export default function EtlTasks() {
   }
 
   const handleDelete = async (task: EtlTask) => {
-    // 检查任务是否已调度上线
-    if (task.is_scheduled) {
-      showScheduledWarning(task)
+    // 检查任务是否有调度引用（dag_id 存在表示有调度记录）
+    if (task.dag_id) {
+      Modal.info({
+        icon: null,
+        title: null,
+        content: (
+          <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
+            <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?etl_ids=${task.id}`, '_blank') }}>前往</Button>
+          </div>
+        ),
+        footer: null,
+        centered: true,
+        closable: true,
+        width: 280,
+      })
       return
     }
     try {
       await etlApi.delete(task.id)
-      message.success('ETL task deleted')
+      message.success('删除成功')
       loadTasks()
     } catch (err: any) {
-      message.error('Failed to delete task: ' + (err.response?.data?.detail || err.message))
+      message.error('删除失败: ' + (err.response?.data?.detail || err.message))
     }
+  }
+
+  // 批量删除
+  const handleBatchDelete = async () => {
+    if (selectedTaskIds.length === 0) return
+
+    const tasksToDelete = tasks.filter((t) => selectedTaskIds.includes(t.id))
+    const scheduledTasks = tasksToDelete.filter((t) => t.dag_id)  // dag_id 存在表示有调度记录
+    const deletableTasks = tasksToDelete.filter((t) => !t.dag_id)
+
+    if (scheduledTasks.length > 0) {
+      Modal.info({
+        icon: null,
+        title: null,
+        content: (
+          <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
+            <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?etl_ids=${scheduledTasks.map(t => t.id).join(',')}`, '_blank') }}>前往</Button>
+          </div>
+        ),
+        footer: null,
+        centered: true,
+        closable: true,
+        width: 280,
+      })
+      return
+    }
+
+    let successCount = 0
+    for (const task of deletableTasks) {
+      try {
+        await etlApi.delete(task.id)
+        successCount++
+      } catch (err) {
+        console.error('Delete failed:', err)
+      }
+    }
+    message.success(`成功删除 ${successCount} 个任务`)
+    setSelectedTaskIds([])
+    loadTasks()
   }
 
   const handleExecute = async (task: EtlTask) => {
@@ -245,6 +307,31 @@ export default function EtlTasks() {
       setSqlModalVisible(true)
     } catch (err: any) {
       message.error('加载失败: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
+  const handleViewDependencies = async (task: EtlTask) => {
+    setViewingDepsTask(task)
+    setViewDepsModalVisible(true)
+    setLoadingDeps(true)
+    try {
+      const res = await taskDependencyApi.getForTask('etl', task.id)
+      setViewingDeps(res.data.map((d: any) => ({
+        id: d.id,
+        upstream_task_type: d.upstream_task_type,
+        upstream_task_id: d.upstream_task_id,
+        upstream_task_name: d.upstream_task_name,
+        upstream_table_name: d.upstream_table_name,
+        upstream_layer_name: d.upstream_layer_name,
+        upstream_layer_color: d.upstream_layer_color,
+        dependency_type: d.dependency_type,
+        source_table: d.source_table,
+      })))
+    } catch (err: any) {
+      message.error('加载依赖失败: ' + (err.response?.data?.detail || err.message))
+      setViewingDeps([])
+    } finally {
+      setLoadingDeps(false)
     }
   }
 
@@ -281,48 +368,40 @@ export default function EtlTasks() {
       title: '名称',
       dataIndex: 'name',
       key: 'name',
-      width: 180,
+      width: 120,
+      ellipsis: { showTitle: false },
       render: (name: string, record: EtlTask) => (
-        <div>
-          <Text strong>{name}</Text>
-          {record.description && (
-            <div>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {record.description}
-              </Text>
-            </div>
-          )}
-        </div>
+        <Tooltip title={record.description ? `${name}\n${record.description}` : name}>
+          <Text strong style={{ cursor: 'pointer' }}>{name}</Text>
+        </Tooltip>
       ),
     },
     {
       title: 'SQL',
       dataIndex: 'sql_preview',
       key: 'sql_preview',
-      width: 100,
+      width: 60,
       render: (_: string, record: EtlTask) => (
-        <Button
-          type="link"
-          size="small"
-          style={{ padding: 0 }}
-          onClick={() => handleViewSql(record)}
-        >
-          查看SQL
-        </Button>
+        <a onClick={() => handleViewSql(record)}>查看</a>
       ),
     },
     {
       title: '数据源',
       dataIndex: 'datasource_name',
       key: 'datasource_name',
-      width: 120,
-      render: (name: string) => name || '平台数据库',
+      width: 90,
+      ellipsis: { showTitle: false },
+      render: (name: string) => (
+        <Tooltip title={name || '平台数据库'}>
+          <span>{name || '平台数据库'}</span>
+        </Tooltip>
+      ),
     },
     {
       title: '层级',
       dataIndex: 'dw_layer_name',
       key: 'dw_layer_name',
-      width: 100,
+      width: 70,
       render: (_: string, record: EtlTask) =>
         record.dw_layer_name ? (
           <Tag color={record.dw_layer_color || 'default'}>{record.dw_layer_name}</Tag>
@@ -331,10 +410,19 @@ export default function EtlTasks() {
         ),
     },
     {
+      title: '依赖',
+      dataIndex: 'dependency_count',
+      key: 'dependency_count',
+      width: 50,
+      render: (count: number, record: EtlTask) => (
+        <a onClick={() => handleViewDependencies(record)}>{count || 0}</a>
+      ),
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 140,
+      width: 110,
       render: (_: string, record: EtlTask) => (
         <Space size={4}>
           {getStatusTag(record.status)}
@@ -345,21 +433,13 @@ export default function EtlTasks() {
     {
       title: '最近执行',
       key: 'last_run',
-      width: 160,
+      width: 140,
+      ellipsis: { showTitle: false },
       render: (_: any, record: EtlTask) =>
         record.last_run_at ? (
-          <div>
-            <Text style={{ fontSize: 12 }}>
-              {new Date(record.last_run_at).toLocaleString()}
-            </Text>
-            {record.last_run_rows !== undefined && (
-              <div>
-                <Text type="secondary" style={{ fontSize: 11 }}>
-                  影响行数: {record.last_run_rows}
-                </Text>
-              </div>
-            )}
-          </div>
+          <Tooltip title={`${new Date(record.last_run_at).toLocaleString()}\n影响行数: ${record.last_run_rows ?? '-'}`}>
+            <Text style={{ fontSize: 12 }}>{new Date(record.last_run_at).toLocaleString()}</Text>
+          </Tooltip>
         ) : (
           <Text type="secondary">-</Text>
         ),
@@ -367,45 +447,48 @@ export default function EtlTasks() {
     {
       title: '操作',
       key: 'actions',
-      width: 160,
+      width: 200,
       render: (_: any, record: EtlTask) => (
-        <Space split={<span style={{ color: '#e8e8e8' }}>|</span>} size={4}>
+        <div style={{ display: 'flex', gap: 8, fontSize: 13, whiteSpace: 'nowrap' }}>
+          <a
+            onClick={() => !record.is_scheduled && navigate(`/scheduler?add=1&etlIds=${record.id}`)}
+            style={{
+              width: 28,
+              color: record.is_scheduled ? '#d9d9d9' : '#1890ff',
+              cursor: record.is_scheduled ? 'default' : 'pointer',
+            }}
+          >
+            上线
+          </a>
+          <span style={{ color: '#e8e8e8' }}>|</span>
           <a
             onClick={() => handleExecute(record)}
-            style={{ color: '#1890ff', fontSize: 13 }}
+            style={{ color: '#1890ff' }}
           >
-            {executing === record.id ? '执行中...' : '执行'}
+            {executing === record.id ? '执行中' : '执行'}
           </a>
+          <span style={{ color: '#e8e8e8' }}>|</span>
           <a
             onClick={() => handleEdit(record)}
-            style={{ color: '#1890ff', fontSize: 13 }}
+            style={{ color: '#1890ff' }}
           >
             编辑
           </a>
+          <span style={{ color: '#e8e8e8' }}>|</span>
           <a
             onClick={() => handleViewLogs(record)}
-            style={{ color: '#1890ff', fontSize: 13 }}
+            style={{ color: '#1890ff' }}
           >
             日志
           </a>
-          {record.is_scheduled ? (
-            <a
-              onClick={() => handleDelete(record)}
-              style={{ color: '#ff4d4f', fontSize: 13 }}
-            >
-              删除
-            </a>
-          ) : (
-            <Popconfirm
-              title="确认删除?"
-              onConfirm={() => handleDelete(record)}
-              okText="删除"
-              cancelText="取消"
-            >
-              <a style={{ color: '#ff4d4f', fontSize: 13 }}>删除</a>
-            </Popconfirm>
-          )}
-        </Space>
+          <span style={{ color: '#e8e8e8' }}>|</span>
+          <a
+            onClick={() => handleDelete(record)}
+            style={{ color: '#ff4d4f' }}
+          >
+            删除
+          </a>
+        </div>
       ),
     },
   ]
@@ -437,6 +520,27 @@ export default function EtlTasks() {
           <Button icon={<ReloadOutlined />} onClick={loadTasks}>
             刷新
           </Button>
+          {selectedTaskIds.length > 0 && (
+            <>
+              <Button
+                type="primary"
+                icon={<CloudUploadOutlined />}
+                onClick={() => {
+                  const ids = selectedTaskIds.join(',')
+                  navigate(`/scheduler?add=1&etlIds=${ids}`)
+                }}
+              >
+                上线 ({selectedTaskIds.length})
+              </Button>
+              <Button
+                danger
+                icon={<DeleteOutlined />}
+                onClick={handleBatchDelete}
+              >
+                删除 ({selectedTaskIds.length})
+              </Button>
+            </>
+          )}
         </Space>
         <Input.Search
           placeholder="搜索任务名称"
@@ -448,12 +552,16 @@ export default function EtlTasks() {
       </div>
 
       <Table
+        size="small"
         columns={columns}
         dataSource={filteredTasks}
         rowKey="id"
         loading={loading}
         pagination={{ pageSize: 20 }}
-        scroll={{ x: 1200 }}
+        rowSelection={{
+          selectedRowKeys: selectedTaskIds,
+          onChange: (keys) => setSelectedTaskIds(keys as number[]),
+        }}
       />
 
       {/* Create/Edit Modal */}
@@ -601,6 +709,66 @@ export default function EtlTasks() {
             }}
           />
         </div>
+      </Modal>
+
+      {/* Dependencies View Modal */}
+      <Modal
+        title={`上游依赖 - ${viewingDepsTask?.name}`}
+        open={viewDepsModalVisible}
+        onCancel={() => {
+          setViewDepsModalVisible(false)
+          setViewingDeps([])
+        }}
+        footer={null}
+        width={600}
+      >
+        {loadingDeps ? (
+          <div style={{ textAlign: 'center', padding: 40 }}>
+            <Spin />
+          </div>
+        ) : viewingDeps.length === 0 ? (
+          <Empty description="暂无上游依赖" />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {viewingDeps.map((dep) => (
+              <div
+                key={`${dep.upstream_task_type}-${dep.upstream_task_id}`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '10px 14px',
+                  background: '#fafafa',
+                  borderRadius: 6,
+                  border: '1px solid #f0f0f0',
+                }}
+              >
+                <Space size={8}>
+                  <Tag color={dep.upstream_task_type === 'sync' ? 'blue' : 'purple'}>
+                    {dep.upstream_task_type === 'sync' ? '同步' : 'ETL'}
+                  </Tag>
+                  <span>{dep.upstream_task_name || `ID: ${dep.upstream_task_id}`}</span>
+                  {dep.upstream_table_name && (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      ({dep.upstream_table_name})
+                    </Text>
+                  )}
+                  {dep.upstream_layer_name && (
+                    <Tag color={dep.upstream_layer_color || 'default'} style={{ fontSize: 11 }}>
+                      {dep.upstream_layer_name}
+                    </Tag>
+                  )}
+                  {dep.dependency_type === 'ai_parsed' && (
+                    <Tag color="green" style={{ fontSize: 10 }}>AI</Tag>
+                  )}
+                  {dep.dependency_type === 'auto' && (
+                    <Tag color="cyan" style={{ fontSize: 10 }}>自动</Tag>
+                  )}
+                </Space>
+              </div>
+            ))}
+          </div>
+        )}
       </Modal>
 
       {/* Warning Modal */}
