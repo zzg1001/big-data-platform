@@ -118,7 +118,7 @@ export default function DataSync() {
   // 新增弹窗
   const [addModalVisible, setAddModalVisible] = useState(false)
   const [editingTask, setEditingTask] = useState<SyncTaskItem | null>(null)  // 双击编辑的任务
-  // 上线调度弹窗
+    // 上线调度弹窗
   const [scheduleModalVisible, setScheduleModalVisible] = useState(false)
   const [scheduleTasks, setScheduleTasks] = useState<SyncTaskItem[]>([])  // 支持批量
   const [scheduleCron, setScheduleCron] = useState('0 2 * * *')
@@ -218,7 +218,9 @@ export default function DataSync() {
       const res = await datasourceApi.listAll()
       setDatasources(res.data)
       if (res.data.length > 0) {
-        setSourceDsId(res.data[0].id)
+        // 优先选择默认数据源
+        const defaultDs = res.data.find((ds: any) => ds.is_default)
+        setSourceDsId(defaultDs ? defaultDs.id : res.data[0].id)
       }
     } catch (error) {
       message.error('加载数据源失败')
@@ -276,15 +278,17 @@ export default function DataSync() {
 
   // 打开新增弹窗
   const handleOpenAddModal = () => {
+    // 优先选择默认数据源
+    const defaultDs = datasources.find((ds: any) => ds.is_default)
+    setSourceDsId(defaultDs ? defaultDs.id : (datasources.length > 0 ? datasources[0].id : null))
     setSelectedTables([])
     setLeftSelected([])
     setRightSelected([])
     setTasksCreated(false)
     setCreatedCount(0)
-    setTargetDsId(null)  // 重置目标数据源（null表示使用平台数据库）
-    // 默认选择ODS层级（如果存在）
-    const odsLayer = layers.find((l) => l.name === 'ODS')
-    setSelectedLayerId(odsLayer?.id || (layers.length > 0 ? layers[0].id : null))
+    setTargetDsId(null)
+    // 层级默认为空，强制用户选择
+    setSelectedLayerId(null)
     setAddModalVisible(true)
   }
 
@@ -1289,6 +1293,10 @@ export default function DataSync() {
       message.warning('请选择源数据库')
       return
     }
+    if (!selectedLayerId) {
+      message.warning('请选择目标层级')
+      return
+    }
     if (!warehouseConfigured) {
       message.warning('请先在「系统管理」中配置目标平台数据库')
       return
@@ -1578,11 +1586,14 @@ export default function DataSync() {
     try {
       for (const task of scheduleTasks) {
         try {
-          await syncScheduleApi.create({
+          // 先创建调度
+          const res = await syncScheduleApi.create({
             name: `${task.name}_调度`,
             sync_task_id: task.id,
             cron_expression: scheduleCron,
           })
+          // 再启用调度（生成 DAG 并激活）
+          await syncScheduleApi.enable(res.data.id)
           successCount++
         } catch {
           failCount++
@@ -1613,7 +1624,7 @@ export default function DataSync() {
         content: (
           <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
             <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
-            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?sync_ids=${task.id}`, '_blank') }}>前往</Button>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/bigdata/scheduler?sync_ids=${task.id}`, '_blank') }}>前往</Button>
           </div>
         ),
         footer: null,
@@ -1654,7 +1665,7 @@ export default function DataSync() {
         content: (
           <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
             <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
-            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?sync_ids=${scheduledTasks.map(t => t.id).join(',')}`, '_blank') }}>前往</Button>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/bigdata/scheduler?sync_ids=${scheduledTasks.map(t => t.id).join(',')}`, '_blank') }}>前往</Button>
           </div>
         ),
         footer: null,
@@ -1914,7 +1925,7 @@ export default function DataSync() {
                 type="text"
                 size="small"
                 icon={<ScheduleOutlined style={{ color: '#52c41a' }} />}
-                onClick={() => navigate(`/scheduler?sync_ids=${record.id}`)}
+                onClick={() => navigate(`/bigdata/scheduler?sync_ids=${record.id}`)}
               />
             </Tooltip>
           ) : (
@@ -2056,7 +2067,7 @@ export default function DataSync() {
             <Button
               size="small"
               icon={<SettingOutlined />}
-              onClick={() => navigate('/field-templates')}
+              onClick={() => navigate('/bigdata/field-templates')}
               style={{ borderRadius: 6 }}
             >
               字段模板
@@ -2150,6 +2161,8 @@ export default function DataSync() {
               icon={<ThunderboltOutlined />}
               loading={creating}
               disabled={
+                !sourceDsId ||
+                !selectedLayerId ||
                 selectedTables.length === 0 ||
                 !warehouseConfigured ||
                 selectedTables.some((t) => t.ddlStatus === 'generating') ||
@@ -2181,7 +2194,7 @@ export default function DataSync() {
             <DatabaseOutlined style={{ fontSize: 16, color: '#1890ff' }} />
             <Select
               size="small"
-              style={{ width: 140 }}
+              style={{ width: 160 }}
               placeholder="选择源数据库"
               value={sourceDsId}
               onChange={(v) => {
@@ -2192,12 +2205,12 @@ export default function DataSync() {
                 // 平台数据库选项
                 ...(warehouseConfig?.configured ? [{
                   value: -1,
-                  label: `平台数据库 (${warehouseConfig.type})`,
+                  label: '平台数据库',
                 }] : []),
                 // 其他数据源
                 ...datasources.map((ds) => ({
                   value: ds.id,
-                  label: `${ds.name} (${ds.type})`,
+                  label: ds.is_default ? `默认 - ${ds.name}` : ds.name,
                 })),
               ]}
             />
@@ -2224,7 +2237,7 @@ export default function DataSync() {
             <GoldOutlined style={{ fontSize: 16, color: '#d4af37' }} />
             <Select
               size="small"
-              style={{ width: 140 }}
+              style={{ width: 160 }}
               placeholder="选择目标数据库"
               value={targetDsId}
               onChange={(v) => {
@@ -2236,12 +2249,12 @@ export default function DataSync() {
                 // 平台数据库选项
                 ...(warehouseConfig?.configured ? [{
                   value: null as any,
-                  label: `平台数据库 (${warehouseConfig.type})`,
+                  label: '平台数据库',
                 }] : []),
                 // 其他数据源（不做互斥）
                 ...datasources.map((ds) => ({
                   value: ds.id,
-                  label: `${ds.name} (${ds.type})`,
+                  label: ds.is_default ? `默认 - ${ds.name}` : ds.name,
                 })),
               ]}
             />

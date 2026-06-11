@@ -70,10 +70,12 @@ class DataSourceResponse(BaseModel):
     port: int
     database: str
     username: str
+    password_mask: str = "********"  # 密码掩码，不返回真实密码
     schema_name: Optional[str] = None
     service_name: Optional[str] = None
     is_active: bool
     is_warehouse: bool = False  # 是否为平台数据库
+    is_default: bool = False  # 是否为默认数据源
     connection_status: str
     last_connected_at: Optional[datetime] = None
     group_id: Optional[int] = None

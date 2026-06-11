@@ -169,7 +169,7 @@ export default function EtlTasks() {
       return
     }
     // 跳转到数据探索页面编辑
-    navigate(`/data-explorer?etl_id=${task.id}&etl_name=${encodeURIComponent(task.name)}`)
+    navigate(`/bigdata/data-explorer?etl_id=${task.id}&etl_name=${encodeURIComponent(task.name)}`)
   }
 
   const handleSubmit = async () => {
@@ -224,7 +224,7 @@ export default function EtlTasks() {
         content: (
           <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
             <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
-            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?etl_ids=${task.id}`, '_blank') }}>前往</Button>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/bigdata/scheduler?etl_ids=${task.id}`, '_blank') }}>前往</Button>
           </div>
         ),
         footer: null,
@@ -258,7 +258,7 @@ export default function EtlTasks() {
         content: (
           <div style={{ textAlign: 'center', padding: '20px 0 10px' }}>
             <div style={{ fontSize: 16, fontWeight: 500, color: '#1d1d1f', marginBottom: 20 }}>删除引用再试！</div>
-            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/scheduler?etl_ids=${scheduledTasks.map(t => t.id).join(',')}`, '_blank') }}>前往</Button>
+            <Button type="primary" onClick={() => { Modal.destroyAll(); window.open(`/bigdata/scheduler?etl_ids=${scheduledTasks.map(t => t.id).join(',')}`, '_blank') }}>前往</Button>
           </div>
         ),
         footer: null,
@@ -451,7 +451,7 @@ export default function EtlTasks() {
       render: (_: any, record: EtlTask) => (
         <div style={{ display: 'flex', gap: 8, fontSize: 13, whiteSpace: 'nowrap' }}>
           <a
-            onClick={() => !record.is_scheduled && navigate(`/scheduler?add=1&etlIds=${record.id}`)}
+            onClick={() => !record.is_scheduled && navigate(`/bigdata/scheduler?add=1&etlIds=${record.id}`)}
             style={{
               width: 28,
               color: record.is_scheduled ? '#d9d9d9' : '#1890ff',
@@ -527,7 +527,7 @@ export default function EtlTasks() {
                 icon={<CloudUploadOutlined />}
                 onClick={() => {
                   const ids = selectedTaskIds.join(',')
-                  navigate(`/scheduler?add=1&etlIds=${ids}`)
+                  navigate(`/bigdata/scheduler?add=1&etlIds=${ids}`)
                 }}
               >
                 上线 ({selectedTaskIds.length})
@@ -787,7 +787,7 @@ export default function EtlTasks() {
           type="primary"
           onClick={() => {
             setWarningVisible(false)
-            navigate(`/scheduler?etl_id=${warningTaskId}`)
+            navigate(`/bigdata/scheduler?etl_id=${warningTaskId}`)
           }}
         >
           调度管理

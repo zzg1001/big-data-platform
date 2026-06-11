@@ -1,36 +1,57 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
-  Card,
-  Table,
   Button,
   Modal,
   Form,
   Input,
-  Select,
   InputNumber,
   Space,
   Tag,
   message,
   Popconfirm,
   Typography,
+  Table,
+  Tabs,
 } from 'antd'
 import {
   PlusOutlined,
-  EditOutlined,
-  DeleteOutlined,
-  ReloadOutlined,
+  LeftOutlined,
+  DatabaseOutlined,
 } from '@ant-design/icons'
 import { datasourceApi } from '../services/api'
 
-const { Title } = Typography
-const { Search } = Input
+const { Title, Text } = Typography
 
-const typeOptions = [
-  { value: 'mysql', label: 'MySQL' },
-  { value: 'postgresql', label: 'PostgreSQL' },
-  { value: 'oracle', label: 'Oracle' },
-  { value: 'hive', label: 'Hive' },
-  { value: 'sqlserver', label: 'SQL Server' },
+// 数据库类型配置
+const dbTypes = [
+  {
+    key: 'mysql',
+    name: 'MySQL',
+    icon: '🐬',
+    enabled: true,
+    description: '关系型数据库',
+  },
+  {
+    key: 'postgresql',
+    name: 'PostgreSQL',
+    icon: '🐘',
+    enabled: false,
+    description: '关系型数据库',
+  },
+  {
+    key: 'hive',
+    name: 'Hive',
+    icon: '🐝',
+    enabled: false,
+    description: '数据仓库',
+  },
+  {
+    key: 'oracle',
+    name: 'Oracle',
+    icon: '🔴',
+    enabled: false,
+    description: '企业级数据库',
+  },
 ]
 
 export default function DataSources() {
@@ -40,26 +61,20 @@ export default function DataSources() {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [form] = Form.useForm()
   const [testing, setTesting] = useState(false)
-  const [testPassed, setTestPassed] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [passwordChanged, setPasswordChanged] = useState(false)  // 密码是否被修改
 
-  // 分页和搜索状态
-  const [pagination, setPagination] = useState({ current: 1, pageSize: 20, total: 0 })
-  const [keyword, setKeyword] = useState('')
+  // 当前选中的数据库类型（null 表示在类型选择页）
+  const [selectedDbType, setSelectedDbType] = useState<string | null>(null)
 
-  const loadDatasources = useCallback(async (page = 1, pageSize = 20, search = '') => {
+  // Tab 状态
+  const [activeTab, setActiveTab] = useState<'all' | 'added'>('all')
+
+  const loadDatasources = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await datasourceApi.list({
-        page,
-        page_size: pageSize,
-        keyword: search || undefined,
-      })
-      setDatasources(res.data.items)
-      setPagination({
-        current: res.data.page,
-        pageSize: res.data.page_size,
-        total: res.data.total,
-      })
+      const res = await datasourceApi.listAll()
+      setDatasources(res.data || [])
     } catch (error) {
       message.error('加载数据源失败')
     } finally {
@@ -71,33 +86,35 @@ export default function DataSources() {
     loadDatasources()
   }, [loadDatasources])
 
-  const handleTableChange = (pag: any) => {
-    loadDatasources(pag.current, pag.pageSize, keyword)
+  // 获取各类型的数据源数量（不区分大小写）
+  const getCountByType = (type: string) => {
+    return datasources.filter((ds) => ds.type?.toLowerCase() === type.toLowerCase()).length
   }
 
-  const handleSearch = (value: string) => {
-    setKeyword(value)
-    loadDatasources(1, pagination.pageSize, value)
-  }
-
-  const handleRefresh = () => {
-    loadDatasources(pagination.current, pagination.pageSize, keyword)
+  // 获取当前类型的数据源列表（不区分大小写）
+  const getCurrentTypeDatasources = () => {
+    if (!selectedDbType) return []
+    return datasources.filter((ds) => ds.type?.toLowerCase() === selectedDbType.toLowerCase())
   }
 
   const handleCreate = () => {
     setEditingId(null)
-    setTestPassed(false)
+    setPasswordChanged(false)
     form.resetFields()
-    form.setFieldsValue({ port: 3306, pool_size: 5, max_overflow: 10 })
+    form.setFieldsValue({ port: 3306 })
     setModalVisible(true)
   }
 
   const handleEdit = (record: any) => {
     setEditingId(record.id)
-    setTestPassed(false)
+    setPasswordChanged(false)
     form.setFieldsValue({
-      ...record,
-      password: '', // Don't show existing password
+      name: record.name,
+      host: record.host,
+      port: record.port,
+      database: record.database,
+      username: record.username,
+      password: '••••••••',  // 显示掩码
     })
     setModalVisible(true)
   }
@@ -112,18 +129,40 @@ export default function DataSources() {
     }
   }
 
+  const handleSetDefault = async (id: number) => {
+    try {
+      await datasourceApi.setDefault(id)
+      message.success('已设为默认数据源')
+      loadDatasources()
+    } catch (error) {
+      message.error('设置失败')
+    }
+  }
+
   const handleTest = async () => {
     setTesting(true)
     try {
-      const values = await form.validateFields()
-      const result = await datasourceApi.test(values)
-
-      if (result.data.success) {
-        message.success('连接成功，可以保存')
-        setTestPassed(true)
+      // 编辑模式且密码未修改时，使用已保存的密码测试
+      if (editingId && !passwordChanged) {
+        const result = await datasourceApi.testSaved(editingId)
+        if (result.data.success) {
+          message.success('连接测试成功')
+        } else {
+          message.error(`连接失败: ${result.data.message}`)
+        }
       } else {
-        message.error(`连接失败: ${result.data.message}`)
-        setTestPassed(false)
+        // 新建或密码已修改时，使用表单中的密码测试
+        const values = await form.validateFields()
+        const result = await datasourceApi.test({
+          ...values,
+          type: selectedDbType,
+        })
+
+        if (result.data.success) {
+          message.success('连接测试成功')
+        } else {
+          message.error(`连接失败: ${result.data.message}`)
+        }
       }
     } catch (error: any) {
       if (error.errorFields) {
@@ -131,161 +170,460 @@ export default function DataSources() {
         return
       }
       message.error(`测试失败: ${error.response?.data?.detail || error.message}`)
-      setTestPassed(false)
     } finally {
       setTesting(false)
     }
   }
 
   const handleSubmit = async () => {
+    setSaving(true)
     try {
       const values = await form.validateFields()
+      const data: any = {
+        ...values,
+        type: selectedDbType,
+      }
+
+      // 编辑模式下，如果密码未修改则不提交密码字段
+      if (editingId && !passwordChanged) {
+        delete data.password
+      }
 
       if (editingId) {
-        await datasourceApi.update(editingId, values)
+        await datasourceApi.update(editingId, data)
         message.success('更新成功')
       } else {
-        await datasourceApi.create(values)
+        await datasourceApi.create(data)
         message.success('创建成功')
       }
 
       setModalVisible(false)
-      setTestPassed(false)
       loadDatasources()
     } catch (error: any) {
       if (error.errorFields) return
-      message.error('操作失败')
+      message.error(error.response?.data?.detail || '操作失败')
+    } finally {
+      setSaving(false)
     }
   }
 
-  const columns = [
-    { title: '名称', dataIndex: 'name', key: 'name' },
-    {
-      title: '类型',
-      dataIndex: 'type',
-      key: 'type',
-      render: (type: string) => <Tag color="blue">{type.toUpperCase()}</Tag>,
-    },
-    { title: '主机', dataIndex: 'host', key: 'host' },
-    { title: '端口', dataIndex: 'port', key: 'port' },
-    { title: '数据库', dataIndex: 'database', key: 'database' },
-    {
-      title: '状态',
-      dataIndex: 'connection_status',
-      key: 'status',
-      render: (status: string) => (
-        <Tag color={status === 'connected' ? 'green' : status === 'failed' ? 'red' : 'default'}>
-          {status === 'connected' ? '已连接' : status === 'failed' ? '失败' : '未知'}
-        </Tag>
-      ),
-    },
-    {
-      title: '操作',
-      key: 'actions',
-      width: 120,
-      render: (_: any, record: any) => (
-        <Space>
+  // 数据源类型选择页面
+  const renderTypeSelection = () => {
+    const addedCount = datasources.length
+    const allCount = dbTypes.length
+
+    return (
+      <div style={{ padding: '0 24px' }}>
+        <Title level={4} style={{ marginBottom: 24 }}>数据源管理</Title>
+
+        <Tabs
+          activeKey={activeTab}
+          onChange={(key) => setActiveTab(key as 'all' | 'added')}
+          items={[
+            { key: 'all', label: <span>全部数据源 <Tag color="green">{allCount}</Tag></span> },
+            { key: 'added', label: <span>已添加数据源 <Tag>{addedCount}</Tag></span> },
+          ]}
+        />
+
+        {activeTab === 'all' ? (
+          <>
+            <div style={{ marginTop: 24, marginBottom: 16 }}>
+              <Text type="secondary">数据库 ({dbTypes.length})</Text>
+            </div>
+            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+              {dbTypes.map((db) => {
+                const count = getCountByType(db.key)
+                return (
+                  <div
+                    key={db.key}
+                    onClick={() => db.enabled && setSelectedDbType(db.key)}
+                    style={{
+                      width: 280,
+                      padding: '20px 24px',
+                      background: '#fff',
+                      borderRadius: 8,
+                      border: '1px solid #e8e8e8',
+                      cursor: db.enabled ? 'pointer' : 'not-allowed',
+                      opacity: db.enabled ? 1 : 0.5,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 16,
+                      transition: 'all 0.2s',
+                    }}
+                    onMouseEnter={(e) => {
+                      if (db.enabled) {
+                        e.currentTarget.style.borderColor = '#1890ff'
+                        e.currentTarget.style.boxShadow = '0 2px 8px rgba(24,144,255,0.15)'
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = '#e8e8e8'
+                      e.currentTarget.style.boxShadow = 'none'
+                    }}
+                  >
+                    <div style={{
+                      width: 48,
+                      height: 48,
+                      background: '#f5f5f5',
+                      borderRadius: 8,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: 24,
+                    }}>
+                      {db.icon}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 15, fontWeight: 500, color: '#1d1d1f' }}>
+                        {db.name}
+                      </div>
+                      <div style={{ fontSize: 12, color: '#86868b' }}>
+                        {db.description}
+                      </div>
+                    </div>
+                    {db.enabled ? (
+                      count > 0 && (
+                        <Tag color="green" style={{ margin: 0 }}>{count} 个连接</Tag>
+                      )
+                    ) : (
+                      <Tag style={{ margin: 0 }}>即将上线</Tag>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </>
+        ) : (
+          // 已添加数据源列表
+          <div style={{ marginTop: 24 }}>
+            {datasources.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: 60, color: '#86868b' }}>
+                暂无已添加的数据源
+              </div>
+            ) : (
+              <Table
+                dataSource={datasources}
+                rowKey="id"
+                loading={loading}
+                columns={[
+                  {
+                    title: '连接名称',
+                    dataIndex: 'name',
+                    key: 'name',
+                    render: (name: string, record: any) => (
+                      <Space>
+                        <span style={{ fontSize: 18 }}>
+                          {dbTypes.find(d => d.key === record.type?.toLowerCase())?.icon || '📦'}
+                        </span>
+                        <span style={{ fontWeight: 500 }}>{name}</span>
+                      </Space>
+                    ),
+                  },
+                  {
+                    title: '类型',
+                    dataIndex: 'type',
+                    key: 'type',
+                    render: (type: string) => (
+                      <Tag color="blue">{type?.toUpperCase()}</Tag>
+                    ),
+                  },
+                  {
+                    title: '服务器地址',
+                    key: 'address',
+                    render: (_: any, record: any) => (
+                      <span>{record.host}:{record.port}</span>
+                    ),
+                  },
+                  {
+                    title: '数据库',
+                    dataIndex: 'database',
+                    key: 'database',
+                  },
+                  {
+                    title: '创建时间',
+                    dataIndex: 'created_at',
+                    key: 'created_at',
+                    render: (date: string) => date ? new Date(date).toLocaleString() : '-',
+                  },
+                  {
+                    title: '操作',
+                    key: 'actions',
+                    width: 120,
+                    render: (_: any, record: any) => (
+                      <Space>
+                        <a onClick={() => {
+                          setSelectedDbType(record.type?.toLowerCase())
+                          setTimeout(() => handleEdit(record), 100)
+                        }}>编辑</a>
+                        <Popconfirm
+                          title="确定删除该数据源?"
+                          onConfirm={() => handleDelete(record.id)}
+                        >
+                          <a style={{ color: '#ff4d4f' }}>删除</a>
+                        </Popconfirm>
+                      </Space>
+                    ),
+                  },
+                ]}
+                pagination={{ pageSize: 10 }}
+              />
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // MySQL 数据源管理页面
+  const renderMySQLManagement = () => {
+    const currentDatasources = getCurrentTypeDatasources()
+    const dbInfo = dbTypes.find(d => d.key === selectedDbType)
+
+    return (
+      <div style={{ display: 'flex', height: '100%' }}>
+        {/* 左侧信息栏 */}
+        <div style={{
+          width: 240,
+          background: '#fafafa',
+          borderRight: '1px solid #e8e8e8',
+          padding: '20px',
+        }}>
           <Button
-            type="link"
-            icon={<EditOutlined />}
-            onClick={() => handleEdit(record)}
+            type="text"
+            icon={<LeftOutlined />}
+            onClick={() => setSelectedDbType(null)}
+            style={{ marginBottom: 20, padding: '4px 0' }}
           >
-            编辑
+            返回
           </Button>
-          <Popconfirm
-            title="确定删除该数据源?"
-            onConfirm={() => handleDelete(record.id)}
-          >
-            <Button type="link" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
-        </Space>
-      ),
-    },
-  ]
+
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            marginBottom: 24,
+          }}>
+            <div style={{
+              width: 64,
+              height: 64,
+              background: '#fff',
+              borderRadius: 12,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 32,
+              marginBottom: 12,
+              border: '1px solid #e8e8e8',
+            }}>
+              {dbInfo?.icon}
+            </div>
+            <div style={{ fontSize: 16, fontWeight: 600 }}>{dbInfo?.name}</div>
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <div style={{
+              fontSize: 13,
+              fontWeight: 500,
+              color: '#1d1d1f',
+              marginBottom: 12,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+            }}>
+              <DatabaseOutlined /> 需要的信息
+            </div>
+            <div style={{ fontSize: 12, color: '#666', lineHeight: 2 }}>
+              <div>• 服务器地址</div>
+              <div>• 端口号</div>
+              <div>• 数据库名（可选）</div>
+              <div>• 用户名</div>
+              <div>• 密码</div>
+            </div>
+          </div>
+        </div>
+
+        {/* 右侧列表区 */}
+        <div style={{ flex: 1, padding: '20px 24px' }}>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 20,
+          }}>
+            <div style={{ fontSize: 15, fontWeight: 500 }}>
+              连接信息列表
+            </div>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={handleCreate}
+            >
+              添加连接
+            </Button>
+          </div>
+
+          <Table
+            dataSource={currentDatasources}
+            rowKey="id"
+            loading={loading}
+            columns={[
+              {
+                title: '连接名称',
+                dataIndex: 'name',
+                key: 'name',
+                sorter: (a, b) => a.name.localeCompare(b.name),
+              },
+              {
+                title: '服务器地址',
+                key: 'address',
+                render: (_: any, record: any) => (
+                  <span>{record.host}</span>
+                ),
+              },
+              {
+                title: '数据库',
+                dataIndex: 'database',
+                key: 'database',
+                render: (db: string) => db || '-',
+              },
+              {
+                title: '创建时间',
+                dataIndex: 'created_at',
+                key: 'created_at',
+                sorter: (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+                render: (date: string) => date ? new Date(date).toLocaleString() : '-',
+              },
+              {
+                title: '默认',
+                key: 'is_default',
+                width: 70,
+                render: (_: any, record: any) => (
+                  <Tag
+                    color={record.is_default ? 'blue' : 'default'}
+                    style={{
+                      cursor: 'pointer',
+                      opacity: record.is_default ? 1 : 0.5,
+                    }}
+                    onClick={() => !record.is_default && handleSetDefault(record.id)}
+                  >
+                    默认
+                  </Tag>
+                ),
+              },
+              {
+                title: '操作',
+                key: 'actions',
+                width: 100,
+                render: (_: any, record: any) => (
+                  <Space>
+                    <a onClick={() => handleEdit(record)}>编辑</a>
+                    <Popconfirm
+                      title="确定删除该连接?"
+                      onConfirm={() => handleDelete(record.id)}
+                    >
+                      <a style={{ color: '#ff4d4f' }}>删除</a>
+                    </Popconfirm>
+                  </Space>
+                ),
+              },
+            ]}
+            pagination={{
+              pageSize: 10,
+              showTotal: (total) => `共 ${total} 条`,
+            }}
+          />
+        </div>
+      </div>
+    )
+  }
 
   return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-        <Title level={4}>数据源管理</Title>
-        <Space>
-          <Search
-            placeholder="搜索名称/主机/数据库"
-            allowClear
-            onSearch={handleSearch}
-            style={{ width: 250 }}
-          />
-          <Button icon={<ReloadOutlined />} onClick={handleRefresh}>
-            刷新
-          </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>
-            新建数据源
-          </Button>
-        </Space>
-      </div>
+    <div style={{ height: '100%', background: '#fff' }}>
+      {selectedDbType ? renderMySQLManagement() : renderTypeSelection()}
 
-      <Card>
-        <Table
-          columns={columns}
-          dataSource={datasources}
-          rowKey="id"
-          loading={loading}
-          pagination={{
-            ...pagination,
-            showSizeChanger: true,
-            showQuickJumper: true,
-            showTotal: (total) => `共 ${total} 条`,
-            pageSizeOptions: ['10', '20', '50', '100'],
-          }}
-          onChange={handleTableChange}
-        />
-      </Card>
-
+      {/* 添加/编辑弹窗 */}
       <Modal
-        title={editingId ? '编辑数据源' : '新建数据源'}
+        title={`${editingId ? '编辑' : '添加'} MySQL 数据源连接`}
         open={modalVisible}
-        onOk={handleSubmit}
-        onCancel={() => { setModalVisible(false); setTestPassed(false) }}
-        width={600}
-        footer={[
-          <Button key="test" onClick={() => handleTest()} loading={testing}>
-            测试连接
-          </Button>,
-          <Button key="cancel" onClick={() => { setModalVisible(false); setTestPassed(false) }} disabled={testing}>
-            取消
-          </Button>,
-          <Button key="submit" type="primary" onClick={handleSubmit} disabled={!testPassed || testing}>
-            确定
-          </Button>,
-        ]}
+        onCancel={() => setModalVisible(false)}
+        width={480}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <Button onClick={() => setModalVisible(false)}>
+              取消
+            </Button>
+            <Button onClick={handleTest} loading={testing}>
+              测试连接
+            </Button>
+            <Button type="primary" onClick={handleSubmit} loading={saving}>
+              保存
+            </Button>
+          </div>
+        }
       >
-        <Form form={form} layout="vertical" onValuesChange={() => setTestPassed(false)}>
-          <Form.Item name="name" label="名称" rules={[{ required: true }]}>
-            <Input placeholder="数据源名称" />
+        <Form
+          form={form}
+          layout="vertical"
+          style={{ marginTop: 16 }}
+        >
+          <Form.Item
+            name="name"
+            label="数据源连接名称"
+            rules={[{ required: true, message: '请输入连接名称' }]}
+          >
+            <Input placeholder="请输入连接名称" />
           </Form.Item>
-          <Form.Item name="type" label="类型" rules={[{ required: true }]}>
-            <Select options={typeOptions} placeholder="选择数据库类型" />
+
+          <Form.Item
+            name="host"
+            label="服务器"
+            rules={[{ required: true, message: '请输入服务器地址' }]}
+          >
+            <Input placeholder="如 127.0.0.1 或 db.example.com" />
           </Form.Item>
-          <Form.Item name="host" label="主机" rules={[{ required: true }]}>
-            <Input placeholder="localhost" />
+
+          <Form.Item
+            name="port"
+            label="端口号"
+            rules={[{ required: true, message: '请输入端口号' }]}
+          >
+            <InputNumber
+              style={{ width: '100%' }}
+              placeholder="3306"
+              min={1}
+              max={65535}
+            />
           </Form.Item>
-          <Form.Item name="port" label="端口" rules={[{ required: true }]}>
-            <InputNumber style={{ width: '100%' }} placeholder="3306" />
-          </Form.Item>
-          <Form.Item name="database" label="数据库">
+
+          <Form.Item
+            name="database"
+            label="数据库名"
+          >
             <Input placeholder="可选，留空则连接后选择" />
           </Form.Item>
-          <Form.Item name="username" label="用户名" rules={[{ required: true }]}>
-            <Input placeholder="用户名" />
+
+          <Form.Item
+            name="username"
+            label="用户名"
+            rules={[{ required: true, message: '请输入用户名' }]}
+          >
+            <Input placeholder="请输入用户名" />
           </Form.Item>
+
           <Form.Item
             name="password"
             label="密码"
-            rules={[{ required: !editingId }]}
+            rules={[{ required: !editingId, message: '请输入密码' }]}
           >
-            <Input.Password placeholder={editingId ? '留空则不修改' : '密码'} />
-          </Form.Item>
-          <Form.Item name="schema_name" label="Schema">
-            <Input placeholder="可选" />
+            <Input.Password
+              placeholder={editingId ? '留空则不修改' : '请输入密码'}
+              onChange={() => {
+                if (editingId && !passwordChanged) {
+                  setPasswordChanged(true)
+                  form.setFieldValue('password', '')  // 清空掩码，让用户输入新密码
+                }
+              }}
+            />
           </Form.Item>
         </Form>
       </Modal>

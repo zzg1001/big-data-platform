@@ -98,6 +98,7 @@ export const datasourceApi = {
   delete: (id: number) => api.delete(`/api/v1/datasources/${id}`),
   test: (data: any) => api.post('/api/v1/datasources/test', data),
   testSaved: (id: number) => api.post(`/api/v1/datasources/${id}/test`),
+  setDefault: (id: number) => api.post(`/api/v1/datasources/${id}/set-default`),
   getTables: (id: number) => api.get(`/api/v1/datasources/${id}/tables`),
   getTableMetadata: (id: number, table: string) =>
     api.get(`/api/v1/datasources/${id}/tables/${table}`),

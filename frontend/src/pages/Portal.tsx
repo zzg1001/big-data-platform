@@ -55,10 +55,10 @@ const modules: ModuleCardProps[] = [
   },
 ]
 
-function ModuleCard({ title, description, icon, path, iconBg, disabled }: ModuleCardProps) {
+function ModuleCard({ title, description, icon, path, iconBg, disabled, onNavigate }: ModuleCardProps & { onNavigate: (path: string) => void }) {
   return (
     <div
-      onClick={() => !disabled && path && window.open(path, '_blank')}
+      onClick={() => !disabled && path && onNavigate(path)}
       style={{
         background: '#fff',
         borderRadius: 8,
@@ -314,7 +314,7 @@ export default function Portal() {
             <Row gutter={[16, 16]}>
               {modules.map((module, index) => (
                 <Col xs={24} sm={12} key={index}>
-                  <ModuleCard {...module} />
+                  <ModuleCard {...module} onNavigate={navigate} />
                 </Col>
               ))}
             </Row>

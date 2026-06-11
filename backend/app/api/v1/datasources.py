@@ -224,6 +224,34 @@ async def delete_datasource(
     await db.flush()
 
 
+@router.post("/{datasource_id}/set-default", response_model=DataSourceResponse)
+async def set_default_datasource(
+    datasource_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a datasource as the default."""
+    # 先取消所有数据源的默认状态
+    await db.execute(
+        select(DataSource).where(DataSource.is_default == True)
+    )
+    result = await db.execute(select(DataSource).where(DataSource.is_active == True))
+    all_datasources = result.scalars().all()
+    for ds in all_datasources:
+        ds.is_default = False
+
+    # 设置指定数据源为默认
+    result = await db.execute(select(DataSource).where(DataSource.id == datasource_id))
+    datasource = result.scalar_one_or_none()
+    if not datasource:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Datasource not found")
+
+    datasource.is_default = True
+    await db.flush()
+    await db.refresh(datasource)
+    return datasource
+
+
 @router.post("/test", response_model=dict)
 async def test_connection(
     test_data: DataSourceTest,

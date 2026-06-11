@@ -14,6 +14,7 @@ import {
   Input,
   Descriptions,
   Alert,
+  Badge,
 } from 'antd'
 import {
   DeleteOutlined,
@@ -158,6 +159,9 @@ export default function Scheduler() {
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [batchEnabling, setBatchEnabling] = useState(false)
   const [batchDisabling, setBatchDisabling] = useState(false)
+
+  // 未调度任务数量
+  const [unscheduledCount, setUnscheduledCount] = useState(0)
   
   
   // Draggable popover
@@ -262,11 +266,17 @@ export default function Scheduler() {
   const loadSchedules = async () => {
     setLoading(true)
     try {
-      // 同时加载同步调度和ETL任务
-      const [syncRes, etlRes] = await Promise.all([
+      // 同时加载同步调度、ETL任务和可调度任务
+      const [syncRes, etlRes, availableSyncRes] = await Promise.all([
         syncScheduleApi.list(statusFilter),
         etlApi.list(),
+        syncScheduleApi.getAvailableTasks(),
       ])
+
+      // 计算未调度任务数量：可调度同步任务 + 未调度ETL任务
+      const unscheduledSyncCount = availableSyncRes.data?.length || 0
+      const unscheduledEtlCount = etlRes.data.filter((t: any) => !t.is_scheduled).length
+      setUnscheduledCount(unscheduledSyncCount + unscheduledEtlCount)
 
       setSchedules(syncRes.data)
 
@@ -1304,14 +1314,16 @@ export default function Scheduler() {
           <Button icon={<ReloadOutlined />} onClick={loadSchedules}>
             刷新
           </Button>
-          <Button
-            type="primary"
-            icon={<PlusOutlined />}
-            onClick={handleOpenAddModal}
-            disabled={adding || batchEnabling || batchDisabling || batchDeleting}
-          >
-            添加调度
-          </Button>
+          <Badge count={unscheduledCount} offset={[-5, 5]} size="small">
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={handleOpenAddModal}
+              disabled={adding || batchEnabling || batchDisabling || batchDeleting}
+            >
+              添加调度
+            </Button>
+          </Badge>
         </Space>
         <Input.Search
           placeholder="搜索任务名称"
@@ -1353,9 +1365,9 @@ export default function Scheduler() {
           onRow={(record) => ({
             onDoubleClick: () => {
               if (record.type === 'etl') {
-                navigate(`/etl-tasks?id=${record.taskId}`)
+                navigate(`/bigdata/etl-tasks?id=${record.taskId}`)
               } else {
-                navigate(`/data-sync?id=${record.taskId}`)
+                navigate(`/bigdata/data-sync?id=${record.taskId}`)
               }
             },
             style: { cursor: 'pointer' },

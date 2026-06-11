@@ -907,7 +907,7 @@ export default function DataExplorer() {
       setParsedTables([])
 
       // 跳转到 ETL 任务页面
-      navigate(`/etl-tasks?id=${taskId}`)
+      navigate(`/bigdata/etl-tasks?id=${taskId}`)
     } catch (error: any) {
       if (error.errorFields) return
       message.error('保存失败: ' + (error.response?.data?.detail || error.message))
@@ -2020,7 +2020,7 @@ export default function DataExplorer() {
                       if (syncIds.length > 0) params.set('syncIds', syncIds.join(','))
                       if (etlIds.length > 0) params.set('etlIds', etlIds.join(','))
                       // 新窗口打开调度管理
-                      window.open(`/scheduler?${params.toString()}`, '_blank')
+                      window.open(`/bigdata/scheduler?${params.toString()}`, '_blank')
                     }}
                     style={{
                       fontSize: 11,
