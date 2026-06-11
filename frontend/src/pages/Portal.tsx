@@ -56,11 +56,9 @@ const modules: ModuleCardProps[] = [
 ]
 
 function ModuleCard({ title, description, icon, path, iconBg, disabled }: ModuleCardProps) {
-  const navigate = useNavigate()
-
   return (
     <div
-      onClick={() => !disabled && path && navigate(path)}
+      onClick={() => !disabled && path && window.open(path, '_blank')}
       style={{
         background: '#fff',
         borderRadius: 8,

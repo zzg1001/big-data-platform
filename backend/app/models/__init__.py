@@ -12,6 +12,7 @@ from app.models.sync_schedule import SyncSchedule
 from app.models.etl_task import EtlTask, EtlLog
 from app.models.dw_layer import DwLayer
 from app.models.task_dependency import TaskDependency
+from app.models.tag import TagNode, TagData
 
 __all__ = [
     "User",
@@ -35,4 +36,6 @@ __all__ = [
     "EtlLog",
     "DwLayer",
     "TaskDependency",
+    "TagNode",
+    "TagData",
 ]

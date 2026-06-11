@@ -40,6 +40,7 @@ import {
   SyncOutlined,
   FolderOpenOutlined,
   DeleteOutlined,
+  TagOutlined,
 } from '@ant-design/icons'
 import Editor, { Monaco } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
@@ -95,6 +96,13 @@ export default function DataExplorer() {
   const [tableData, setTableData] = useState<any[]>([])
   const [loadingTableInfo, setLoadingTableInfo] = useState(false)
   const [totalRows, setTotalRows] = useState(0)
+  // 字段标签（待重构）
+  const [columnTags, setColumnTags] = useState<Record<string, {id: number, name: string, color: string}[]>>({})
+  // 打标签弹窗
+  const [tagModalVisible, setTagModalVisible] = useState(false)
+  const [tagModalColumn, setTagModalColumn] = useState<string | null>(null)
+  const [availableTags, setAvailableTags] = useState<{id: number, name: string, color: string, group_name: string}[]>([])
+  const [selectedTagIds, setSelectedTagIds] = useState<number[]>([])
 
   // SQL 编辑器多Tab
   interface EditorTab {
@@ -466,6 +474,8 @@ export default function DataExplorer() {
     try {
       const res = await configApi.getWarehouse()
       setWarehouseConfig(res.data)
+
+      // 标签功能待重构
     } catch (error) {
       console.error('Failed to load warehouse config')
     } finally {
@@ -498,6 +508,7 @@ export default function DataExplorer() {
   const handleSelectTable = async (tableName: string) => {
     setSelectedTable(tableName)
     setLoadingTableInfo(true)
+    setColumnTags({})
 
     try {
       // 加载表结构
@@ -513,6 +524,9 @@ export default function DataExplorer() {
       setTableData(dataRes.data.rows || [])
       setTotalRows(dataRes.data.total || 0)
 
+      // 标签功能待重构
+      setColumnTags({})
+
       // 生成默认SQL
       setSql(`SELECT * FROM ${tableName} LIMIT 100;`)
     } catch (error: any) {
@@ -522,6 +536,22 @@ export default function DataExplorer() {
     } finally {
       setLoadingTableInfo(false)
     }
+  }
+
+  // 打开打标签弹窗 - 待重构
+  const openTagModal = async (columnName: string) => {
+    setTagModalColumn(columnName)
+    setSelectedTagIds([])
+    setTagModalVisible(true)
+    // 标签功能待重构，暂时加载空列表
+    setAvailableTags([])
+    message.info('标签功能正在重构中')
+  }
+
+  // 保存标签 - 待重构
+  const saveColumnTags = async () => {
+    message.info('标签功能正在重构中')
+    setTagModalVisible(false)
   }
 
   // 获取表字段（优先从缓存，否则异步加载）
@@ -1080,6 +1110,30 @@ export default function DataExplorer() {
       dataIndex: 'data_type',
       key: 'data_type',
       render: (type: string) => <Tag color="blue">{type}</Tag>,
+    },
+    {
+      title: '标签',
+      dataIndex: 'name',
+      key: 'tags',
+      render: (name: string) => {
+        const tags = columnTags[name] || []
+        return (
+          <Space size={4} wrap>
+            {tags.map(t => (
+              <Tag key={t.id} color={t.color} style={{ margin: 0 }}>{t.name}</Tag>
+            ))}
+            <Tooltip title="编辑标签">
+              <Button
+                type="text"
+                size="small"
+                icon={<TagOutlined style={{ fontSize: 12 }} />}
+                onClick={() => openTagModal(name)}
+                style={{ width: 20, height: 20, padding: 0, color: '#999' }}
+              />
+            </Tooltip>
+          </Space>
+        )
+      },
     },
     {
       title: '可空',
@@ -2041,6 +2095,44 @@ export default function DataExplorer() {
         >
           {savingEtl ? '保存中...' : '保存'}
         </div>
+      </Modal>
+
+      {/* 打标签 Modal */}
+      <Modal
+        title={`为字段 "${tagModalColumn}" 打标签`}
+        open={tagModalVisible}
+        onCancel={() => setTagModalVisible(false)}
+        onOk={saveColumnTags}
+        confirmLoading={false}
+        okText="保存"
+        cancelText="取消"
+        width={400}
+      >
+        <div style={{ marginBottom: 12 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>选择要添加的标签（可多选）</Text>
+        </div>
+        <Select
+          mode="multiple"
+          style={{ width: '100%' }}
+          placeholder="选择标签"
+          value={selectedTagIds}
+          onChange={setSelectedTagIds}
+          optionLabelProp="label"
+        >
+          {availableTags.map(tag => (
+            <Select.Option key={tag.id} value={tag.id} label={tag.name}>
+              <Space>
+                <Tag color={tag.color} style={{ margin: 0 }}>{tag.name}</Tag>
+                <Text type="secondary" style={{ fontSize: 11 }}>{tag.group_name}</Text>
+              </Space>
+            </Select.Option>
+          ))}
+        </Select>
+        {availableTags.length === 0 && (
+          <div style={{ marginTop: 12, textAlign: 'center' }}>
+            <Text type="secondary">暂无可用标签，请先在标签系统中创建标签</Text>
+          </div>
+        )}
       </Modal>
     </div>
   )

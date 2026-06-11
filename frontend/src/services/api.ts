@@ -353,3 +353,74 @@ export const sqlScriptApi = {
       params: { new_name: newName },
     }),
 }
+
+// 标签管理平台 API
+export const tagApi = {
+  // 标签节点
+  listNodes: (params?: { parent_id?: number; node_type?: string; keyword?: string }) =>
+    api.get('/api/v1/tags/nodes', { params }),
+  getTree: () => api.get('/api/v1/tags/tree'),
+  createNode: (data: { name: string; description?: string; node_type: string; parent_id?: number; color?: string }) =>
+    api.post('/api/v1/tags/nodes', data),
+  updateNode: (id: number, data: any) =>
+    api.put(`/api/v1/tags/nodes/${id}`, data),
+  deleteNode: (id: number) =>
+    api.delete(`/api/v1/tags/nodes/${id}`),
+
+  // 标签数据
+  listData: (params?: { tag_node_id?: number; datasource_id?: number; table_name?: string }) =>
+    api.get('/api/v1/tags/data', { params }),
+  createData: (data: { tag_node_id: number; datasource_id?: number; table_name?: string; row_id?: string }) =>
+    api.post('/api/v1/tags/data', data),
+  deleteData: (id: number) =>
+    api.delete(`/api/v1/tags/data/${id}`),
+
+  // 规则标签
+  createRuleTag: (data: {
+    name: string;
+    description?: string;
+    parent_id?: number;
+    color?: string;
+    rule_config: { datasource_id?: number; source_table: string; sql_condition?: string; full_sql?: string };
+  }) => api.post('/api/v1/tags/rule-tag', data),
+
+  // 获取所有类型节点（用于行级标签）
+  listTypes: () => api.get('/api/v1/tags/types'),
+
+  // 获取类型下的标签选项
+  getTagsUnderType: (typeId: number) => api.get(`/api/v1/tags/nodes/${typeId}/tags`),
+
+  // 行级标签
+  createRowTag: (data: {
+    name: string;
+    description?: string;
+    parent_id?: number;
+    color?: string;
+    datasource_id?: number;
+    source_table: string;
+    source_columns: string[];
+    tag_fields: { name: string; description: string; type_id: number | null }[];  // 标签字段配置，每个字段绑定一个类型
+    target_table?: string;
+  }) => api.post('/api/v1/tags/row-tag', data),
+
+  executeRowTag: (nodeId: number, data: { batch_size?: number; ai_prompt?: string }) =>
+    api.post(`/api/v1/tags/row-tag/${nodeId}/execute`, data),
+
+  // 数据集标签
+  createDatasetTag: (data: {
+    name: string;
+    description?: string;
+    parent_id?: number;
+    color?: string;
+    source_tag_ids: number[];
+    filter_condition?: string;
+    target_table?: string;
+  }) => api.post('/api/v1/tags/dataset-tag', data),
+
+  // 预览标签数据
+  previewTagData: (nodeId: number, limit?: number) =>
+    api.get(`/api/v1/tags/nodes/${nodeId}/preview`, { params: { limit } }),
+
+  // 统计
+  getStatistics: () => api.get('/api/v1/tags/statistics'),
+}
