@@ -15,6 +15,9 @@ import {
   Descriptions,
   Alert,
   Badge,
+  Layout,
+  Avatar,
+  Dropdown,
 } from 'antd'
 import {
   DeleteOutlined,
@@ -32,11 +35,16 @@ import {
   LeftOutlined,
   HolderOutlined,
   CodeOutlined,
+  HomeOutlined,
+  UserOutlined,
+  LogoutOutlined,
 } from '@ant-design/icons'
-import { syncScheduleApi, etlApi } from '../services/api'
+import { useAuthStore } from '../stores/authStore'
+import { syncScheduleApi, etlApi, scheduleApi } from '../services/api'
 import CronExpressionInput from '../components/CronExpressionInput'
 
 const { Title, Text } = Typography
+const { Header, Content } = Layout
 
 // 调度列表项（从 sync-schedules API）
 interface SyncScheduleItem {
@@ -63,13 +71,13 @@ interface SyncScheduleItem {
   created_at: string
 }
 
-// 统一的调度项（包括同步和ETL）
+// 统一的调度项（包括同步、ETL和标签任务）
 interface ScheduleItem {
   id: number
-  type: 'sync' | 'etl'
+  type: 'sync' | 'etl' | 'tag'
   name: string
   description?: string
-  taskId: number  // 实际任务的id（同步任务id 或 ETL任务id）
+  taskId: number  // 实际任务的id（同步任务id、ETL任务id 或 标签任务调度id）
   taskName: string
   taskDetail: string  // 源表→目标表 或 SQL预览
   cron_expression: string
@@ -80,6 +88,7 @@ interface ScheduleItem {
   last_run_at?: string
   last_run_rows?: number
   created_at: string
+  status?: string  // 用于tag类型的状态
 }
 
 // 可调度的同步任务（未创建调度的）
@@ -101,6 +110,7 @@ interface AvailableEtlTask {
 
 export default function Scheduler() {
   const navigate = useNavigate()
+  const { user, logout } = useAuthStore()
   const [searchParams, setSearchParams] = useSearchParams()
   const [schedules, setSchedules] = useState<SyncScheduleItem[]>([])
   const [allSchedules, setAllSchedules] = useState<ScheduleItem[]>([])
@@ -266,12 +276,21 @@ export default function Scheduler() {
   const loadSchedules = async () => {
     setLoading(true)
     try {
-      // 同时加载同步调度、ETL任务和可调度任务
+      // 同时加载同步调度、ETL任务、通用调度（含标签任务）和可调度任务
       const [syncRes, etlRes, availableSyncRes] = await Promise.all([
         syncScheduleApi.list(statusFilter),
         etlApi.list(),
         syncScheduleApi.getAvailableTasks(),
       ])
+
+      // 单独加载通用调度，避免影响其他数据
+      let generalSchedulesRes: any = { data: [] }
+      try {
+        generalSchedulesRes = await scheduleApi.list()
+        console.log('通用调度数据:', generalSchedulesRes.data)
+      } catch (e) {
+        console.error('加载通用调度失败:', e)
+      }
 
       // 计算未调度任务数量：可调度同步任务 + 未调度ETL任务
       const unscheduledSyncCount = availableSyncRes.data?.length || 0
@@ -320,8 +339,35 @@ export default function Scheduler() {
           created_at: e.created_at,
         }))
 
+      // 标签任务调度（dag_id 以 tag_task_ 开头，或名称以 "标签任务-" 开头）
+      const allGeneralSchedules = generalSchedulesRes.data || []
+      console.log('所有通用调度:', allGeneralSchedules.map((s: any) => ({ id: s.id, name: s.name, dag_id: s.dag_id })))
+
+      const tagItems: ScheduleItem[] = allGeneralSchedules
+        .filter((s: any) => s.dag_id?.startsWith('tag_task_') || s.name?.startsWith('标签任务-'))
+        .map((s: any) => ({
+          id: s.id,
+          type: 'tag' as const,
+          name: s.name,
+          description: s.description,
+          taskId: s.id,
+          taskName: s.name.replace('标签任务-', ''),
+          taskDetail: s.description || 'SQL规则标签',
+          cron_expression: s.cron_expression,
+          is_enabled: s.status === 'active',
+          dag_id: s.dag_id,
+          airflow_status: s.status,
+          next_run_time: undefined,
+          last_run_at: undefined,
+          last_run_rows: undefined,
+          created_at: s.created_at,
+          status: s.status,
+        }))
+
+      console.log('标签任务调度:', tagItems)
+
       // 根据筛选条件过滤
-      let combined = [...syncItems, ...etlItems]
+      let combined = [...syncItems, ...etlItems, ...tagItems]
       if (statusFilter === 'enabled') {
         combined = combined.filter(s => s.is_enabled)
       } else if (statusFilter === 'disabled') {
@@ -720,6 +766,82 @@ export default function Scheduler() {
     }
   }
 
+  // 删除标签任务调度
+  const handleTagDelete = async (record: ScheduleItem) => {
+    if (record.is_enabled) {
+      message.warning('请先下线后再删除')
+      return
+    }
+    setDeleting(record.id)
+    try {
+      await scheduleApi.delete(record.id)
+      message.success('删除成功')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '删除失败')
+    } finally {
+      setDeleting(null)
+    }
+  }
+
+  // 标签任务编辑
+  const [tagEditModalVisible, setTagEditModalVisible] = useState(false)
+  const [editingTagSchedule, setEditingTagSchedule] = useState<ScheduleItem | null>(null)
+  const [tagEditCron, setTagEditCron] = useState('')
+
+  const handleTagOpenEditModal = (record: ScheduleItem) => {
+    setEditingTagSchedule(record)
+    setTagEditCron(record.cron_expression)
+    setTagEditModalVisible(true)
+  }
+
+  const handleTagEdit = async () => {
+    if (!editingTagSchedule) return
+    try {
+      await scheduleApi.update(editingTagSchedule.id, {
+        cron_expression: tagEditCron,
+      })
+      message.success('修改成功')
+      setTagEditModalVisible(false)
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '修改失败')
+    }
+  }
+
+  // 标签任务调度上线
+  const [tagEnabling, setTagEnabling] = useState<number | null>(null)
+  const handleTagEnable = async (record: ScheduleItem) => {
+    setTagEnabling(record.id)
+    try {
+      // 先生成DAG
+      await scheduleApi.generateDag(record.id)
+      // 再部署上线
+      await scheduleApi.deploy(record.id)
+      message.success('上线成功')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '上线失败')
+    } finally {
+      setTagEnabling(null)
+    }
+  }
+
+  // 标签任务调度下线
+  const [tagDisabling, setTagDisabling] = useState<number | null>(null)
+  const handleTagDisable = async (record: ScheduleItem) => {
+    setTagDisabling(record.id)
+    try {
+      await scheduleApi.pause(record.id)
+      message.success('下线成功')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '下线失败')
+    } finally {
+      setTagDisabling(null)
+    }
+  }
+
   // View schedule detail
   const handleView = (schedule: SyncScheduleItem) => {
     setViewSchedule(schedule)
@@ -780,7 +902,7 @@ export default function Scheduler() {
   const parseSelectedKeys = () => {
     return selectedKeys.map(key => {
       const [type, id] = key.split('-')
-      return { type: type as 'sync' | 'etl', id: parseInt(id, 10) }
+      return { type: type as 'sync' | 'etl' | 'tag', id: parseInt(id, 10) }
     })
   }
 
@@ -910,13 +1032,15 @@ export default function Scheduler() {
       title: '类型',
       key: 'type',
       width: 80,
-      render: (_: any, record: ScheduleItem) => (
-        record.type === 'sync' ? (
-          <Tag color="blue"><SyncOutlined /> 同步</Tag>
-        ) : (
-          <Tag color="purple"><CodeOutlined /> ETL</Tag>
-        )
-      ),
+      render: (_: any, record: ScheduleItem) => {
+        if (record.type === 'sync') {
+          return <Tag color="blue"><SyncOutlined /> 同步</Tag>
+        } else if (record.type === 'tag') {
+          return <Tag color="green">标签</Tag>
+        } else {
+          return <Tag color="purple"><CodeOutlined /> ETL</Tag>
+        }
+      },
     },
     {
       title: '调度名称',
@@ -946,6 +1070,8 @@ export default function Scheduler() {
           }}>
             {record.type === 'sync' ? (
               <span>{detail}</span>
+            ) : record.type === 'tag' ? (
+              <span style={{ color: '#52c41a' }}>{detail}</span>
             ) : (
               <Text code style={{ fontSize: 11 }}>{detail}</Text>
             )}
@@ -1087,6 +1213,63 @@ export default function Scheduler() {
                 />
               </Tooltip>
             </>
+          ) : record.type === 'tag' ? (
+            // 标签任务的操作
+            <>
+              <Tooltip title="查看">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={() => navigate('/tags')}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              <Tooltip title="编辑">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => handleTagOpenEditModal(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              {record.is_enabled ? (
+                <Tooltip title="下线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PauseOutlined />}
+                    loading={tagDisabling === record.id}
+                    onClick={() => handleTagDisable(record)}
+                    style={{ color: '#faad14', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              ) : (
+                <Tooltip title="上线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    loading={tagEnabling === record.id}
+                    onClick={() => handleTagEnable(record)}
+                    style={{ color: '#52c41a', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              )}
+              <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
+                <Button
+                  type="link"
+                  size="small"
+                  danger={!record.is_enabled}
+                  disabled={record.is_enabled}
+                  icon={<DeleteOutlined />}
+                  loading={deleting === record.id}
+                  onClick={() => handleTagDelete(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+            </>
           ) : (
             // ETL任务的操作
             <>
@@ -1179,17 +1362,51 @@ export default function Scheduler() {
     )
   })
 
+  const handleLogout = async () => {
+    await logout()
+    navigate('/login')
+  }
+
+  const userMenuItems = [
+    {
+      key: 'logout',
+      icon: <LogoutOutlined />,
+      label: '退出登录',
+      onClick: handleLogout,
+    },
+  ]
+
   return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-        <Space>
-          <Title level={4} style={{ margin: 0 }}>
-            <ScheduleOutlined style={{ marginRight: 8 }} />
-            调度管理
-          </Title>
-          <Tag color="green">{onlineCount} 已上线</Tag>
-          <Tag>{offlineCount} 未上线</Tag>
-        </Space>
+    <Layout style={{ minHeight: '100vh', background: '#f0f2f5' }}>
+      <Header style={{ background: '#1a1a1a', padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 28, height: 28, borderRadius: 6, background: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14 }}>
+              <ScheduleOutlined />
+            </div>
+            <span style={{ fontSize: 15, fontWeight: 600, color: '#fff' }}>调度管理</span>
+          </div>
+          <Button type="text" icon={<HomeOutlined />} onClick={() => window.open('/', '_blank')} style={{ color: 'rgba(255,255,255,0.7)' }}>
+            返回首页
+          </Button>
+        </div>
+        <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
+          <div style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Avatar size={32} icon={<UserOutlined />} style={{ background: '#722ed1' }} />
+            <span style={{ color: 'rgba(255,255,255,0.85)', fontSize: 13 }}>{user?.username || '用户'}</span>
+          </div>
+        </Dropdown>
+      </Header>
+
+      <Content style={{ padding: '24px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
+          <Space>
+            <Title level={4} style={{ margin: 0 }}>
+              任务调度列表
+            </Title>
+            <Tag color="green">{onlineCount} 已上线</Tag>
+            <Tag>{offlineCount} 未上线</Tag>
+          </Space>
         <Space>
           {selectedKeys.length > 0 && (
             <>
@@ -1366,6 +1583,8 @@ export default function Scheduler() {
             onDoubleClick: () => {
               if (record.type === 'etl') {
                 navigate(`/bigdata/etl-tasks?id=${record.taskId}`)
+              } else if (record.type === 'tag') {
+                navigate(`/tags`)  // 跳转到标签管理页面
               } else {
                 navigate(`/bigdata/data-sync?id=${record.taskId}`)
               }
@@ -2024,6 +2243,35 @@ export default function Scheduler() {
         />
       </Modal>
 
-    </div>
+      {/* 标签调度编辑弹框 */}
+      <Modal
+        title={`编辑调度 - ${editingTagSchedule?.name || ''}`}
+        open={tagEditModalVisible}
+        onCancel={() => setTagEditModalVisible(false)}
+        onOk={handleTagEdit}
+        okText="保存"
+        width={550}
+      >
+        <div style={{ marginTop: 16 }}>
+          <div style={{ marginBottom: 16, padding: 12, background: '#f5f5f5', borderRadius: 8 }}>
+            <Text strong>任务信息</Text>
+            <div style={{ marginTop: 8, fontSize: 13, color: '#666' }}>
+              <div>调度名称：{editingTagSchedule?.name}</div>
+              <div>DAG ID：{editingTagSchedule?.dag_id}</div>
+              <div>状态：{editingTagSchedule?.is_enabled ? '已上线' : '未上线'}</div>
+            </div>
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <Text strong>调度时间</Text>
+          </div>
+          <CronExpressionInput
+            value={tagEditCron}
+            onChange={(v) => setTagEditCron(v)}
+          />
+        </div>
+      </Modal>
+
+      </Content>
+    </Layout>
   )
 }

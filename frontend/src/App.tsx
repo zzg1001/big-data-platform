@@ -4,6 +4,8 @@ import MainLayout from './layouts/MainLayout'
 import Login from './pages/Login'
 import Portal from './pages/Portal'
 import TagSystem from './pages/TagSystem'
+import TagLayouts from './pages/TagLayouts'
+import Scheduler from './pages/Scheduler'
 import Dashboard from './pages/Dashboard'
 import DataSources from './pages/DataSources'
 import FileManager from './pages/FileManager'
@@ -11,7 +13,6 @@ import DataSync from './pages/DataSync'
 import FieldTemplates from './pages/FieldTemplates'
 import DataExplorer from './pages/DataExplorer'
 import EtlTasks from './pages/EtlTasks'
-import Scheduler from './pages/Scheduler'
 import Admin from './pages/Admin'
 import DwLayers from './pages/DwLayers'
 
@@ -37,6 +38,22 @@ function App() {
         element={
           <PrivateRoute>
             <TagSystem />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/tag-layouts"
+        element={
+          <PrivateRoute>
+            <TagLayouts />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/scheduler"
+        element={
+          <PrivateRoute>
+            <Scheduler />
           </PrivateRoute>
         }
       />

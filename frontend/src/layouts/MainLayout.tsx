@@ -122,7 +122,7 @@ export default function MainLayout() {
             <Button
               type="text"
               icon={<HomeOutlined />}
-              onClick={() => navigate('/')}
+              onClick={() => window.open('/', '_blank')}
             >
               返回首页
             </Button>

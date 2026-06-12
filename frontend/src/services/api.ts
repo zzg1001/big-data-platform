@@ -382,7 +382,13 @@ export const tagApi = {
     description?: string;
     parent_id?: number;
     color?: string;
-    rule_config: { datasource_id?: number; source_table: string; sql_condition?: string; full_sql?: string };
+    rule_config: {
+      datasource_id?: number;
+      source_table: string;
+      sql_condition?: string;
+      full_sql?: string;
+      composite_tags?: { id: number; name: string }[];  // 复合标签来源
+    };
   }) => api.post('/api/v1/tags/rule-tag', data),
 
   // 获取所有类型节点（用于行级标签）
@@ -407,6 +413,22 @@ export const tagApi = {
   executeRowTag: (nodeId: number, data: { batch_size?: number; ai_prompt?: string }) =>
     api.post(`/api/v1/tags/row-tag/${nodeId}/execute`, data),
 
+  // SQL规则标签
+  previewRuleSql: (sourceTable: string, aiPrompt: string) =>
+    api.post(`/api/v1/tags/rule-tag/preview-sql`, null, {
+      params: { source_table: sourceTable, ai_prompt: aiPrompt }
+    }),
+  generateRuleSql: (nodeId: number) =>
+    api.post(`/api/v1/tags/rule-tag/${nodeId}/generate-sql`),
+  executeRuleTag: (nodeId: number) =>
+    api.post(`/api/v1/tags/rule-tag/${nodeId}/execute`),
+
+  // 复合标签
+  generateCompositeSql: (data: {
+    tags: { id: number; name: string; source_table?: string; rule_config?: string }[];
+    prompt: string;
+  }) => api.post('/api/v1/tags/composite-tag/generate-sql', data),
+
   // 数据集标签
   createDatasetTag: (data: {
     name: string;
@@ -421,6 +443,14 @@ export const tagApi = {
   // 预览标签数据
   previewTagData: (nodeId: number, limit?: number) =>
     api.get(`/api/v1/tags/nodes/${nodeId}/preview`, { params: { limit } }),
+
+  // 获取任务状态
+  getRowTagStatus: (nodeId: number) =>
+    api.get(`/api/v1/tags/row-tag/${nodeId}/status`),
+
+  // 创建标签任务调度
+  createTagSchedule: (nodeId: number, cronExpression: string) =>
+    api.post(`/api/v1/tags/row-tag/${nodeId}/schedule`, null, { params: { cron_expression: cronExpression } }),
 
   // 统计
   getStatistics: () => api.get('/api/v1/tags/statistics'),

@@ -100,7 +100,7 @@ async def list_tag_nodes(
     return responses
 
 
-@router.get("/tree", response_model=List[TagNodeTree])
+@router.get("/tree")
 async def get_tag_tree(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -126,6 +126,9 @@ async def get_tag_tree(
             "level": node.level,
             "usage_count": node.usage_count,
             "rule_type": node.rule_type,
+            "rule_config": node.rule_config,
+            "source_table": node.source_table,
+            "tag_table_name": node.tag_table_name,
             "parent_id": node.parent_id,
             "children": []
         }
@@ -526,6 +529,418 @@ async def create_rule_tag(
     )
 
 
+# ==================== 规则标签执行 ====================
+
+@router.post("/rule-tag/preview-sql")
+async def preview_rule_sql(
+    source_table: str,
+    ai_prompt: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    预览AI生成的SQL（保存任务前）
+    1. 读取表的少量样本数据
+    2. 调用AI生成SQL + 提取标签
+    3. 返回SQL和标签给前端确认
+    """
+    engine, _ = await get_warehouse_engine(db)
+
+    # 获取表结构
+    table_schema = ""
+    sample_data = []
+    try:
+        with engine.connect() as conn:
+            # 获取表结构
+            desc_result = conn.execute(text(f"DESCRIBE `{source_table}`"))
+            columns = desc_result.fetchall()
+            table_schema = f"表名: {source_table}\n字段:\n"
+            for col in columns:
+                table_schema += f"  - {col[0]}: {col[1]}\n"
+
+            # 读取少量样本数据（5条）
+            sample_result = conn.execute(text(f"SELECT * FROM `{source_table}` LIMIT 5"))
+            column_names = list(sample_result.keys())
+            rows = sample_result.fetchall()
+            sample_data = [dict(zip(column_names, row)) for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取表数据失败: {str(e)}")
+
+    # 调用AI生成SQL
+    ai_assistant = AIAssistant()
+    system_prompt = """你是一个SQL专家。根据用户的自然语言描述和样本数据，生成符合条件的SQL查询。
+
+要求：
+1. 生成的SQL用于筛选数据并打上标签
+2. SELECT语句应包含原表的主要字段和一个标签字段(tag_result)
+3. 使用CASE WHEN来根据条件生成标签值
+4. 确保SQL语法正确，可以直接执行
+5. SQL要能覆盖所有数据行，不符合条件的也要有默认标签
+
+返回格式（JSON）：
+{
+  "sql": "SELECT ... FROM ...",
+  "tags": ["标签1", "标签2", "其他"],
+  "tag_field": "tag_result"
+}
+
+只返回JSON，不要其他解释。"""
+
+    # 格式化样本数据
+    sample_text = "样本数据:\n"
+    for i, row in enumerate(sample_data):
+        sample_text += f"  第{i+1}行: {json.dumps(row, ensure_ascii=False, default=str)}\n"
+
+    user_prompt = f"""
+表结构:
+{table_schema}
+
+{sample_text}
+
+用户需求:
+{ai_prompt}
+
+请生成SQL并提取标签列表。
+"""
+
+    try:
+        ai_response = ai_assistant._call_claude(system_prompt, user_prompt)
+
+        # 解析JSON响应
+        response_text = ai_response.strip()
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        try:
+            result = json.loads(response_text)
+            generated_sql = result.get("sql", "")
+            extracted_tags = result.get("tags", [])
+            tag_field = result.get("tag_field", "tag_result")
+        except json.JSONDecodeError:
+            # 如果不是JSON，尝试提取SQL
+            generated_sql = response_text
+            if "```sql" in generated_sql:
+                generated_sql = generated_sql.split("```sql")[1].split("```")[0].strip()
+            # 从SQL中提取标签
+            extracted_tags = []
+            import re
+            then_matches = re.findall(r"THEN\s+['\"]([^'\"]+)['\"]", generated_sql, re.IGNORECASE)
+            else_matches = re.findall(r"ELSE\s+['\"]([^'\"]+)['\"]", generated_sql, re.IGNORECASE)
+            extracted_tags = list(set(then_matches + else_matches))
+            tag_field = "tag_result"
+
+        return {
+            "sql": generated_sql,
+            "tags": extracted_tags,
+            "tag_field": tag_field,
+            "sample_data": sample_data,
+            "table_schema": table_schema
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI生成SQL失败: {str(e)}")
+
+
+@router.post("/rule-tag/{node_id}/generate-sql")
+async def generate_rule_sql(
+    node_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    根据AI提示词生成SQL
+    如果rule_config中的full_sql以 '-- AI_PROMPT:' 开头，则调用AI生成SQL
+    """
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    node = result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail="标签节点不存在")
+    if node.rule_type != "sql":
+        raise HTTPException(status_code=400, detail="该标签不是SQL规则标签")
+
+    config = json.loads(node.rule_config) if node.rule_config else {}
+    full_sql = config.get("full_sql", "")
+
+    # 检查是否是AI提示词
+    if not full_sql.startswith("-- AI_PROMPT:"):
+        return {"sql": full_sql, "generated": False}
+
+    # 提取AI提示词
+    ai_prompt = full_sql.replace("-- AI_PROMPT:", "").split("\n")[0].strip()
+    source_table = config.get("source_table", "")
+
+    # 获取表结构
+    engine, _ = await get_warehouse_engine(db)
+    table_schema = ""
+    try:
+        with engine.connect() as conn:
+            desc_result = conn.execute(text(f"DESCRIBE `{source_table}`"))
+            columns = desc_result.fetchall()
+            table_schema = f"表名: {source_table}\n字段:\n"
+            for col in columns:
+                table_schema += f"  - {col[0]}: {col[1]}\n"
+    except Exception as e:
+        table_schema = f"表名: {source_table} (无法获取结构: {e})"
+
+    # 调用AI生成SQL
+    ai_assistant = AIAssistant()
+    system_prompt = """你是一个SQL专家。根据用户的自然语言描述，生成符合条件的SQL查询。
+要求：
+1. 生成的SQL用于筛选数据并打上标签
+2. SELECT语句应包含原表的主要字段和一个标签字段
+3. 使用CASE WHEN来根据条件生成标签值
+4. 只返回SQL语句，不要其他解释"""
+
+    user_prompt = f"""
+表结构:
+{table_schema}
+
+用户需求:
+{ai_prompt}
+
+请生成SQL，格式类似:
+SELECT *, CASE WHEN 条件 THEN '标签A' WHEN 条件 THEN '标签B' ELSE '其他' END AS tag_result
+FROM {source_table}
+"""
+
+    try:
+        ai_response = ai_assistant._call_claude(system_prompt, user_prompt)
+        # 提取SQL
+        generated_sql = ai_response.strip()
+        if "```sql" in generated_sql:
+            generated_sql = generated_sql.split("```sql")[1].split("```")[0].strip()
+        elif "```" in generated_sql:
+            generated_sql = generated_sql.split("```")[1].split("```")[0].strip()
+
+        # 更新rule_config
+        config["full_sql"] = generated_sql
+        config["ai_prompt"] = ai_prompt
+        node.rule_config = json.dumps(config, ensure_ascii=False)
+        node.ai_generated = True
+        await db.flush()
+
+        return {"sql": generated_sql, "generated": True, "prompt": ai_prompt}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI生成SQL失败: {str(e)}")
+
+
+@router.post("/rule-tag/{node_id}/execute")
+async def execute_rule_tag(
+    node_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    执行SQL规则标签
+    执行SQL并将结果写入新表
+    """
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    node = result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail="标签节点不存在")
+    if node.rule_type != "sql":
+        raise HTTPException(status_code=400, detail="该标签不是SQL规则标签")
+
+    config = json.loads(node.rule_config) if node.rule_config else {}
+    full_sql = config.get("full_sql", "")
+
+    # 如果是AI提示词，先生成SQL
+    if full_sql.startswith("-- AI_PROMPT:"):
+        raise HTTPException(status_code=400, detail="请先生成SQL（点击'生成SQL'按钮）")
+
+    if not full_sql:
+        raise HTTPException(status_code=400, detail="SQL规则为空")
+
+    # 生成目标表名
+    if not node.tag_table_name:
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', node.name.lower())
+        target_table = f"rule_tag_{safe_name}_{int(__import__('time').time())}"
+        node.tag_table_name = target_table
+        await db.flush()
+    else:
+        target_table = node.tag_table_name
+
+    engine, _ = await get_warehouse_engine(db)
+
+    try:
+        with engine.connect() as conn:
+            # 创建目标表并插入数据
+            create_sql = f"CREATE TABLE IF NOT EXISTS `{target_table}` AS {full_sql}"
+            conn.execute(text(create_sql))
+            conn.commit()
+
+            # 获取结果数量
+            count_result = conn.execute(text(f"SELECT COUNT(*) FROM `{target_table}`"))
+            count = count_result.scalar() or 0
+
+        # 更新使用计数
+        node.usage_count = count
+        await db.flush()
+
+        return {
+            "message": "SQL规则执行成功",
+            "target_table": target_table,
+            "row_count": count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"执行失败: {str(e)}")
+
+
+# ==================== 复合智能标签 ====================
+
+from pydantic import BaseModel
+
+class CompositeTagInfo(BaseModel):
+    id: int
+    name: str
+    source_table: Optional[str] = None
+    rule_config: Optional[str] = None
+
+class CompositeTagRequest(BaseModel):
+    tags: List[CompositeTagInfo]
+    prompt: str
+
+@router.post("/composite-tag/generate-sql")
+async def generate_composite_sql(
+    data: CompositeTagRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    为复合智能标签生成关联SQL
+    1. 获取所选标签的源表信息
+    2. 调用AI分析表结构并生成关联SQL
+    """
+    if len(data.tags) < 2:
+        raise HTTPException(status_code=400, detail="请至少选择两个标签")
+
+    engine, _ = await get_warehouse_engine(db)
+
+    # 收集所有标签的表信息
+    tables_info = []
+    for tag_info in data.tags:
+        # 获取完整的标签节点信息
+        result = await db.execute(select(TagNode).filter(TagNode.id == tag_info.id))
+        node = result.scalars().first()
+        if not node:
+            continue
+
+        # 解析source_table
+        source_table = node.source_table
+        tag_table = node.tag_table_name
+
+        if not source_table and node.rule_config:
+            try:
+                config = json.loads(node.rule_config)
+                source_table = config.get("source_table", "")
+            except:
+                pass
+
+        # 获取表结构
+        table_to_describe = tag_table or source_table
+        if table_to_describe:
+            try:
+                with engine.connect() as conn:
+                    desc_result = conn.execute(text(f"DESCRIBE `{table_to_describe}`"))
+                    columns = desc_result.fetchall()
+                    column_info = [{"name": col[0], "type": col[1]} for col in columns]
+
+                    # 获取少量样本数据
+                    sample_result = conn.execute(text(f"SELECT * FROM `{table_to_describe}` LIMIT 3"))
+                    sample_rows = [dict(zip([c[0] for c in columns], row)) for row in sample_result.fetchall()]
+
+                    tables_info.append({
+                        "tag_id": node.id,
+                        "tag_name": node.name,
+                        "source_table": source_table,
+                        "tag_table": tag_table,
+                        "table_used": table_to_describe,
+                        "columns": column_info,
+                        "sample_data": sample_rows,
+                        "rule_type": node.rule_type,
+                    })
+            except Exception as e:
+                tables_info.append({
+                    "tag_id": node.id,
+                    "tag_name": node.name,
+                    "source_table": source_table,
+                    "tag_table": tag_table,
+                    "error": str(e),
+                })
+
+    if len(tables_info) < 2:
+        raise HTTPException(status_code=400, detail="无法获取足够的表信息，请确保选择的标签有关联的表")
+
+    # 构建AI提示
+    ai_assistant = AIAssistant()
+
+    # 表结构描述
+    tables_description = []
+    for info in tables_info:
+        if "error" in info:
+            tables_description.append(f"标签 '{info['tag_name']}': 无法获取表结构 ({info['error']})")
+        else:
+            cols_desc = ", ".join([f"{c['name']}({c['type']})" for c in info['columns']])
+            sample_str = json.dumps(info['sample_data'], ensure_ascii=False, default=str) if info['sample_data'] else "无样本数据"
+            tables_description.append(f"""
+标签: {info['tag_name']}
+表名: {info['table_used']}
+字段: {cols_desc}
+样本数据: {sample_str}
+""")
+
+    system_prompt = """你是一个SQL专家。根据用户提供的多个标签表信息和组合逻辑，生成一个将这些表关联起来的SQL查询。
+
+要求：
+1. 分析表结构，找出可能的关联字段（如id、user_id、order_id等）
+2. 根据用户描述的组合逻辑生成合适的JOIN查询
+3. SELECT子句应包含有意义的字段，并添加一个composite_tag标签字段
+4. 使用CASE WHEN来根据条件生成复合智能标签值
+5. 如果用户描述的是交集，使用INNER JOIN；如果是并集，使用FULL OUTER JOIN或UNION
+6. 确保SQL语法正确，可以直接执行
+
+只返回SQL语句，不要其他解释。SQL应该以注释开头说明关联逻辑。"""
+
+    user_prompt = f"""
+以下是需要组合的标签表信息：
+
+{chr(10).join(tables_description)}
+
+用户描述的组合逻辑：
+{data.prompt}
+
+请生成关联SQL，将这些表组合成一个复合视图。
+"""
+
+    try:
+        ai_response = ai_assistant._call_claude(system_prompt, user_prompt)
+
+        # 提取SQL
+        generated_sql = ai_response.strip()
+        if "```sql" in generated_sql:
+            generated_sql = generated_sql.split("```sql")[1].split("```")[0].strip()
+        elif "```" in generated_sql:
+            generated_sql = generated_sql.split("```")[1].split("```")[0].strip()
+
+        # 添加注释头
+        sql_header = f"""-- 复合智能标签SQL
+-- 组合标签: {', '.join([t['tag_name'] for t in tables_info if 'tag_name' in t])}
+-- 涉及表: {', '.join([t['table_used'] for t in tables_info if 'table_used' in t])}
+-- 组合逻辑: {data.prompt[:100]}{'...' if len(data.prompt) > 100 else ''}
+--
+"""
+        full_sql = sql_header + generated_sql
+
+        return {
+            "sql": full_sql,
+            "tables_info": tables_info,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI生成SQL失败: {str(e)}")
+
+
 # ==================== 统计 ====================
 
 @router.get("/statistics", response_model=TagStatistics)
@@ -554,17 +969,39 @@ async def get_tag_statistics(
     result = await db.execute(select(func.count(TagData.id)))
     total_tagged_data = result.scalar() or 0
 
-    # AI生成数
+    # 获取所有SQL规则类型的标签，根据rule_config分类统计
     result = await db.execute(
-        select(func.count(TagNode.id)).filter(TagNode.ai_generated == True, TagNode.is_active == True)
+        select(TagNode).filter(TagNode.rule_type == "sql", TagNode.is_active == True)
     )
-    ai_generated_count = result.scalar() or 0
+    sql_nodes = result.scalars().all()
 
-    # 规则标签数
-    result = await db.execute(
-        select(func.count(TagNode.id)).filter(TagNode.rule_type != None, TagNode.is_active == True)
-    )
-    rule_tag_count = result.scalar() or 0
+    ai_generated_count = 0  # AI打标任务
+    rule_tag_count = 0  # 普通SQL规则
+    composite_tag_count = 0  # 复合智能标签
+    graph_tag_count = 0  # Graph Intelligence任务
+
+    for node in sql_nodes:
+        if node.rule_config:
+            try:
+                config = json.loads(node.rule_config)
+                full_sql = config.get("full_sql", "")
+                source = config.get("source", "")
+                # Graph Intelligence: source === 'graph'
+                if source == "graph":
+                    graph_tag_count += 1
+                # 复合智能标签：有composite_tags字段
+                elif config.get("composite_tags"):
+                    composite_tag_count += 1
+                # AI打标：full_sql以 "-- TAGS:" 开头 或 source === 'ai'
+                elif full_sql.startswith("-- TAGS:") or source == "ai":
+                    ai_generated_count += 1
+                # 其他为普通SQL规则
+                else:
+                    rule_tag_count += 1
+            except:
+                rule_tag_count += 1
+        else:
+            rule_tag_count += 1
 
     # Top标签
     result = await db.execute(
@@ -582,6 +1019,8 @@ async def get_tag_statistics(
         total_tagged_data=total_tagged_data,
         ai_generated_count=ai_generated_count,
         rule_tag_count=rule_tag_count,
+        composite_tag_count=composite_tag_count,
+        graph_tag_count=graph_tag_count,
         top_tags=top_tags
     )
 
@@ -1136,4 +1575,136 @@ async def preview_tag_data(
         "columns": columns,
         "rows": rows,
         "total": total
+    }
+
+
+# ==================== 调度集成 ====================
+
+@router.get("/row-tag/{node_id}/status")
+async def get_row_tag_status(
+    node_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取行级标签任务的状态"""
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    node = result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail="标签节点不存在")
+    if node.rule_type != "row":
+        raise HTTPException(status_code=400, detail="该标签不是行级标签")
+
+    # 获取打标数据量
+    data_count = 0
+    if node.tag_table_name:
+        try:
+            engine, _ = await get_warehouse_engine(db)
+            with engine.connect() as conn:
+                count_result = conn.execute(text(f"SELECT COUNT(*) FROM `{node.tag_table_name}`"))
+                data_count = count_result.scalar() or 0
+        except:
+            pass
+
+    return {
+        "node_id": node.id,
+        "name": node.name,
+        "source_table": node.source_table,
+        "target_table": node.tag_table_name,
+        "usage_count": node.usage_count,
+        "data_count": data_count,
+        "last_updated": node.updated_at.isoformat() if node.updated_at else None,
+    }
+
+
+@router.post("/row-tag/{node_id}/schedule")
+async def create_tag_schedule(
+    node_id: int,
+    cron_expression: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    为标签任务创建调度
+    支持行级标签(row)和SQL规则标签(sql)两种类型
+    这会在 Schedule 表中创建一条记录，并生成对应的 Airflow DAG
+    """
+    from app.models.schedule import Schedule, ScheduleStatus
+    from app.services.dag_generator import DAGGenerator
+
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    node = result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail="标签节点不存在")
+    if node.rule_type not in ("row", "sql"):
+        raise HTTPException(status_code=400, detail="该标签类型不支持调度")
+
+    # 创建调度记录 - 使用node.id确保唯一性，避免中文名称被sanitize后丢失
+    dag_generator = DAGGenerator()
+    dag_id = f"tag_task_{node.id}"
+
+    # 检查是否已存在
+    existing = await db.execute(select(Schedule).filter(Schedule.dag_id == dag_id))
+    if existing.scalars().first():
+        raise HTTPException(status_code=400, detail="该任务已存在调度")
+
+    # 根据规则类型生成不同的SQL内容
+    if node.rule_type == "sql":
+        # SQL规则标签：直接执行存储的SQL
+        config = json.loads(node.rule_config) if node.rule_config else {}
+        full_sql = config.get("full_sql", "")
+        if not full_sql or full_sql.startswith("-- AI_PROMPT:"):
+            raise HTTPException(status_code=400, detail="SQL规则尚未确认，请先生成并确认SQL")
+
+        sql_content = f"""-- SQL规则标签调度
+-- 任务ID: {node.id}
+-- 任务名称: {node.name}
+-- 源表: {node.source_table}
+-- 目标表: {node.tag_table_name or 'auto_generated'}
+--
+-- 此任务通过 HTTP API 执行:
+-- POST /api/v1/tags/rule-tag/{node.id}/execute
+--
+-- SQL规则内容:
+{full_sql}
+"""
+        description = f"SQL规则标签自动调度: {node.description or node.name}"
+        execute_endpoint = f"rule-tag/{node.id}/execute"
+    else:
+        # 行级标签：调用AI打标
+        sql_content = f"""-- AI打标任务调度
+-- 任务ID: {node.id}
+-- 任务名称: {node.name}
+-- 源表: {node.source_table}
+-- 目标表: {node.tag_table_name}
+--
+-- 此任务通过 HTTP API 执行:
+-- POST /api/v1/tags/row-tag/{node.id}/execute
+--
+-- 执行逻辑: 读取源表数据，调用AI进行打标，结果写入目标表
+SELECT 'tag_task_{node.id}' as task_type;
+"""
+        description = f"AI打标任务自动调度: {node.description or node.name}"
+        execute_endpoint = f"row-tag/{node.id}/execute"
+
+    schedule = Schedule(
+        name=f"标签任务-{node.name}",
+        description=description,
+        dag_id=dag_id,
+        cron_expression=cron_expression,
+        sql_content=sql_content,
+        datasource_id=node.source_datasource_id,
+        status=ScheduleStatus.DRAFT,
+        created_by=current_user.id,
+    )
+    db.add(schedule)
+    await db.flush()
+    await db.refresh(schedule)
+
+    return {
+        "message": "调度创建成功",
+        "schedule_id": schedule.id,
+        "dag_id": dag_id,
+        "cron_expression": cron_expression,
+        "rule_type": node.rule_type,
+        "execute_endpoint": execute_endpoint,
     }

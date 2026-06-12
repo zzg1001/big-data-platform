@@ -64,11 +64,14 @@ class TagNodeTree(BaseModel):
     name: str
     description: Optional[str] = None
     node_type: str
-    color: str
+    color: Optional[str] = None
     icon: Optional[str] = None
     level: int
     usage_count: int = 0
     rule_type: Optional[str] = None
+    rule_config: Optional[str] = None  # 规则配置JSON
+    source_table: Optional[str] = None  # 源表
+    tag_table_name: Optional[str] = None  # 标签结果表
     children: List["TagNodeTree"] = []
 
 
@@ -100,12 +103,19 @@ class TagDataResponse(BaseModel):
 
 # ==================== 规则标签 ====================
 
+class CompositeTagRef(BaseModel):
+    """复合智能标签来源引用"""
+    id: int
+    name: str
+
+
 class RuleTagConfig(BaseModel):
     """规则标签配置"""
     datasource_id: Optional[int] = None  # 为空时使用平台仓库
     source_table: str
     sql_condition: Optional[str] = None  # WHERE条件
     full_sql: Optional[str] = None  # 完整SQL
+    composite_tags: Optional[List[CompositeTagRef]] = None  # 复合智能标签来源
 
 
 class RuleTagCreate(BaseModel):
@@ -212,6 +222,8 @@ class TagStatistics(BaseModel):
     category_count: int
     tag_count: int
     total_tagged_data: int
-    ai_generated_count: int
-    rule_tag_count: int
+    ai_generated_count: int  # AI打标任务数
+    rule_tag_count: int  # SQL规则任务数（不含AI打标和复合智能标签）
+    composite_tag_count: int = 0  # 复合智能标签任务数
+    graph_tag_count: int = 0  # Graph Intelligence任务数
     top_tags: List[dict]

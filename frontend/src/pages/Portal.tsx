@@ -10,6 +10,7 @@ import {
   RobotOutlined,
   QuestionCircleOutlined,
   BellOutlined,
+  ScheduleOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 
@@ -25,7 +26,7 @@ interface ModuleCardProps {
 const modules: ModuleCardProps[] = [
   {
     title: '智能数据开发',
-    description: '自然语言查询 · 智能 SQL · ETL 编排 · 调度管理',
+    description: '自然语言查询 · 智能 SQL · ETL 编排 · 数据同步',
     icon: <DatabaseOutlined />,
     path: '/bigdata',
     iconBg: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
@@ -36,6 +37,13 @@ const modules: ModuleCardProps[] = [
     icon: <TagsOutlined />,
     path: '/tags',
     iconBg: 'linear-gradient(135deg, #11998e 0%, #38ef7d 100%)',
+  },
+  {
+    title: '调度管理',
+    description: '任务调度 · DAG 编排 · 定时执行 · 运行监控',
+    icon: <ScheduleOutlined />,
+    path: '/scheduler',
+    iconBg: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
   },
   {
     title: '数据资产管理',
