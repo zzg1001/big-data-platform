@@ -106,6 +106,8 @@ async def get_tag_tree(
     current_user: User = Depends(get_current_user)
 ):
     """获取完整的标签树"""
+    from app.models.schedule import Schedule, ScheduleStatus
+
     result = await db.execute(
         select(TagNode)
         .filter(TagNode.is_active == True)
@@ -113,9 +115,19 @@ async def get_tag_tree(
     )
     all_nodes = result.scalars().all()
 
+    # 查询已上线的标签调度（dag_id 以 tag_task_ 开头且状态为 ACTIVE）
+    schedule_result = await db.execute(
+        select(Schedule.dag_id)
+        .filter(Schedule.dag_id.like("tag_task_%"))
+        .filter(Schedule.status == ScheduleStatus.ACTIVE)
+    )
+    deployed_dag_ids = {row[0] for row in schedule_result.fetchall()}
+
     # 构建树
     node_map = {}
     for node in all_nodes:
+        # 判断是否已上线
+        is_scheduled = f"tag_task_{node.id}" in deployed_dag_ids
         node_map[node.id] = {
             "id": node.id,
             "name": node.name,
@@ -130,6 +142,7 @@ async def get_tag_tree(
             "source_table": node.source_table,
             "tag_table_name": node.tag_table_name,
             "parent_id": node.parent_id,
+            "is_scheduled": is_scheduled,
             "children": []
         }
 

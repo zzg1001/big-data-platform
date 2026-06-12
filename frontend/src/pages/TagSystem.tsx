@@ -62,6 +62,7 @@ import {
   PicCenterOutlined,
   DeploymentUnitOutlined,
   BranchesOutlined,
+  CheckCircleOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 import { tagApi, warehouseApi, scheduleApi, aiApi } from '../services/api'
@@ -89,6 +90,7 @@ interface TagTask {
   updated_at: string
   rule_config?: string
   color?: string
+  is_scheduled?: boolean
 }
 
 // 画布上的节点
@@ -983,9 +985,18 @@ export default function TagSystem() {
     setPreviewVisible(true)
     try {
       const res = await tagApi.previewTagData(task.id, 100)
-      setPreviewData(res.data || [])
-    } catch (error) {
-      message.error('加载预览数据失败')
+      // 将 {columns, rows} 格式转换为对象数组
+      const { columns = [], rows = [] } = res.data || {}
+      const formattedData = rows.map((row: any[]) => {
+        const obj: Record<string, any> = {}
+        columns.forEach((col: string, index: number) => {
+          obj[col] = row[index]
+        })
+        return obj
+      })
+      setPreviewData(formattedData)
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '加载预览数据失败')
     } finally {
       setPreviewLoading(false)
     }
@@ -998,23 +1009,32 @@ export default function TagSystem() {
     setScheduleModalVisible(true)
   }
 
-  // 创建调度任务
+  // 创建调度任务并直接上线
   const handleCreateSchedule = async () => {
     if (!schedulingTask) return
     setSchedulingLoading(true)
     try {
-      // 使用专门的标签调度API
+      // 使用专门的标签调度API创建调度
       const res = await tagApi.createTagSchedule(schedulingTask.id, cronExpression)
-      message.success(res.data?.message || '调度任务创建成功')
+      const scheduleId = res.data?.schedule_id
+
+      // 自动部署上线
+      if (scheduleId) {
+        await scheduleApi.deploy(scheduleId)
+      }
+
+      message.success('上线成功')
       setScheduleModalVisible(false)
-      // 可选：跳转到调度管理页面
+      // 刷新任务列表以更新按钮状态
+      loadTasks()
+      // 可选：跳转到调度管理页面查看
       Modal.confirm({
-        title: '调度创建成功',
-        content: `已创建调度任务 (DAG: ${res.data?.dag_id})，是否前往调度管理页面部署？`,
+        title: '上线成功',
+        content: `任务已上线 (DAG: ${res.data?.dag_id})，是否前往调度管理页面查看？`,
         onOk: () => navigate('/bigdata/scheduler'),
       })
     } catch (error: any) {
-      message.error(error.response?.data?.detail || '创建调度失败')
+      message.error(error.response?.data?.detail || '上线失败')
     } finally {
       setSchedulingLoading(false)
     }
@@ -1459,14 +1479,26 @@ export default function TagSystem() {
               预览
             </Button>
             {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
-              <Button
-                type="link"
-                size="small"
-                icon={<ScheduleOutlined />}
-                onClick={() => handleOpenSchedule(record)}
-              >
-                调度
-              </Button>
+              record.is_scheduled ? (
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<CheckCircleOutlined />}
+                  disabled
+                  style={{ color: '#52c41a' }}
+                >
+                  已上线
+                </Button>
+              ) : (
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<ScheduleOutlined />}
+                  onClick={() => handleOpenSchedule(record)}
+                >
+                  上线
+                </Button>
+              )
             )}
             <Button
               type="link"
@@ -1482,49 +1514,105 @@ export default function TagSystem() {
       },
     ]
 
+    // 获取当前视图的配色
+    const viewColors: Record<string, { primary: string; bg: string; icon: React.ReactNode }> = {
+      ai: { primary: '#1890ff', bg: 'linear-gradient(135deg, #1890ff 0%, #096dd9 100%)', icon: <RobotOutlined /> },
+      sql: { primary: '#52c41a', bg: 'linear-gradient(135deg, #52c41a 0%, #389e0d 100%)', icon: <FileTextOutlined /> },
+      composite: { primary: '#eb2f96', bg: 'linear-gradient(135deg, #eb2f96 0%, #c41d7f 100%)', icon: <MergeCellsOutlined /> },
+      dataset: { primary: '#722ed1', bg: 'linear-gradient(135deg, #722ed1 0%, #531dab 100%)', icon: <DatabaseOutlined /> },
+    }
+    const currentColors = viewColors[currentView || ''] || viewColors.ai
+
     return (
-      <div style={{ padding: '20px 40px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 24 }}>
-          <Button
-            type="text"
-            icon={<LeftOutlined />}
-            onClick={() => setCurrentView(null)}
-            style={{ marginRight: 16 }}
-          >
-            返回
-          </Button>
-          <Title level={4} style={{ margin: 0 }}>{viewTitle}</Title>
-          <div style={{ flex: 1 }} />
-          {currentView === 'ai' && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={handleOpenCreate}>
-              新建任务
+      <div style={{ padding: '16px 24px', height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {/* 页面头部 */}
+        <div style={{
+          background: currentColors.bg,
+          borderRadius: 10,
+          padding: '12px 20px',
+          marginBottom: 12,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexShrink: 0,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <Button
+              type="text"
+              icon={<LeftOutlined />}
+              onClick={() => setCurrentView(null)}
+              style={{ color: 'rgba(255,255,255,0.85)' }}
+            >
+              返回
             </Button>
-          )}
-          {currentView === 'sql' && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => {
-              setEditorSql('')
-              setEditorResult(null)
-              setEditorSelectedTable(null)
-              setCurrentView('sql-editor')
+            <div style={{
+              width: 32,
+              height: 32,
+              borderRadius: 8,
+              background: 'rgba(255,255,255,0.2)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              fontSize: 16,
             }}>
-              新建任务
-            </Button>
-          )}
-          {currentView === 'composite' && (
-            <Button type="primary" icon={<MergeCellsOutlined />} onClick={handleOpenCompositeCreate}>
-              新建复合智能标签
-            </Button>
-          )}
+              {currentColors.icon}
+            </div>
+            <div>
+              <Title level={5} style={{ margin: 0, color: '#fff', fontSize: 15 }}>{viewTitle}</Title>
+              <Text style={{ color: 'rgba(255,255,255,0.75)', fontSize: 12 }}>
+                共 {tasks.length} 个任务
+              </Text>
+            </div>
+          </div>
+          <div>
+            {currentView === 'ai' && (
+              <Button size="small" type="primary" icon={<PlusOutlined />} onClick={handleOpenCreate}
+                style={{ background: 'rgba(255,255,255,0.2)', borderColor: 'transparent' }}>
+                新建任务
+              </Button>
+            )}
+            {currentView === 'sql' && (
+              <Button size="small" type="primary" icon={<PlusOutlined />} onClick={() => {
+                setEditorSql('')
+                setEditorResult(null)
+                setEditorSelectedTable(null)
+                setCurrentView('sql-editor')
+              }} style={{ background: 'rgba(255,255,255,0.2)', borderColor: 'transparent' }}>
+                新建任务
+              </Button>
+            )}
+            {currentView === 'composite' && (
+              <Button size="small" type="primary" icon={<MergeCellsOutlined />} onClick={handleOpenCompositeCreate}
+                style={{ background: 'rgba(255,255,255,0.2)', borderColor: 'transparent' }}>
+                新建复合智能标签
+              </Button>
+            )}
+          </div>
         </div>
 
-        <div style={{ background: '#fff', borderRadius: 8, padding: 16 }}>
+        {/* 表格容器 */}
+        <div style={{
+          background: '#fff',
+          borderRadius: 10,
+          flex: 1,
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }}>
           <Table
             dataSource={tasks}
             columns={columns}
             rowKey="id"
             loading={loading}
-            pagination={{ pageSize: 10 }}
-            locale={{ emptyText: <Empty description="暂无任务" /> }}
+            size="small"
+            pagination={{
+              pageSize: 15,
+              showTotal: (total) => `共 ${total} 条`,
+              size: 'small',
+            }}
+            locale={{ emptyText: <Empty description="暂无任务，点击右上角创建" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
+            scroll={{ y: 'calc(100vh - 240px)' }}
           />
         </div>
       </div>
@@ -1543,31 +1631,55 @@ export default function TagSystem() {
     return (
       <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
         {/* 顶部工具栏 */}
-        <div style={{ padding: '12px 20px', background: '#fff', borderBottom: '1px solid #e8e8e8', display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0 }}>
-          <Button type="text" icon={<LeftOutlined />} onClick={() => setCurrentView(null)}>
+        <div style={{
+          padding: '8px 16px',
+          background: '#fff',
+          borderBottom: '1px solid #e8e8e8',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          flexShrink: 0,
+        }}>
+          <Button type="text" size="small" icon={<LeftOutlined />} onClick={() => setCurrentView(null)}>
             返回
           </Button>
-          <Title level={5} style={{ margin: 0 }}>标签管理</Title>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{
+              width: 24,
+              height: 24,
+              borderRadius: 5,
+              background: 'linear-gradient(135deg, #fa8c16 0%, #fa541c 100%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              fontSize: 12,
+            }}>
+              <TagOutlined />
+            </div>
+            <Text strong style={{ fontSize: 14 }}>标签管理</Text>
+          </div>
           <div style={{ flex: 1 }} />
           {connectingFrom !== null && (
-            <Tag color="processing">连线模式：点击目标节点完成连接，或再次点击取消</Tag>
+            <Tag color="processing" style={{ fontSize: 11 }}>
+              连线模式：点击目标节点完成连接
+            </Tag>
           )}
-          <Tooltip title="查看已保存布局">
-            <Button icon={<FolderOpenOutlined />} onClick={handleGoToLayouts}>已保存</Button>
-          </Tooltip>
-          <Tooltip title="保存当前布局">
-            <Button
-              type="primary"
-              icon={<SaveOutlined />}
-              onClick={() => setSaveModalVisible(true)}
-              disabled={canvasNodes.length === 0}
-            >
-              保存布局
-            </Button>
-          </Tooltip>
-          <Tooltip title="新建标签">
-            <Button icon={<PlusOutlined />} onClick={() => handleOpenTagCreate()}>新建标签</Button>
-          </Tooltip>
+          <Button size="small" icon={<FolderOpenOutlined />} onClick={handleGoToLayouts}>已保存</Button>
+          <Button
+            size="small"
+            type="primary"
+            icon={<SaveOutlined />}
+            onClick={() => setSaveModalVisible(true)}
+            disabled={canvasNodes.length === 0}
+            style={{ background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', borderColor: 'transparent' }}
+          >
+            保存布局
+          </Button>
+          <Button size="small" type="primary" icon={<PlusOutlined />} onClick={() => handleOpenTagCreate()}
+            style={{ background: 'linear-gradient(135deg, #52c41a 0%, #389e0d 100%)', borderColor: 'transparent' }}>
+            新建标签
+          </Button>
         </div>
 
         <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
@@ -2485,28 +2597,51 @@ export default function TagSystem() {
   // 预览弹框
   const renderPreviewModal = () => (
     <Modal
-      title="数据预览"
+      title={
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{
+            width: 28,
+            height: 28,
+            borderRadius: 6,
+            background: 'linear-gradient(135deg, #1890ff 0%, #096dd9 100%)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#fff',
+            fontSize: 14,
+          }}>
+            <EyeOutlined />
+          </div>
+          <span>数据预览</span>
+        </div>
+      }
       open={previewVisible}
       onCancel={() => setPreviewVisible(false)}
       footer={null}
-      width={800}
+      width={900}
     >
       <Spin spinning={previewLoading}>
         {previewData.length > 0 ? (
-          <Table
-            dataSource={previewData}
-            columns={Object.keys(previewData[0] || {}).map((key) => ({
-              title: key,
-              dataIndex: key,
-              key,
-              ellipsis: true,
-            }))}
-            rowKey={(_, index) => String(index)}
-            scroll={{ x: 'max-content' }}
-            pagination={{ pageSize: 10 }}
-          />
+          <>
+            <div style={{ marginBottom: 12, color: '#666', fontSize: 13 }}>
+              共 {previewData.length} 条数据
+            </div>
+            <Table
+              dataSource={previewData}
+              columns={Object.keys(previewData[0] || {}).map((key) => ({
+                title: key,
+                dataIndex: key,
+                key,
+                ellipsis: true,
+              }))}
+              rowKey={(_, index) => String(index)}
+              scroll={{ x: 'max-content' }}
+              pagination={{ pageSize: 10, showSizeChanger: true }}
+              size="small"
+            />
+          </>
         ) : (
-          <Empty description="暂无数据" />
+          <Empty description="暂无数据" style={{ padding: '40px 0' }} />
         )}
       </Spin>
     </Modal>
@@ -3307,23 +3442,58 @@ export default function TagSystem() {
   }
 
   return (
-    <Layout style={{ height: '100vh', background: '#f0f2f5' }}>
-      <Header style={{ background: '#1a1a1a', padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{ width: 28, height: 28, borderRadius: 6, background: 'linear-gradient(135deg, #11998e 0%, #38ef7d 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14 }}>
+    <Layout style={{ height: '100vh', background: '#f5f7fa' }}>
+      <Header style={{
+        background: 'linear-gradient(90deg, #1a1a2e 0%, #16213e 100%)',
+        padding: '0 24px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        boxShadow: '0 1px 4px rgba(0,0,0,0.1)',
+        height: 48,
+        lineHeight: '48px',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setCurrentView(null)}>
+            <div style={{
+              width: 26,
+              height: 26,
+              borderRadius: 6,
+              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              fontSize: 13,
+            }}>
               <TagsOutlined />
             </div>
-            <span style={{ fontSize: 15, fontWeight: 600, color: '#fff' }}>标签管理平台</span>
+            <span style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>标签管理平台</span>
           </div>
-          <Button type="text" icon={<HomeOutlined />} onClick={() => window.open('/', '_blank')} style={{ color: 'rgba(255,255,255,0.7)' }}>
-            返回首页
+          <div style={{ height: 16, width: 1, background: 'rgba(255,255,255,0.15)' }} />
+          <Button
+            type="text"
+            size="small"
+            icon={<HomeOutlined />}
+            onClick={() => window.open('/', '_blank')}
+            style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12 }}
+          >
+            数据平台首页
           </Button>
         </div>
         <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
-          <div style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Avatar size={26} icon={<UserOutlined />} style={{ background: '#11998e' }} />
-            <span style={{ color: '#fff', fontSize: 13 }}>{user?.username || 'User'}</span>
+          <div style={{
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '4px 10px',
+            borderRadius: 6,
+            background: 'rgba(255,255,255,0.08)',
+          }}>
+            <Avatar size={22} icon={<UserOutlined />} style={{ background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' }} />
+            <span style={{ color: '#fff', fontSize: 12 }}>{user?.username || 'User'}</span>
+            <DownOutlined style={{ color: 'rgba(255,255,255,0.5)', fontSize: 9 }} />
           </div>
         </Dropdown>
       </Header>
@@ -3371,30 +3541,62 @@ export default function TagSystem() {
         </div>
       </Modal>
 
-      {/* 调度弹框 */}
+      {/* 上线弹框 */}
       <Modal
-        title={`设置调度 - ${schedulingTask?.name || ''}`}
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{
+              width: 28,
+              height: 28,
+              borderRadius: 6,
+              background: 'linear-gradient(135deg, #52c41a 0%, #389e0d 100%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              fontSize: 14,
+            }}>
+              <ScheduleOutlined />
+            </div>
+            <span>上线任务</span>
+          </div>
+        }
         open={scheduleModalVisible}
         onCancel={() => { setScheduleModalVisible(false); setSchedulingTask(null) }}
         onOk={handleCreateSchedule}
-        okText="创建调度"
+        okText="确认上线"
         cancelText="取消"
         confirmLoading={schedulingLoading}
         width={560}
+        okButtonProps={{
+          style: { background: 'linear-gradient(135deg, #52c41a 0%, #389e0d 100%)', borderColor: 'transparent' }
+        }}
       >
         <div style={{ marginTop: 16 }}>
-          <div style={{ marginBottom: 16, padding: 12, background: '#f5f5f5', borderRadius: 8 }}>
-            <div style={{ marginBottom: 8 }}>
-              <Text strong>任务信息</Text>
+          <div style={{
+            marginBottom: 20,
+            padding: 16,
+            background: 'linear-gradient(135deg, #f6ffed 0%, #d9f7be 100%)',
+            borderRadius: 10,
+            border: '1px solid #b7eb8f',
+          }}>
+            <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <TagOutlined style={{ color: '#52c41a' }} />
+              <Text strong style={{ color: '#389e0d' }}>任务信息</Text>
             </div>
-            <div style={{ fontSize: 13, color: '#666' }}>
-              <div>任务名称：{schedulingTask?.name}</div>
-              <div>源表：{schedulingTask?.source_table || '-'}</div>
-              <div>类型：{schedulingTask?.rule_type === 'sql' ? 'SQL规则' : schedulingTask?.rule_type === 'row' ? 'AI打标' : schedulingTask?.rule_type}</div>
+            <div style={{ fontSize: 13, color: '#555', lineHeight: 1.8 }}>
+              <div><Text type="secondary">任务名称：</Text>{schedulingTask?.name}</div>
+              <div><Text type="secondary">源表：</Text>{schedulingTask?.source_table || '-'}</div>
+              <div><Text type="secondary">类型：</Text>
+                <Tag color={schedulingTask?.rule_type === 'sql' ? 'green' : 'blue'} style={{ marginLeft: 4 }}>
+                  {schedulingTask?.rule_type === 'sql' ? 'SQL规则' : schedulingTask?.rule_type === 'row' ? 'AI打标' : schedulingTask?.rule_type}
+                </Tag>
+              </div>
             </div>
           </div>
 
-          <div style={{ marginBottom: 12 }}>
+          <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <ScheduleOutlined style={{ color: '#1890ff' }} />
             <Text strong>调度时间设置</Text>
           </div>
           <CronExpressionInput
