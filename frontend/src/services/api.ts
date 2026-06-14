@@ -544,3 +544,26 @@ export const tagApi = {
   deleteDimensionDefineSession: (sessionId: string) =>
     api.delete(`/api/v1/tags/chat/define-dimension/${sessionId}`),
 }
+
+// 数据服务 API
+export const dataServiceApi = {
+  // 密钥管理
+  listKeys: () => api.get('/api/v1/data-service/keys'),
+  createKey: (data: {
+    name: string
+    description?: string
+    scope_type: string
+    scope_ids?: number[]
+    rate_limit?: number
+    expires_at?: string
+  }) => api.post('/api/v1/data-service/keys', data),
+  getKey: (id: number) => api.get(`/api/v1/data-service/keys/${id}`),
+  updateKey: (id: number, data: any) => api.put(`/api/v1/data-service/keys/${id}`, data),
+  deleteKey: (id: number) => api.delete(`/api/v1/data-service/keys/${id}`),
+  regenerateKey: (id: number) => api.post(`/api/v1/data-service/keys/${id}/regenerate`),
+
+  // 统计
+  getOverviewStats: () => api.get('/api/v1/data-service/stats/overview'),
+  getAccessLogs: (params?: { page?: number; page_size?: number; key_id?: number }) =>
+    api.get('/api/v1/data-service/stats/logs', { params }),
+}

@@ -11,6 +11,7 @@ import {
   QuestionCircleOutlined,
   BellOutlined,
   ScheduleOutlined,
+  ApiOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 
@@ -25,7 +26,7 @@ interface ModuleCardProps {
 
 const modules: ModuleCardProps[] = [
   {
-    title: '智能数据开发',
+    title: '智能数据探索',
     description: '自然语言查询 · 智能 SQL · ETL 编排 · 数据同步',
     icon: <DatabaseOutlined />,
     path: '/bigdata',
@@ -33,21 +34,28 @@ const modules: ModuleCardProps[] = [
   },
   {
     title: 'AI 智能标签',
-    description: 'AI 自动打标 · 标签规则 · 数据分类 · 业务沉淀',
+    description: '智能打标 · 规则引擎 · 数据赋魂 · 业务沉淀',
     icon: <TagsOutlined />,
     path: '/tags',
     iconBg: 'linear-gradient(135deg, #11998e 0%, #38ef7d 100%)',
   },
   {
-    title: '调度管理',
-    description: '任务调度 · DAG 编排 · 定时执行 · 运行监控',
+    title: '智能编排引擎',
+    description: 'AI 编排 · DAG 调度 · 定时执行 · 运行监控',
     icon: <ScheduleOutlined />,
     path: '/scheduler',
     iconBg: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
   },
   {
-    title: '数据资产管理',
-    description: '元数据治理 · 血缘追踪 · 质量监控 · 资产沉淀',
+    title: '智能 API 中心',
+    description: 'AI 接口 · 数据开放 · 调用统计 · 智能文档',
+    icon: <ApiOutlined />,
+    path: '/data-service',
+    iconBg: 'linear-gradient(135deg, #1890ff 0%, #722ed1 100%)',
+  },
+  {
+    title: 'AI 资产治理',
+    description: '智能元数据 · 血缘追踪 · 质量监控 · 资产沉淀',
     icon: <AppstoreOutlined />,
     path: '',
     iconBg: 'linear-gradient(135deg, #fc4a1a 0%, #f7b733 100%)',
@@ -182,7 +190,7 @@ export default function Portal() {
               <RobotOutlined />
             </div>
             <span style={{ fontSize: 15, fontWeight: 600, color: '#fff' }}>
-              智能数据平台
+              Grok Data
             </span>
           </div>
 
@@ -280,7 +288,7 @@ export default function Portal() {
               }}
             >
               <RobotOutlined style={{ color: '#fff', fontSize: 12 }} />
-              <span style={{ color: '#fff', fontSize: 12 }}>智能 · 高效 · 沉淀</span>
+              <span style={{ color: '#fff', fontSize: 12 }}>Learn · Adapt · Grok</span>
             </div>
             <h1
               style={{
@@ -290,7 +298,7 @@ export default function Portal() {
                 marginBottom: 8,
               }}
             >
-              智能数据平台
+              Grok Data
             </h1>
             <p
               style={{
@@ -299,7 +307,7 @@ export default function Portal() {
                 margin: 0,
               }}
             >
-              AI 驱动 · 智能决策 · 业务沉淀
+              AI 驱动 · 深度理解 · 超越
             </p>
           </div>
         </div>
@@ -343,7 +351,7 @@ export default function Portal() {
         }}
       >
         <span style={{ color: '#999', fontSize: 12 }}>
-          智能数据平台 v1.0 · 让数据更懂业务
+          Grok Data v1.0 · Learn · Adapt · Grok
         </span>
       </footer>
     </div>

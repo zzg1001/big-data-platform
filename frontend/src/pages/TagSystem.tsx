@@ -269,7 +269,7 @@ export default function TagSystem() {
   const [compositeSqlConfirmed, setCompositeSqlConfirmed] = useState(false)
   const [generatingCompositeSql, setGeneratingCompositeSql] = useState(false)
   const [compositeForm] = Form.useForm()
-  const [compositeTags, setCompositeTags] = useState<TagTask[]>([]) // 有SQL规则的标签列表
+  const [compositeTags, setCompositeTags] = useState<TagTask[]>([]) // 有规则引擎的标签列表
 
   // SQL编辑器视图相关
   interface EditorTab {
@@ -631,13 +631,13 @@ export default function TagSystem() {
         rule_config: {
           source_table: editorSelectedTable || '',
           full_sql: editorSql,
-          source: 'sql',  // 标识为SQL规则手动创建
+          source: 'sql',  // 标识为规则引擎手动创建
         } as any,
       })
       message.success('标签创建成功')
       setSaveTagModalVisible(false)
       saveTagForm.resetFields()
-      setCurrentView('sql')  // 返回SQL规则列表
+      setCurrentView('sql')  // 返回规则引擎列表
       loadTasks()
       loadStatistics()
     } catch (error: any) {
@@ -646,7 +646,7 @@ export default function TagSystem() {
     }
   }
 
-  // 加载可用于复合智能标签的标签列表（有SQL规则的标签）
+  // 加载可用于复合智能标签的标签列表（有规则引擎的标签）
   const loadCompositeTags = async () => {
     try {
       const res = await tagApi.getTree()
@@ -660,7 +660,7 @@ export default function TagSystem() {
         }
       }
       flatten(res.data || [])
-      // 过滤出有SQL规则的标签
+      // 过滤出有规则引擎的标签
       const tagsWithSql = allNodes.filter(t => t.rule_type === 'sql' || t.rule_type === 'row')
       setCompositeTags(tagsWithSql)
     } catch (error) {
@@ -886,7 +886,7 @@ export default function TagSystem() {
         })
         setTasks(addScheduleStatus(filtered))
       } else if (currentView === 'sql') {
-        // SQL规则视图：只显示手动创建的SQL规则（不是AI生成的，也不是复合智能标签）
+        // 规则引擎视图：只显示手动创建的规则引擎（不是AI生成的，也不是复合智能标签）
         const filtered = allNodes.filter((t) => {
           if (t.rule_type !== 'sql') return false
           if (t.rule_config) {
@@ -906,7 +906,7 @@ export default function TagSystem() {
         })
         setTasks(addScheduleStatus(filtered))
       } else if (currentView === 'composite') {
-        // 复合智能标签视图：只显示有composite_tags配置的SQL规则
+        // 复合智能标签视图：只显示有composite_tags配置的规则引擎
         const filtered = allNodes.filter((t) => {
           if (t.rule_type !== 'sql') return false
           if (t.rule_config) {
@@ -1374,7 +1374,7 @@ export default function TagSystem() {
           },
         })
       } else if (currentView === 'sql') {
-        // SQL 规则标签（从SQL规则入口进入）
+        // 规则引擎标签（从规则引擎入口进入）
         await tagApi.createRuleTag({
           name: values.name,
           description: values.description,
@@ -1414,14 +1414,14 @@ export default function TagSystem() {
     setExecuting(task.id)
     try {
       if (task.rule_type === 'row') {
-        // AI打标任务
+        // 智能标签
         const res = await tagApi.executeRowTag(task.id, {})
-        message.success(res.data?.message || 'AI打标任务已启动，后台执行中...')
+        message.success(res.data?.message || '智能标签已启动，后台执行中...')
         setTimeout(() => {
           message.info('执行完成后可点击"预览"查看打标结果')
         }, 2000)
       } else if (task.rule_type === 'sql') {
-        // SQL规则标签：先检查是否需要生成SQL
+        // 规则引擎标签：先检查是否需要生成SQL
         const ruleConfig = task.rule_config ? JSON.parse(task.rule_config) : {}
         if (ruleConfig.full_sql?.startsWith('-- AI_PROMPT:')) {
           // 需要先生成SQL
@@ -1432,7 +1432,7 @@ export default function TagSystem() {
             message.success('SQL已生成，正在执行...')
           }
         }
-        // 执行SQL规则
+        // 执行规则引擎
         const res = await tagApi.executeRuleTag(task.id)
         message.success(`执行成功！已生成 ${res.data?.row_count || 0} 条数据`)
       }
@@ -1674,9 +1674,9 @@ export default function TagSystem() {
     // 检查是否有任务关联（rule_type 不为空说明有任务）- 必须去任务页面删除
     if (tag.rule_type) {
       const ruleTypeMap: Record<string, string> = {
-        'ai': 'AI打标任务',
+        'ai': '智能标签',
         'ai_chat': 'AI对话任务',
-        'sql': 'SQL规则任务',
+        'sql': '规则引擎任务',
         'composite': '复合智能标签',
         'row': '行级标签任务',
         'graph': '图谱标签',
@@ -1798,7 +1798,7 @@ export default function TagSystem() {
     },
     {
       key: 'sql',
-      title: 'SQL规则',
+      title: '规则引擎',
       icon: <FileTextOutlined style={{ fontSize: 32 }} />,
       description: '自定义SQL逻辑打标签',
       color: '#52c41a',
@@ -1929,7 +1929,7 @@ export default function TagSystem() {
 
   // 渲染任务列表
   const renderTaskList = () => {
-    const viewTitle = currentView === 'ai' ? 'AI打标任务' : currentView === 'sql' ? 'SQL规则标签' : currentView === 'composite' ? '复合智能标签' : '数据集'
+    const viewTitle = currentView === 'ai' ? '智能标签' : currentView === 'sql' ? '规则引擎标签' : currentView === 'composite' ? '复合智能标签' : '数据集'
 
     const columns = [
       {
@@ -1966,9 +1966,13 @@ export default function TagSystem() {
           if (record.node_type === 'value' || record.node_type === 'tag') {
             return <Tag color="green" style={{ margin: 0 }}>值标签</Tag>
           }
+          // 类型标签显示"类型标签"
+          if (record.node_type === 'type') {
+            return <Tag color="blue" style={{ margin: 0 }}>类型标签</Tag>
+          }
           return (
-            <Tag color={type === 'row' ? 'blue' : type === 'sql' ? 'blue' : 'default'} style={{ margin: 0 }}>
-              {type === 'row' ? 'AI' : type === 'sql' ? 'AI' : type || '-'}
+            <Tag color="default" style={{ margin: 0 }}>
+              {type || '-'}
             </Tag>
           )
         },
@@ -2014,64 +2018,71 @@ export default function TagSystem() {
         key: 'actions',
         width: 160,
         fixed: 'right' as const,
-        render: (_: any, record: TagTask) => (
-          <Space size={4}>
-            {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
-              <Tooltip title="执行">
-                <Button
-                  type="link"
-                  size="small"
-                  icon={<PlayCircleOutlined />}
-                  loading={executing === record.id}
-                  onClick={() => handleExecute(record)}
-                  style={{ padding: '0 4px' }}
-                />
-              </Tooltip>
-            )}
-            <Tooltip title="预览">
-              <Button
-                type="link"
-                size="small"
-                icon={<EyeOutlined />}
-                onClick={() => handlePreview(record)}
-                style={{ padding: '0 4px' }}
-              />
-            </Tooltip>
-            {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
-              record.is_scheduled ? (
-                <Tooltip title="前往调度管理下线">
+        render: (_: any, record: TagTask) => {
+          // 值标签禁用执行和调度按钮
+          const isValueTag = record.node_type === 'value' || record.node_type === 'tag'
+          return (
+            <Space size={4}>
+              {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
+                <Tooltip title={isValueTag ? '值标签不支持执行' : '执行'}>
                   <Button
                     type="link"
                     size="small"
-                    icon={<ScheduleOutlined />}
-                    onClick={() => navigate('/scheduler')}
-                    style={{ color: '#52c41a', padding: '0 4px' }}
-                  />
-                </Tooltip>
-              ) : (
-                <Tooltip title="上线">
-                  <Button
-                    type="link"
-                    size="small"
-                    icon={<ScheduleOutlined />}
-                    onClick={() => handleOpenSchedule(record)}
+                    icon={<PlayCircleOutlined />}
+                    loading={executing === record.id}
+                    disabled={isValueTag}
+                    onClick={() => handleExecute(record)}
                     style={{ padding: '0 4px' }}
                   />
                 </Tooltip>
-              )
-            )}
-            <Tooltip title="删除">
-              <Button
-                type="link"
-                size="small"
-                danger
-                icon={<DeleteOutlined />}
-                onClick={() => handleDeleteTask(record.id, record.name)}
-                style={{ padding: '0 4px' }}
-              />
-            </Tooltip>
-          </Space>
-        ),
+              )}
+              <Tooltip title="预览">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={() => handlePreview(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
+                record.is_scheduled ? (
+                  <Tooltip title="前往调度管理下线">
+                    <Button
+                      type="link"
+                      size="small"
+                      icon={<ScheduleOutlined />}
+                      disabled={isValueTag}
+                      onClick={() => navigate('/scheduler')}
+                      style={{ color: isValueTag ? undefined : '#52c41a', padding: '0 4px' }}
+                    />
+                  </Tooltip>
+                ) : (
+                  <Tooltip title={isValueTag ? '值标签不支持调度' : '上线'}>
+                    <Button
+                      type="link"
+                      size="small"
+                      icon={<ScheduleOutlined />}
+                      disabled={isValueTag}
+                      onClick={() => handleOpenSchedule(record)}
+                      style={{ padding: '0 4px' }}
+                    />
+                  </Tooltip>
+                )
+              )}
+              <Tooltip title="删除">
+                <Button
+                  type="link"
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                  onClick={() => handleDeleteTask(record.id, record.name)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+            </Space>
+          )
+        },
       },
     ]
 
@@ -5954,10 +5965,10 @@ export default function TagSystem() {
     )
   }
 
-  // 渲染SQL规则弹框
+  // 渲染规则引擎弹框
   const renderSQLModal = () => (
     <Modal
-      title={editingTask ? '编辑SQL规则标签' : '新建SQL规则标签'}
+      title={editingTask ? '编辑规则引擎标签' : '新建规则引擎标签'}
       open={modalVisible && currentView === 'sql'}
       onCancel={() => setModalVisible(false)}
       onOk={handleSubmit}
@@ -6013,7 +6024,7 @@ export default function TagSystem() {
 
         <Form.Item
           name="sql"
-          label="SQL规则"
+          label="规则引擎"
           rules={[{ required: true, message: '请输入SQL' }]}
         >
           <div style={{ border: '1px solid #d9d9d9', borderRadius: 6 }}>
@@ -6091,7 +6102,7 @@ export default function TagSystem() {
         {/* 步骤1: 选择标签 */}
         <div style={{ display: compositeStep === 0 ? 'block' : 'none' }}>
           <div style={{ marginBottom: 16 }}>
-            <Text type="secondary">选择2个或多个已有标签进行组合（只显示有SQL规则的标签）</Text>
+            <Text type="secondary">选择2个或多个已有标签进行组合（只显示有规则引擎的标签）</Text>
           </div>
           {selectedTags.length > 0 && (
             <div style={{ marginBottom: 16, padding: 12, background: '#f6ffed', borderRadius: 8, border: '1px solid #b7eb8f' }}>
@@ -6137,7 +6148,7 @@ export default function TagSystem() {
                           源表：{getTagSourceTable(tag)}
                         </div>
                         <Tag color={tag.rule_type === 'row' ? 'blue' : 'green'} style={{ marginTop: 4 }}>
-                          {tag.rule_type === 'row' ? 'AI打标' : 'SQL规则'}
+                          {tag.rule_type === 'row' ? 'AI打标' : '规则引擎'}
                         </Tag>
                       </div>
                     </div>
@@ -6145,7 +6156,7 @@ export default function TagSystem() {
                 </List.Item>
               )
             }}
-            locale={{ emptyText: <Empty description="暂无可用标签，请先创建AI打标或SQL规则标签" /> }}
+            locale={{ emptyText: <Empty description="暂无可用标签，请先创建AI打标或规则引擎标签" /> }}
           />
         </div>
 
@@ -6380,7 +6391,7 @@ export default function TagSystem() {
           <Button type="text" icon={<LeftOutlined />} onClick={() => setCurrentView('sql')} size="small">
             返回
           </Button>
-          <Text strong>SQL规则标签</Text>
+          <Text strong>规则引擎标签</Text>
         </div>
 
         {/* 主体内容 */}
@@ -6714,7 +6725,7 @@ export default function TagSystem() {
   // 保存为标签弹框
   const renderSaveTagModal = () => (
     <Modal
-      title="保存为SQL规则标签"
+      title="保存为规则引擎标签"
       open={saveTagModalVisible}
       onCancel={() => { setSaveTagModalVisible(false); saveTagForm.resetFields() }}
       onOk={handleSaveAsTag}
@@ -7116,7 +7127,7 @@ export default function TagSystem() {
               <Text>
                 {tagDetailData.node_type === 'value' || tagDetailData.node_type === 'tag'
                   ? '值标签'
-                  : tagDetailData.rule_type === 'sql' ? 'SQL规则' : tagDetailData.rule_type === 'row' ? '行级标签' : '手动标签'}
+                  : tagDetailData.rule_type === 'sql' ? '规则引擎' : tagDetailData.rule_type === 'row' ? '行级标签' : '手动标签'}
               </Text>
             </div>
             {/* 值标签显示所属类型标签 */}
@@ -7187,11 +7198,11 @@ export default function TagSystem() {
           </div>
         )}
 
-        {/* SQL规则 - 跳转到数据探索 */}
+        {/* 规则引擎 - 跳转到数据探索 */}
         {ruleConfig.full_sql && (
           <div style={{ marginBottom: 20 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ fontWeight: 600, fontSize: 14 }}>SQL规则</div>
+              <div style={{ fontWeight: 600, fontSize: 14 }}>规则引擎</div>
               <Button
                 type="primary"
                 ghost
@@ -7613,7 +7624,7 @@ export default function TagSystem() {
             }}>
               <TagsOutlined />
             </div>
-            <span style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>标签管理平台</span>
+            <span style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>AI Tag Engine</span>
           </div>
           <div style={{ height: 16, width: 1, background: 'rgba(255,255,255,0.15)' }} />
           <Button
@@ -7712,7 +7723,7 @@ export default function TagSystem() {
               <div><Text type="secondary">源表：</Text>{schedulingTask?.source_table || '-'}</div>
               <div><Text type="secondary">类型：</Text>
                 <Tag color={schedulingTask?.rule_type === 'sql' ? 'green' : 'blue'} style={{ marginLeft: 4 }}>
-                  {schedulingTask?.rule_type === 'sql' ? 'SQL规则' : schedulingTask?.rule_type === 'row' ? 'AI打标' : schedulingTask?.rule_type}
+                  {schedulingTask?.rule_type === 'sql' ? '规则引擎' : schedulingTask?.rule_type === 'row' ? 'AI打标' : schedulingTask?.rule_type}
                 </Tag>
               </div>
             </div>

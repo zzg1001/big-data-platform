@@ -15,6 +15,7 @@ import DataExplorer from './pages/DataExplorer'
 import EtlTasks from './pages/EtlTasks'
 import Admin from './pages/Admin'
 import DwLayers from './pages/DwLayers'
+import DataService from './pages/DataService'
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuthStore()
@@ -54,6 +55,14 @@ function App() {
         element={
           <PrivateRoute>
             <Scheduler />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/data-service"
+        element={
+          <PrivateRoute>
+            <DataService />
           </PrivateRoute>
         }
       />
