@@ -48,6 +48,7 @@ import {
   EditOutlined,
   DownOutlined,
   FolderOpenOutlined,
+  FolderOutlined,
   MergeCellsOutlined,
   StarOutlined,
   TableOutlined,
@@ -166,6 +167,8 @@ export default function TagSystem() {
 
   // 思维导图拖拽相关
   const [nodePositions, setNodePositions] = useState<Record<number, { x: number; y: number }>>({})
+  const [collapsedNodes, setCollapsedNodes] = useState<Set<number>>(new Set())  // 收缩的节点ID集合
+  const [canvasContextMenu, setCanvasContextMenu] = useState<{ x: number; y: number; step: 'type' | 'dimension'; nodeType?: 'category' | 'type' | 'value' } | null>(null)
   const [draggingNodeId, setDraggingNodeId] = useState<number | null>(null)
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 })
   const [hasDragged, setHasDragged] = useState(false)
@@ -2198,13 +2201,89 @@ export default function TagSystem() {
           flexDirection: 'column',
         }}>
 {(() => {
-            // 根据搜索文本筛选任务
-            const filteredTasks = taskSearchText
-              ? tasks.filter(t => t.name.toLowerCase().includes(taskSearchText.toLowerCase()))
-              : tasks
+            // 构建树形结构
+            const buildTaskTree = (flatTasks: TagTask[]): (TagTask & { children?: TagTask[] })[] => {
+              const taskMap = new Map<number, TagTask & { children?: TagTask[] }>()
+              const rootTasks: (TagTask & { children?: TagTask[] })[] = []
+
+              // 先创建所有节点的副本
+              flatTasks.forEach(task => {
+                taskMap.set(task.id, { ...task, children: [] })
+              })
+
+              // 建立父子关系
+              flatTasks.forEach(task => {
+                const taskNode = taskMap.get(task.id)!
+                if (task.parent_id && taskMap.has(task.parent_id)) {
+                  const parent = taskMap.get(task.parent_id)!
+                  if (!parent.children) parent.children = []
+                  parent.children.push(taskNode)
+                } else {
+                  rootTasks.push(taskNode)
+                }
+              })
+
+              // 清理空的children数组
+              const cleanChildren = (nodes: (TagTask & { children?: TagTask[] })[]) => {
+                nodes.forEach(node => {
+                  if (node.children && node.children.length === 0) {
+                    delete node.children
+                  } else if (node.children) {
+                    cleanChildren(node.children)
+                  }
+                })
+              }
+              cleanChildren(rootTasks)
+
+              return rootTasks
+            }
+
+            // 根据搜索文本筛选任务（保留匹配项及其父子关系）
+            const filteredTasks = (() => {
+              if (!taskSearchText) return tasks
+
+              const searchLower = taskSearchText.toLowerCase()
+              const matchedIds = new Set<number>()
+
+              // 找出所有名字匹配的任务
+              tasks.forEach(t => {
+                if (t.name.toLowerCase().includes(searchLower)) {
+                  matchedIds.add(t.id)
+                }
+              })
+
+              // 添加匹配项的所有子任务
+              const addChildren = (parentId: number) => {
+                tasks.forEach(t => {
+                  if (t.parent_id === parentId && !matchedIds.has(t.id)) {
+                    matchedIds.add(t.id)
+                    addChildren(t.id)
+                  }
+                })
+              }
+              matchedIds.forEach(id => addChildren(id))
+
+              // 添加匹配项的所有父任务（确保树结构完整）
+              const addParents = (task: TagTask) => {
+                if (task.parent_id) {
+                  const parent = tasks.find(t => t.id === task.parent_id)
+                  if (parent && !matchedIds.has(parent.id)) {
+                    matchedIds.add(parent.id)
+                    addParents(parent)
+                  }
+                }
+              }
+              tasks.filter(t => matchedIds.has(t.id)).forEach(addParents)
+
+              return tasks.filter(t => matchedIds.has(t.id))
+            })()
+
+            // 转成树形结构
+            const treeData = buildTaskTree(filteredTasks)
+
             return (
               <Table
-                dataSource={filteredTasks}
+                dataSource={treeData}
                 columns={columns}
                 rowKey="id"
                 loading={loading}
@@ -2910,6 +2989,25 @@ export default function TagSystem() {
         return
       }
 
+      // 检查维度一致性：不同维度的标签不能相连
+      const sourceTag = allTags.find(t => t.id === connectingFrom.id)
+      const targetTag = allTags.find(t => t.id === targetNodeId)
+      if (sourceTag && targetTag) {
+        const sourceDimension = sourceTag.dimension_id
+        const targetDimension = targetTag.dimension_id
+        // 如果维度不一致，不允许连接（包括一个有维度一个没有的情况）
+        if (sourceDimension !== targetDimension) {
+          const sourceDim = dimensions.find(d => d.id === sourceDimension)
+          const targetDim = dimensions.find(d => d.id === targetDimension)
+          const sourceLabel = sourceDim?.display_name || (sourceDimension ? '未知维度' : '无维度')
+          const targetLabel = targetDim?.display_name || (targetDimension ? '未知维度' : '无维度')
+          message.warning(`不能连接不同维度的标签：${sourceLabel} 与 ${targetLabel}`)
+          setConnectingFrom(null)
+          setConnectingTo(null)
+          return
+        }
+      }
+
       // 添加到待保存变更
       setPendingConnections(prev => ({
         ...prev,
@@ -3020,8 +3118,10 @@ export default function TagSystem() {
       const nodeWidth = 120
       const verticalGap = 12  // 节点间垂直间距
 
-      // 计算子树高度
+      // 计算子树高度（考虑收缩状态）
       const getSubtreeHeight = (nodeId: number): number => {
+        // 如果节点是收缩的，只返回自身高度
+        if (collapsedNodes.has(nodeId)) return nodeHeight
         const children = allTags.filter(t => t.parent_id === nodeId)
         if (children.length === 0) return nodeHeight
         let height = 0
@@ -3040,7 +3140,8 @@ export default function TagSystem() {
         inheritColor: string
       ): number => {
         const defaultX = startX + level * levelGap
-        const children = allTags.filter(t => t.parent_id === node.id)
+        const isCollapsed = collapsedNodes.has(node.id)
+        const children = isCollapsed ? [] : allTags.filter(t => t.parent_id === node.id)
         const nodeColor = parseColor(node.color) || inheritColor
 
         let currentY = y
@@ -3061,6 +3162,9 @@ export default function TagSystem() {
         const finalX = nodePositions[node.id]?.x ?? defaultX
         const finalY = nodePositions[node.id]?.y ?? defaultY
 
+        // 检查是否有子节点（用于显示展开/收缩按钮）
+        const hasChildren = allTags.some(t => t.parent_id === node.id)
+
         nodes.push({
           id: node.id,
           name: node.name,
@@ -3070,15 +3174,19 @@ export default function TagSystem() {
           color: nodeColor,
           parentId: node.parent_id,
           level,
-        })
+          hasChildren,
+          isCollapsed,
+        } as any)
 
-        // 递归布局子节点
-        currentY = y
-        children.forEach((child, i) => {
-          layoutNode(child, level + 1, currentY, nodeColor)
-          currentY += getSubtreeHeight(child.id)
-          if (i < children.length - 1) currentY += verticalGap
-        })
+        // 递归布局子节点（如果没有收缩）
+        if (!isCollapsed) {
+          currentY = y
+          children.forEach((child, i) => {
+            layoutNode(child, level + 1, currentY, nodeColor)
+            currentY += getSubtreeHeight(child.id)
+            if (i < children.length - 1) currentY += verticalGap
+          })
+        }
 
         return childrenTotalHeight || nodeHeight
       }
@@ -3153,27 +3261,45 @@ export default function TagSystem() {
             style={{ cursor: 'grab' }}
             onMouseDown={(e) => {
               e.stopPropagation()
-              e.preventDefault()
               // 检查是否是值标签的连线，值标签不能拖拽重连
               const childNode = allTags.find(t => t.id === childId)
               if (childNode && (childNode.node_type === 'tag' || childNode.node_type === 'value')) {
-                message.warning('值标签的连线不能修改')
-                return
+                return // 值标签不能拖拽，让 click 事件处理
               }
               const rect = mindMapRef.current?.getBoundingClientRect()
               if (rect) {
-                // 开始拖拽连线，从子节点位置开始
-                setDraggingLine({
-                  childId,
-                  childName,
-                  startX: toX,  // 子节点的 X 位置
-                  startY: toY,  // 子节点的 Y 位置
-                })
-                setDraggingLineEnd({
-                  x: e.clientX - rect.left,
-                  y: e.clientY - rect.top,
-                })
-                setClickedLine(null)
+                const startX = e.clientX
+                const startY = e.clientY
+                let hasMoved = false
+
+                const handleMouseMove = (moveE: MouseEvent) => {
+                  // 检查是否真的移动了（超过5px才算拖拽）
+                  if (!hasMoved && (Math.abs(moveE.clientX - startX) > 5 || Math.abs(moveE.clientY - startY) > 5)) {
+                    hasMoved = true
+                    // 开始拖拽连线
+                    setDraggingLine({
+                      childId,
+                      childName,
+                      startX: toX,
+                      startY: toY,
+                    })
+                    setClickedLine(null)
+                  }
+                  if (hasMoved) {
+                    setDraggingLineEnd({
+                      x: moveE.clientX - rect.left,
+                      y: moveE.clientY - rect.top,
+                    })
+                  }
+                }
+
+                const handleMouseUp = () => {
+                  document.removeEventListener('mousemove', handleMouseMove)
+                  document.removeEventListener('mouseup', handleMouseUp)
+                }
+
+                document.addEventListener('mousemove', handleMouseMove)
+                document.addEventListener('mouseup', handleMouseUp)
               }
             }}
             onClick={(e) => {
@@ -4111,62 +4237,14 @@ export default function TagSystem() {
               if (target.closest('[data-node-id]')) return
 
               e.preventDefault()
-
-              Modal.confirm({
-                title: '新建节点',
-                icon: null,
-                content: (
-                  <div style={{ marginTop: 16 }}>
-                    <div style={{ marginBottom: 8, color: '#666' }}>选择要创建的节点类型：</div>
-                    <Space direction="vertical" style={{ width: '100%' }}>
-                      <Button
-                        block
-                        icon={<FolderOpenOutlined />}
-                        onClick={() => {
-                          Modal.destroyAll()
-                          setEditingTag(null)
-                          setCreatingParent(null)
-                          tagForm.resetFields()
-                          tagForm.setFieldValue('node_type', 'category')
-                          setTagModalVisible(true)
-                        }}
-                      >
-                        新建分类
-                      </Button>
-                      <Button
-                        block
-                        icon={<TagsOutlined />}
-                        onClick={() => {
-                          Modal.destroyAll()
-                          setEditingTag(null)
-                          setCreatingParent(null)
-                          tagForm.resetFields()
-                          tagForm.setFieldValue('node_type', 'type')
-                          setTagModalVisible(true)
-                        }}
-                      >
-                        新建类型
-                      </Button>
-                      <Button
-                        block
-                        icon={<TagOutlined />}
-                        onClick={() => {
-                          Modal.destroyAll()
-                          setEditingTag(null)
-                          setCreatingParent(null)
-                          tagForm.resetFields()
-                          tagForm.setFieldValue('node_type', 'value')
-                          setTagModalVisible(true)
-                        }}
-                      >
-                        新建标签
-                      </Button>
-                    </Space>
-                  </div>
-                ),
-                footer: null,
-                closable: true,
-              })
+              const rect = mindMapRef.current?.getBoundingClientRect()
+              if (rect) {
+                setCanvasContextMenu({
+                  x: e.clientX - rect.left,
+                  y: e.clientY - rect.top,
+                  step: 'type'
+                })
+              }
             }}
           >
             <Spin spinning={loading}>
@@ -4192,7 +4270,7 @@ export default function TagSystem() {
                   padding: '20px 0',
                   position: 'relative',
                 }}
-                onClick={() => { setClickedLine(null); setNodeContextMenu(null) }}
+                onClick={() => { setClickedLine(null); setNodeContextMenu(null); setCanvasContextMenu(null) }}
                 onMouseMove={(e) => {
                   // 拖拽连线时更新终点位置
                   if (draggingLine) {
@@ -4303,8 +4381,8 @@ export default function TagSystem() {
                         if (!hasDragged) {
                           const tag = allTags.find(t => t.id === node.id)
                           if (tag) {
-                            // 与标签页面点击逻辑一致：规则标签显示详情弹框
-                            if ((tag.node_type === 'tag' || tag.node_type === 'value' || tag.node_type === 'detail') && tag.rule_type) {
+                            // 与标签页面点击逻辑一致
+                            if (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag') {
                               handleViewTagDetail(tag)
                             } else {
                               handleEditTag(tag)
@@ -4348,6 +4426,17 @@ export default function TagSystem() {
                           return
                         }
 
+                        // 检查维度一致性
+                        const targetTag = allTags.find(t => t.id === node.id)
+                        if (targetTag && sourceTag.dimension_id !== targetTag.dimension_id) {
+                          const sourceDim = dimensions.find(d => d.id === sourceTag.dimension_id)
+                          const targetDim = dimensions.find(d => d.id === targetTag.dimension_id)
+                          const sourceLabel = sourceDim?.display_name || (sourceTag.dimension_id ? '未知维度' : '无维度')
+                          const targetLabel = targetDim?.display_name || (targetTag.dimension_id ? '未知维度' : '无维度')
+                          message.warning(`不能连接不同维度的标签：${sourceLabel} 与 ${targetLabel}`)
+                          return
+                        }
+
                         // 添加到待保存变更
                         setPendingConnections(prev => ({
                           ...prev,
@@ -4371,6 +4460,19 @@ export default function TagSystem() {
                         }
                         // 拖拽连线释放到节点上 - 重新连接
                         if (draggingLine && canReceiveConnection && draggingLine.childId !== node.id && currentProject) {
+                          // 检查维度一致性
+                          const childTag = allTags.find(t => t.id === draggingLine.childId)
+                          const parentTag = allTags.find(t => t.id === node.id)
+                          if (childTag && parentTag && childTag.dimension_id !== parentTag.dimension_id) {
+                            const childDim = dimensions.find(d => d.id === childTag.dimension_id)
+                            const parentDim = dimensions.find(d => d.id === parentTag.dimension_id)
+                            const childLabel = childDim?.display_name || (childTag.dimension_id ? '未知维度' : '无维度')
+                            const parentLabel = parentDim?.display_name || (parentTag.dimension_id ? '未知维度' : '无维度')
+                            message.warning(`不能连接不同维度的标签：${childLabel} 与 ${parentLabel}`)
+                            setDraggingLine(null)
+                            setDraggingLineEnd(null)
+                            return
+                          }
                           // 更新连接：将子节点的父节点改为当前节点
                           setPendingConnections(prev => ({
                             ...prev,
@@ -4428,6 +4530,41 @@ export default function TagSystem() {
                         </div>
                       )}
                       {node.name}
+                      {/* 展开/收缩按钮 - 只有有子节点的节点才显示 */}
+                      {(node as any).hasChildren && (
+                        <div
+                          style={{
+                            marginLeft: 6,
+                            width: 16,
+                            height: 16,
+                            borderRadius: 3,
+                            background: 'rgba(255,255,255,0.3)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            cursor: 'pointer',
+                            fontSize: 12,
+                            color: '#fff',
+                            fontWeight: 'bold',
+                            flexShrink: 0,
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setCollapsedNodes(prev => {
+                              const newSet = new Set(prev)
+                              if (newSet.has(node.id)) {
+                                newSet.delete(node.id)
+                              } else {
+                                newSet.add(node.id)
+                              }
+                              return newSet
+                            })
+                          }}
+                          title={(node as any).isCollapsed ? '展开' : '收缩'}
+                        >
+                          {(node as any).isCollapsed ? '+' : '−'}
+                        </div>
+                      )}
                       {/* 右侧连接点 - 拖出连线（只有分类和类型可以拖出连线） */}
                       {node.node_type !== 'tag' && node.node_type !== 'value' && node.node_type !== 'detail' && (
                         <Tooltip title="拖拽连接子节点">
@@ -4538,14 +4675,164 @@ export default function TagSystem() {
                         添加子级
                       </div>
                     )}
-                    <div
-                      style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
-                      onClick={() => { handleRemoveFromProject(nodeContextMenu.node.id); setNodeContextMenu(null) }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
-                    >
-                      移出
-                    </div>
+                    {nodeContextMenu.node.node_type === 'category' ? (
+                      <div
+                        style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
+                        onClick={() => { handleDeleteTag(nodeContextMenu.node.id); setNodeContextMenu(null) }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                      >
+                        删除
+                      </div>
+                    ) : (
+                      <div
+                        style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
+                        onClick={() => { handleRemoveFromProject(nodeContextMenu.node.id); setNodeContextMenu(null) }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                      >
+                        移出
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 画布右键菜单 - 新建节点 */}
+                {canvasContextMenu && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: canvasContextMenu.x,
+                      top: canvasContextMenu.y,
+                      background: '#fff',
+                      borderRadius: 8,
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                      zIndex: 2000,
+                      overflow: 'hidden',
+                      minWidth: 120,
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {canvasContextMenu.step === 'type' ? (
+                      <>
+                        <div style={{
+                          padding: '6px 10px',
+                          fontSize: 11,
+                          color: '#999',
+                          borderBottom: '1px solid #f0f0f0',
+                          background: '#fafafa',
+                        }}>
+                          选择节点类型
+                        </div>
+                        {[
+                          { value: 'category', label: '分类', icon: <FolderOutlined />, color: '#722ed1' },
+                          { value: 'type', label: '类型', icon: <AppstoreOutlined />, color: '#1890ff' },
+                          { value: 'value', label: '标签', icon: <TagOutlined />, color: '#52c41a' },
+                        ].map(item => (
+                          <div
+                            key={item.value}
+                            style={{
+                              padding: '8px 12px',
+                              cursor: 'pointer',
+                              fontSize: 13,
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                            }}
+                            onClick={() => {
+                              setCanvasContextMenu({
+                                ...canvasContextMenu,
+                                step: 'dimension',
+                                nodeType: item.value as 'category' | 'type' | 'value',
+                              })
+                            }}
+                            onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                            onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                          >
+                            <span style={{ color: item.color, fontSize: 14 }}>{item.icon}</span>
+                            <span>{item.label}</span>
+                          </div>
+                        ))}
+                        <div
+                          style={{
+                            padding: '6px 12px',
+                            borderTop: '1px solid #f0f0f0',
+                            fontSize: 12,
+                            color: '#999',
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => setCanvasContextMenu(null)}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                        >
+                          取消
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{
+                          padding: '6px 10px',
+                          fontSize: 11,
+                          color: '#999',
+                          borderBottom: '1px solid #f0f0f0',
+                          background: '#fafafa',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 4,
+                        }}>
+                          <span
+                            style={{ cursor: 'pointer', color: '#1890ff' }}
+                            onClick={() => setCanvasContextMenu({ ...canvasContextMenu, step: 'type', nodeType: undefined })}
+                          >
+                            ←
+                          </span>
+                          选择维度
+                        </div>
+                        {dimensions.map(dim => (
+                          <div
+                            key={dim.id}
+                            style={{
+                              padding: '8px 12px',
+                              cursor: 'pointer',
+                              fontSize: 13,
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                            }}
+                            onClick={() => {
+                              // 创建新节点
+                              tagForm.resetFields()
+                              tagForm.setFieldValue('node_type', canvasContextMenu.nodeType)
+                              tagForm.setFieldValue('dimension_id', dim.id)
+                              setEditingTag(null)
+                              setCreatingParent(null)
+                              setTagModalVisible(true)
+                              setCanvasContextMenu(null)
+                            }}
+                            onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                            onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                          >
+                            <TagsOutlined style={{ color: '#1890ff', fontSize: 12 }} />
+                            <span>{dim.display_name}</span>
+                            <span style={{ fontSize: 11, color: '#999' }}>({dim.id_field})</span>
+                          </div>
+                        ))}
+                        <div
+                          style={{
+                            padding: '6px 12px',
+                            borderTop: '1px solid #f0f0f0',
+                            fontSize: 12,
+                            color: '#999',
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => setCanvasContextMenu(null)}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                        >
+                          取消
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -7077,6 +7364,38 @@ export default function TagSystem() {
             {/* 隐藏的 node_type 字段，确保值始终存在 */}
             <Form.Item name="node_type" hidden>
               <Input autoComplete="off" />
+            </Form.Item>
+            {/* 隐藏的 dimension_id 字段 */}
+            <Form.Item name="dimension_id" hidden>
+              <Input autoComplete="off" />
+            </Form.Item>
+
+            {/* 显示所属维度 */}
+            <Form.Item noStyle shouldUpdate={(prev, curr) => prev.dimension_id !== curr.dimension_id}>
+              {({ getFieldValue }) => {
+                const dimensionId = getFieldValue('dimension_id')
+                if (!dimensionId) return null
+                const dim = dimensions.find(d => d.id === dimensionId)
+                return (
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '6px 10px',
+                    background: '#e6f7ff',
+                    border: '1px solid #91d5ff',
+                    borderRadius: 4,
+                    marginBottom: 12,
+                    fontSize: 12,
+                  }}>
+                    <TagsOutlined style={{ color: '#1890ff' }} />
+                    <span style={{ color: '#666' }}>所属维度：</span>
+                    <span style={{ fontWeight: 500, color: '#1890ff' }}>
+                      {dim?.display_name || '未知'} ({dim?.id_field || ''})
+                    </span>
+                  </div>
+                )
+              }}
             </Form.Item>
 
             {/* 节点类型选择 - 紧凑卡片样式 */}
