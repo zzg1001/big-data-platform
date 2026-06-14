@@ -8,6 +8,59 @@ from sqlalchemy.orm import relationship
 from app.core.database import Base
 
 
+class TagDimension(Base):
+    """
+    标签维度 - 定义标签的维度（如用户维度、商品维度）
+    每个维度有唯一的ID字段
+    """
+    __tablename__ = "big_tag_dimensions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)  # 维度标识: user_dimension
+    display_name = Column(String(100), nullable=False)  # 显示名: 用户维度
+    id_field = Column(String(100), nullable=False)  # ID字段: user_id
+    description = Column(String(500))
+    is_preset = Column(Boolean, default=False)  # 是否预设
+    is_active = Column(Boolean, default=True)
+    created_by = Column(BigInteger, ForeignKey("big_users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 关系
+    nodes = relationship("TagNode", back_populates="dimension")
+
+
+class TagProject(Base):
+    """
+    标签项目 - 用于组织标签体系
+    每个项目包含独立的标签层级结构
+    """
+    __tablename__ = "big_tag_projects"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500))
+
+    # 项目封面颜色/图标
+    color = Column(String(20), default="#1890ff")
+    icon = Column(String(50))
+
+    # 统计
+    node_count = Column(BigInteger, default=0)  # 节点总数
+    tag_count = Column(BigInteger, default=0)   # 标签数量
+
+    # 状态
+    is_active = Column(Boolean, default=True)
+
+    # 审计
+    created_by = Column(BigInteger, ForeignKey("big_users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 关系
+    nodes = relationship("TagNode", back_populates="project", cascade="all, delete-orphan")
+
+
 class TagNode(Base):
     """
     标签节点 - 统一的树形结构
@@ -19,8 +72,14 @@ class TagNode(Base):
     name = Column(String(100), nullable=False)
     description = Column(String(500))
 
-    # 节点类型: category=分类, type=类型(字段名), tag=标签(字段值)
-    # 层级规则: category下可放任何, type下只能放tag, tag下不能放任何
+    # 所属项目
+    project_id = Column(BigInteger, ForeignKey("big_tag_projects.id"))
+
+    # 所属维度（维度标签专用）
+    dimension_id = Column(BigInteger, ForeignKey("big_tag_dimensions.id"))
+
+    # 节点类型: category=分类, type=类型标签, tag=维度标签, detail=粒度标签
+    # 层级规则: category下可放任何, type下可放tag/detail, tag/detail下不能放任何
     node_type = Column(String(20), nullable=False, default="tag")
 
     # 树形结构
@@ -58,6 +117,8 @@ class TagNode(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # 关系
+    project = relationship("TagProject", back_populates="nodes")
+    dimension = relationship("TagDimension", back_populates="nodes")
     parent = relationship("TagNode", remote_side=[id], backref="children")
     tag_data = relationship("TagData", back_populates="tag_node", cascade="all, delete-orphan")
 
@@ -65,6 +126,8 @@ class TagNode(Base):
         Index('idx_tag_node_parent', 'parent_id'),
         Index('idx_tag_node_path', 'path'),
         Index('idx_tag_node_type', 'node_type'),
+        Index('idx_tag_node_project', 'project_id'),
+        Index('idx_tag_node_dimension', 'dimension_id'),
     )
 
 

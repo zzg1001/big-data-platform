@@ -767,13 +767,31 @@ export default function Scheduler() {
   }
 
   // 删除标签任务调度
-  const handleTagDelete = async (record: ScheduleItem) => {
-    if (record.is_enabled) {
-      message.warning('请先下线后再删除')
+  const handleTagDelete = async (record: ScheduleItem, force: boolean = false) => {
+    if (record.is_enabled && !force) {
+      // 如果是已上线状态，询问是否强制删除
+      Modal.confirm({
+        title: `确定删除"${record.name}"？`,
+        icon: <DeleteOutlined style={{ color: '#ff4d4f' }} />,
+        closable: false,
+        centered: true,
+        okText: '删除',
+        okType: 'danger',
+        cancelText: '取消',
+        onOk: () => handleTagDelete(record, true),
+      })
       return
     }
     setDeleting(record.id)
     try {
+      // 如果是强制删除且还在上线状态，先尝试下线
+      if (force && record.is_enabled) {
+        try {
+          await scheduleApi.pause(record.id)
+        } catch (e) {
+          // 忽略下线错误，继续删除
+        }
+      }
       await scheduleApi.delete(record.id)
       message.success('删除成功')
       loadSchedules()
@@ -1047,11 +1065,30 @@ export default function Scheduler() {
       dataIndex: 'name',
       key: 'name',
       ellipsis: { showTitle: false },
-      render: (name: string, record: ScheduleItem) => (
-        <Tooltip title={record.description ? `${name} - ${record.description}` : name}>
-          <Text strong style={{ fontSize: 13 }}>{name}</Text>
-        </Tooltip>
-      ),
+      render: (name: string, record: ScheduleItem) => {
+        // 标签任务可点击跳转到标签页面
+        if (record.type === 'tag' && record.dag_id) {
+          const match = record.dag_id.match(/^tag_task_(\d+)$/)
+          const tagNodeId = match ? match[1] : null
+          if (tagNodeId) {
+            return (
+              <Tooltip title={record.description ? `${name} - ${record.description}（点击查看标签详情）` : `${name}（点击查看标签详情）`}>
+                <a
+                  style={{ fontWeight: 500, color: '#1890ff', cursor: 'pointer' }}
+                  onClick={() => navigate(`/tags?tagId=${tagNodeId}&view=ai`)}
+                >
+                  {name}
+                </a>
+              </Tooltip>
+            )
+          }
+        }
+        return (
+          <Tooltip title={record.description ? `${name} - ${record.description}` : name}>
+            <Text strong style={{ fontSize: 13 }}>{name}</Text>
+          </Tooltip>
+        )
+      },
     },
     {
       title: '任务详情',
@@ -1221,7 +1258,7 @@ export default function Scheduler() {
                   type="link"
                   size="small"
                   icon={<EyeOutlined />}
-                  onClick={() => navigate('/tags')}
+                  onClick={() => window.open('/tags', '_blank')}
                   style={{ padding: '0 4px' }}
                 />
               </Tooltip>
@@ -1257,12 +1294,11 @@ export default function Scheduler() {
                   />
                 </Tooltip>
               )}
-              <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
+              <Tooltip title="删除">
                 <Button
                   type="link"
                   size="small"
-                  danger={!record.is_enabled}
-                  disabled={record.is_enabled}
+                  danger
                   icon={<DeleteOutlined />}
                   loading={deleting === record.id}
                   onClick={() => handleTagDelete(record)}
@@ -1582,11 +1618,11 @@ export default function Scheduler() {
           onRow={(record) => ({
             onDoubleClick: () => {
               if (record.type === 'etl') {
-                navigate(`/bigdata/etl-tasks?id=${record.taskId}`)
+                window.open(`/bigdata/etl-tasks?id=${record.taskId}`, '_blank')
               } else if (record.type === 'tag') {
-                navigate(`/tags`)  // 跳转到标签管理页面
+                window.open('/tags', '_blank')
               } else {
-                navigate(`/bigdata/data-sync?id=${record.taskId}`)
+                window.open(`/bigdata/data-sync?id=${record.taskId}`, '_blank')
               }
             },
             style: { cursor: 'pointer' },

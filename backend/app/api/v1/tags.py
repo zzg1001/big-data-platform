@@ -13,17 +13,444 @@ from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.api.v1.warehouse import get_warehouse_engine
 from app.models.user import User
-from app.models.tag import TagNode, TagData
+from app.models.tag import TagNode, TagData, TagProject, TagDimension
 from app.models.datasource import DataSource
 from app.schemas.tag import (
     TagNodeCreate, TagNodeUpdate, TagNodeResponse, TagNodeTree,
     TagDataCreate, TagDataResponse,
     RuleTagCreate, RowTagTaskCreate, RowTagTaskExecute, DatasetTagCreate,
-    TagStatistics
+    TagStatistics,
+    TagProjectCreate, TagProjectUpdate, TagProjectResponse,
+    TagDimensionCreate, TagDimensionUpdate, TagDimensionResponse,
+    BatchDimensionTagCreate, BatchDimensionTagResponse
 )
 from app.services.ai_assistant import AIAssistant
 
 router = APIRouter()
+
+
+# ==================== 标签项目 CRUD ====================
+
+@router.get("/projects", response_model=List[TagProjectResponse])
+async def list_tag_projects(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取所有标签项目"""
+    query = select(TagProject).filter(TagProject.is_active == True).order_by(TagProject.created_at.desc())
+    result = await db.execute(query)
+    projects = result.scalars().all()
+
+    responses = []
+    for project in projects:
+        # 获取节点统计
+        node_count_result = await db.execute(
+            select(func.count(TagNode.id)).filter(
+                TagNode.project_id == project.id,
+                TagNode.is_active == True
+            )
+        )
+        node_count = node_count_result.scalar() or 0
+
+        tag_count_result = await db.execute(
+            select(func.count(TagNode.id)).filter(
+                TagNode.project_id == project.id,
+                TagNode.is_active == True,
+                TagNode.node_type.in_(['tag', 'value'])
+            )
+        )
+        tag_count = tag_count_result.scalar() or 0
+
+        responses.append(TagProjectResponse(
+            id=project.id,
+            name=project.name,
+            description=project.description,
+            color=project.color,
+            icon=project.icon,
+            node_count=node_count,
+            tag_count=tag_count,
+            is_active=project.is_active,
+            created_at=project.created_at,
+            updated_at=project.updated_at
+        ))
+
+    return responses
+
+
+@router.post("/projects", response_model=TagProjectResponse)
+async def create_tag_project(
+    data: TagProjectCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """创建标签项目"""
+    project = TagProject(
+        name=data.name,
+        description=data.description,
+        color=data.color,
+        icon=data.icon,
+        created_by=current_user.id
+    )
+    db.add(project)
+    await db.commit()
+    await db.refresh(project)
+
+    return TagProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        color=project.color,
+        icon=project.icon,
+        node_count=0,
+        tag_count=0,
+        is_active=project.is_active,
+        created_at=project.created_at,
+        updated_at=project.updated_at
+    )
+
+
+@router.get("/projects/{project_id}", response_model=TagProjectResponse)
+async def get_tag_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取单个标签项目"""
+    result = await db.execute(select(TagProject).filter(TagProject.id == project_id))
+    project = result.scalars().first()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    # 获取节点统计
+    node_count_result = await db.execute(
+        select(func.count(TagNode.id)).filter(
+            TagNode.project_id == project.id,
+            TagNode.is_active == True
+        )
+    )
+    node_count = node_count_result.scalar() or 0
+
+    tag_count_result = await db.execute(
+        select(func.count(TagNode.id)).filter(
+            TagNode.project_id == project.id,
+            TagNode.is_active == True,
+            TagNode.node_type.in_(['tag', 'value'])
+        )
+    )
+    tag_count = tag_count_result.scalar() or 0
+
+    return TagProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        color=project.color,
+        icon=project.icon,
+        node_count=node_count,
+        tag_count=tag_count,
+        is_active=project.is_active,
+        created_at=project.created_at,
+        updated_at=project.updated_at
+    )
+
+
+@router.put("/projects/{project_id}", response_model=TagProjectResponse)
+async def update_tag_project(
+    project_id: int,
+    data: TagProjectUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """更新标签项目"""
+    result = await db.execute(select(TagProject).filter(TagProject.id == project_id))
+    project = result.scalars().first()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    if data.name is not None:
+        project.name = data.name
+    if data.description is not None:
+        project.description = data.description
+    if data.color is not None:
+        project.color = data.color
+    if data.icon is not None:
+        project.icon = data.icon
+
+    await db.commit()
+    await db.refresh(project)
+
+    # 获取节点统计
+    node_count_result = await db.execute(
+        select(func.count(TagNode.id)).filter(
+            TagNode.project_id == project.id,
+            TagNode.is_active == True
+        )
+    )
+    node_count = node_count_result.scalar() or 0
+
+    tag_count_result = await db.execute(
+        select(func.count(TagNode.id)).filter(
+            TagNode.project_id == project.id,
+            TagNode.is_active == True,
+            TagNode.node_type.in_(['tag', 'value'])
+        )
+    )
+    tag_count = tag_count_result.scalar() or 0
+
+    return TagProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        color=project.color,
+        icon=project.icon,
+        node_count=node_count,
+        tag_count=tag_count,
+        is_active=project.is_active,
+        created_at=project.created_at,
+        updated_at=project.updated_at
+    )
+
+
+@router.delete("/projects/{project_id}")
+async def delete_tag_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """删除标签项目"""
+    result = await db.execute(select(TagProject).filter(TagProject.id == project_id))
+    project = result.scalars().first()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    # 软删除
+    project.is_active = False
+    await db.commit()
+
+    return {"message": "删除成功"}
+
+
+# ==================== 标签维度 CRUD ====================
+
+@router.get("/dimensions", response_model=List[TagDimensionResponse])
+async def list_tag_dimensions(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取所有标签维度"""
+    query = select(TagDimension).filter(TagDimension.is_active == True).order_by(TagDimension.is_preset.desc(), TagDimension.id)
+    result = await db.execute(query)
+    dimensions = result.scalars().all()
+    return [TagDimensionResponse.model_validate(d) for d in dimensions]
+
+
+@router.post("/dimensions", response_model=TagDimensionResponse)
+async def create_tag_dimension(
+    data: TagDimensionCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """创建自定义标签维度"""
+    dimension = TagDimension(
+        name=data.name,
+        display_name=data.display_name,
+        id_field=data.id_field,
+        description=data.description,
+        is_preset=False,
+        created_by=current_user.id
+    )
+    db.add(dimension)
+    await db.commit()
+    await db.refresh(dimension)
+    return TagDimensionResponse.model_validate(dimension)
+
+
+@router.get("/dimensions/{dimension_id}", response_model=TagDimensionResponse)
+async def get_tag_dimension(
+    dimension_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取单个标签维度"""
+    result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
+    dimension = result.scalars().first()
+    if not dimension:
+        raise HTTPException(status_code=404, detail="维度不存在")
+    return TagDimensionResponse.model_validate(dimension)
+
+
+@router.delete("/dimensions/{dimension_id}")
+async def delete_tag_dimension(
+    dimension_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """删除标签维度"""
+    result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
+    dimension = result.scalars().first()
+    if not dimension:
+        raise HTTPException(status_code=404, detail="维度不存在")
+
+    # 检查是否有标签使用此维度
+    tag_count_result = await db.execute(
+        select(func.count(TagNode.id)).filter(TagNode.dimension_id == dimension_id)
+    )
+    tag_count = tag_count_result.scalar() or 0
+    if tag_count > 0:
+        raise HTTPException(status_code=400, detail=f"该维度下有 {tag_count} 个标签，无法删除")
+
+    await db.delete(dimension)
+    await db.commit()
+    return {"message": "删除成功"}
+
+
+# ==================== 批量创建维度标签 ====================
+
+@router.post("/batch-create", response_model=BatchDimensionTagResponse)
+async def batch_create_dimension_tags(
+    data: BatchDimensionTagCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    批量创建维度标签
+    一次创建一个类型标签 + 多个子维度标签
+    parent_id 可选，为空时创建在根目录
+    """
+    parent_node = None
+    project_id = None
+    parent_path = ""
+    parent_level = 0
+
+    # 如果指定了父节点，验证其存在
+    if data.parent_id:
+        parent_result = await db.execute(select(TagNode).filter(TagNode.id == data.parent_id))
+        parent_node = parent_result.scalars().first()
+        if not parent_node:
+            raise HTTPException(status_code=404, detail="父节点不存在")
+        project_id = parent_node.project_id
+        parent_path = parent_node.path or f"/{parent_node.id}"
+        parent_level = parent_node.level or 1
+
+    # 验证维度存在
+    dimension_result = await db.execute(select(TagDimension).filter(TagDimension.id == data.dimension_id))
+    dimension = dimension_result.scalars().first()
+    if not dimension:
+        raise HTTPException(status_code=404, detail="维度不存在")
+
+    # 1. 创建类型标签（包含SQL规则和所有子标签名称）
+    tag_names = [tag.name for tag in data.tags]
+    type_node = TagNode(
+        name=data.type_name,
+        description=data.type_description,
+        node_type="type",
+        parent_id=data.parent_id if data.parent_id else None,
+        project_id=project_id,
+        dimension_id=data.dimension_id,
+        path=parent_path,
+        level=parent_level + 1,
+        color="#722ed1",  # 紫色表示类型标签
+        rule_type="sql",
+        rule_config=json.dumps({
+            "source": "ai_dimension",
+            "full_sql": data.rule_config.full_sql,
+            "source_table": data.rule_config.source_table,
+            "tag_names": tag_names  # 包含所有子标签名称
+        }),
+        ai_generated=True,
+        created_by=current_user.id
+    )
+    db.add(type_node)
+    await db.flush()  # 获取type_node.id
+
+    # 更新类型标签的path
+    type_node.path = f"{parent_path}/{type_node.id}"
+
+    # 2. 创建值标签（不带SQL规则，只是标签值）
+    tag_nodes = []
+    for i, tag_item in enumerate(data.tags):
+        tag_node = TagNode(
+            name=tag_item.name,
+            description=tag_item.description,
+            node_type="value",
+            parent_id=type_node.id,
+            project_id=project_id,
+            dimension_id=data.dimension_id,
+            path=f"{type_node.path}",
+            level=parent_level + 2,
+            color="#1890ff",
+            # 子标签不需要SQL规则，SQL在类型标签上
+            rule_type=None,
+            rule_config=None,
+            ai_generated=True,
+            sort_order=i,
+            created_by=current_user.id
+        )
+        db.add(tag_node)
+        tag_nodes.append(tag_node)
+
+    await db.flush()
+
+    # 更新子标签的path
+    for tag_node in tag_nodes:
+        tag_node.path = f"{type_node.path}/{tag_node.id}"
+
+    await db.commit()
+
+    # 刷新获取完整数据
+    await db.refresh(type_node)
+    for tag_node in tag_nodes:
+        await db.refresh(tag_node)
+
+    # 构建响应
+    type_response = TagNodeResponse(
+        id=type_node.id,
+        name=type_node.name,
+        description=type_node.description,
+        node_type=type_node.node_type,
+        parent_id=type_node.parent_id,
+        project_id=type_node.project_id,
+        dimension_id=type_node.dimension_id,
+        path=type_node.path,
+        level=type_node.level,
+        color=type_node.color,
+        rule_type=type_node.rule_type,
+        rule_config=type_node.rule_config,
+        ai_generated=type_node.ai_generated,
+        is_active=type_node.is_active,
+        created_at=type_node.created_at,
+        updated_at=type_node.updated_at,
+        dimension_name=dimension.display_name
+    )
+
+    tag_responses = []
+    for tag_node in tag_nodes:
+        tag_responses.append(TagNodeResponse(
+            id=tag_node.id,
+            name=tag_node.name,
+            description=tag_node.description,
+            node_type=tag_node.node_type,
+            parent_id=tag_node.parent_id,
+            project_id=tag_node.project_id,
+            dimension_id=tag_node.dimension_id,
+            path=tag_node.path,
+            level=tag_node.level,
+            color=tag_node.color,
+            rule_type=tag_node.rule_type,
+            rule_config=tag_node.rule_config,
+            ai_generated=tag_node.ai_generated,
+            is_active=tag_node.is_active,
+            created_at=tag_node.created_at,
+            updated_at=tag_node.updated_at,
+            dimension_name=dimension.display_name
+        ))
+
+    return BatchDimensionTagResponse(
+        type_node=type_response,
+        tag_nodes=tag_responses
+    )
 
 
 # ==================== 标签节点 CRUD ====================
@@ -33,11 +460,15 @@ async def list_tag_nodes(
     parent_id: Optional[int] = None,
     node_type: Optional[str] = None,
     keyword: Optional[str] = None,
+    project_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """获取标签节点列表"""
     query = select(TagNode).filter(TagNode.is_active == True)
+
+    if project_id is not None:
+        query = query.filter(TagNode.project_id == project_id)
 
     if parent_id is not None:
         query = query.filter(TagNode.parent_id == parent_id)
@@ -77,6 +508,7 @@ async def list_tag_nodes(
             description=node.description,
             node_type=node.node_type,
             parent_id=node.parent_id,
+            project_id=node.project_id,
             path=node.path,
             level=node.level,
             color=node.color,
@@ -102,17 +534,19 @@ async def list_tag_nodes(
 
 @router.get("/tree")
 async def get_tag_tree(
+    project_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """获取完整的标签树"""
     from app.models.schedule import Schedule, ScheduleStatus
 
-    result = await db.execute(
-        select(TagNode)
-        .filter(TagNode.is_active == True)
-        .order_by(TagNode.sort_order, TagNode.id)
-    )
+    query = select(TagNode).filter(TagNode.is_active == True)
+    if project_id is not None:
+        query = query.filter(TagNode.project_id == project_id)
+    query = query.order_by(TagNode.sort_order, TagNode.id)
+
+    result = await db.execute(query)
     all_nodes = result.scalars().all()
 
     # 查询已上线的标签调度（dag_id 以 tag_task_ 开头且状态为 ACTIVE）
@@ -136,20 +570,24 @@ async def get_tag_tree(
             "color": node.color,
             "icon": node.icon,
             "level": node.level,
+            "parent_id": node.parent_id,
+            "project_id": node.project_id,
+            "dimension_id": node.dimension_id,
             "usage_count": node.usage_count,
             "rule_type": node.rule_type,
             "rule_config": node.rule_config,
             "source_table": node.source_table,
             "tag_table_name": node.tag_table_name,
-            "parent_id": node.parent_id,
             "is_scheduled": is_scheduled,
+            "created_at": node.created_at.isoformat() if node.created_at else None,
+            "updated_at": node.updated_at.isoformat() if node.updated_at else None,
             "children": []
         }
 
     # 组装树形结构
     root_nodes = []
     for node_id, node_data in node_map.items():
-        parent_id = node_data.pop("parent_id")
+        parent_id = node_data.get("parent_id")
         if parent_id and parent_id in node_map:
             node_map[parent_id]["children"].append(node_data)
         else:
@@ -207,6 +645,7 @@ async def create_tag_node(
         description=data.description,
         node_type=data.node_type,
         parent_id=data.parent_id,
+        project_id=data.project_id,
         level=level,
         path=path,
         color=data.color,
@@ -228,6 +667,7 @@ async def create_tag_node(
         description=node.description,
         node_type=node.node_type,
         parent_id=node.parent_id,
+        project_id=node.project_id,
         path=node.path,
         level=node.level,
         color=node.color,
@@ -242,6 +682,50 @@ async def create_tag_node(
         ai_confidence=node.ai_confidence,
         usage_count=node.usage_count,
         is_active=node.is_active,
+        created_at=node.created_at,
+        updated_at=node.updated_at,
+        parent_name=parent_name,
+        children_count=0
+    )
+
+
+@router.get("/nodes/{node_id}", response_model=TagNodeResponse)
+async def get_tag_node(
+    node_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取单个标签节点"""
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    node = result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail="节点不存在")
+
+    # 获取父节点名称
+    parent_name = None
+    if node.parent_id:
+        parent_result = await db.execute(select(TagNode.name).filter(TagNode.id == node.parent_id))
+        parent_name = parent_result.scalar()
+
+    return TagNodeResponse(
+        id=node.id,
+        name=node.name,
+        description=node.description,
+        node_type=node.node_type,
+        parent_id=node.parent_id,
+        project_id=node.project_id,
+        path=node.path,
+        level=node.level,
+        color=node.color,
+        icon=node.icon,
+        sort_order=node.sort_order,
+        rule_type=node.rule_type,
+        rule_config=node.rule_config,
+        tag_table_name=node.tag_table_name,
+        source_datasource_id=node.source_datasource_id,
+        source_table=node.source_table,
+        is_active=node.is_active,
+        usage_count=node.usage_count,
         created_at=node.created_at,
         updated_at=node.updated_at,
         parent_name=parent_name,
@@ -338,11 +822,17 @@ async def delete_tag_node(
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
 
-    # 查找所有子孙节点（通过path前缀）
-    path_prefix = node.path or f"/{node_id}"
-    await db.execute(
-        delete(TagNode).where(TagNode.path.like(f"{path_prefix}%"))
-    )
+    # 先删除所有子节点（parent_id 指向当前节点的）
+    async def delete_children(parent_id: int):
+        children_result = await db.execute(
+            select(TagNode).filter(TagNode.parent_id == parent_id)
+        )
+        children = children_result.scalars().all()
+        for child in children:
+            await delete_children(child.id)
+            await db.delete(child)
+
+    await delete_children(node_id)
     await db.delete(node)
     await db.flush()
 
@@ -497,7 +987,7 @@ async def create_rule_tag(
     node = TagNode(
         name=data.name,
         description=data.description,
-        node_type="tag",
+        node_type=data.node_type or "tag",  # 支持维度标签(tag)和粒度标签(detail)
         parent_id=data.parent_id,
         level=level,
         path=path,
@@ -506,6 +996,7 @@ async def create_rule_tag(
         rule_config=json.dumps(data.rule_config.model_dump(), ensure_ascii=False),
         source_datasource_id=data.rule_config.datasource_id,
         source_table=data.rule_config.source_table,
+        tag_table_name=data.rule_config.tag_table_name,  # 保存AI生成的目标表名
         created_by=current_user.id
     )
     db.add(node)
@@ -521,6 +1012,7 @@ async def create_rule_tag(
         description=node.description,
         node_type=node.node_type,
         parent_id=node.parent_id,
+        project_id=node.project_id,
         path=node.path,
         level=node.level,
         color=node.color,
@@ -768,8 +1260,12 @@ async def execute_rule_tag(
 
     # 生成目标表名
     if not node.tag_table_name:
+        # 默认表名格式：tag_任务名拼音_时间戳
+        import time
         safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', node.name.lower())
-        target_table = f"rule_tag_{safe_name}_{int(__import__('time').time())}"
+        safe_name = re.sub(r'_+', '_', safe_name).strip('_')  # 清理多余下划线
+        timestamp = time.strftime('%Y%m%d%H%M%S')
+        target_table = f"tag_{safe_name}_{timestamp}" if safe_name else f"tag_data_{timestamp}"
         node.tag_table_name = target_table
         await db.flush()
     else:
@@ -972,9 +1468,12 @@ async def get_tag_statistics(
     )
     category_count = result.scalar() or 0
 
-    # 标签数
+    # 标签数（包括 tag 和 value 类型）
     result = await db.execute(
-        select(func.count(TagNode.id)).filter(TagNode.node_type == "tag", TagNode.is_active == True)
+        select(func.count(TagNode.id)).filter(
+            TagNode.node_type.in_(["tag", "value"]),
+            TagNode.is_active == True
+        )
     )
     tag_count = result.scalar() or 0
 
@@ -1005,8 +1504,8 @@ async def get_tag_statistics(
                 # 复合智能标签：有composite_tags字段
                 elif config.get("composite_tags"):
                     composite_tag_count += 1
-                # AI打标：full_sql以 "-- TAGS:" 开头 或 source === 'ai'
-                elif full_sql.startswith("-- TAGS:") or source == "ai":
+                # AI打标：source === 'ai' 或 'ai_chat' 或 'ai_dimension'
+                elif source in ("ai", "ai_chat", "ai_dimension"):
                     ai_generated_count += 1
                 # 其他为普通SQL规则
                 else:
@@ -1016,10 +1515,10 @@ async def get_tag_statistics(
         else:
             rule_tag_count += 1
 
-    # Top标签
+    # Top标签（包括 tag 和 value 类型）
     result = await db.execute(
         select(TagNode.name, TagNode.usage_count)
-        .filter(TagNode.node_type == "tag", TagNode.is_active == True)
+        .filter(TagNode.node_type.in_(["tag", "value"]), TagNode.is_active == True)
         .order_by(TagNode.usage_count.desc())
         .limit(10)
     )
@@ -1221,6 +1720,7 @@ async def create_row_tag_task(
         description=node.description,
         node_type=node.node_type,
         parent_id=node.parent_id,
+        project_id=node.project_id,
         path=node.path,
         level=node.level,
         color=node.color,
@@ -1533,6 +2033,7 @@ async def create_dataset_tag(
         description=node.description,
         node_type=node.node_type,
         parent_id=node.parent_id,
+        project_id=node.project_id,
         path=node.path,
         level=node.level,
         color=node.color,
@@ -1569,25 +2070,47 @@ async def preview_tag_data(
     if not node:
         raise HTTPException(status_code=404, detail="标签节点不存在")
 
-    if not node.tag_table_name:
+    # 值标签 (value/tag 类型) 需要从父节点的表中筛选
+    tag_table_name = node.tag_table_name
+    filter_condition = None
+
+    if node.node_type in ('value', 'tag') and not tag_table_name and node.parent_id:
+        # 获取父节点（类型标签）
+        parent_result = await db.execute(select(TagNode).filter(TagNode.id == node.parent_id))
+        parent_node = parent_result.scalars().first()
+        if parent_node and parent_node.tag_table_name:
+            tag_table_name = parent_node.tag_table_name
+            # 值标签按 tag_name 字段筛选
+            filter_condition = f"tag_name = '{node.name}'"
+
+    if not tag_table_name:
         return {"columns": [], "rows": [], "total": 0}
 
     engine, _ = await get_warehouse_engine(db)
 
     with engine.connect() as conn:
+        # 构建查询SQL
+        if filter_condition:
+            data_sql = f"SELECT * FROM `{tag_table_name}` WHERE {filter_condition} LIMIT {limit}"
+            count_sql = f"SELECT COUNT(*) FROM `{tag_table_name}` WHERE {filter_condition}"
+        else:
+            data_sql = f"SELECT * FROM `{tag_table_name}` LIMIT {limit}"
+            count_sql = f"SELECT COUNT(*) FROM `{tag_table_name}`"
+
         # 获取数据
-        result = conn.execute(text(f"SELECT * FROM `{node.tag_table_name}` LIMIT {limit}"))
+        result = conn.execute(text(data_sql))
         columns = list(result.keys())
         rows = [list(row) for row in result.fetchall()]
 
         # 获取总数
-        count_result = conn.execute(text(f"SELECT COUNT(*) FROM `{node.tag_table_name}`"))
+        count_result = conn.execute(text(count_sql))
         total = count_result.scalar() or 0
 
     return {
         "columns": columns,
         "rows": rows,
-        "total": total
+        "total": total,
+        "filter": filter_condition  # 返回筛选条件供前端显示
     }
 
 
@@ -1699,12 +2222,22 @@ SELECT 'tag_task_{node.id}' as task_type;
         description = f"AI打标任务自动调度: {node.description or node.name}"
         execute_endpoint = f"row-tag/{node.id}/execute"
 
+    # 生成 DAG 代码
+    dag_code = dag_generator.generate_sql_dag(
+        name=dag_id,
+        description=description,
+        sql_content=sql_content,
+        conn_id="warehouse_default",  # 使用默认连接
+        schedule_interval=cron_expression,
+    )
+
     schedule = Schedule(
         name=f"标签任务-{node.name}",
         description=description,
         dag_id=dag_id,
         cron_expression=cron_expression,
         sql_content=sql_content,
+        dag_code=dag_code,  # 保存生成的 DAG 代码
         datasource_id=node.source_datasource_id,
         status=ScheduleStatus.DRAFT,
         created_by=current_user.id,
@@ -1721,3 +2254,731 @@ SELECT 'tag_task_{node.id}' as task_type;
         "rule_type": node.rule_type,
         "execute_endpoint": execute_endpoint,
     }
+
+
+# ==================== 层级管理 ====================
+
+@router.get("/unbound")
+async def get_unbound_tags(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取未绑定层级的标签列表（parent_id 为空的 tag 类型节点）"""
+    result = await db.execute(
+        select(TagNode)
+        .filter(TagNode.is_active == True)
+        .filter(TagNode.node_type == "tag")
+        .filter(TagNode.parent_id == None)
+        .order_by(TagNode.created_at.desc())
+    )
+    nodes = result.scalars().all()
+
+    return [
+        {
+            "id": node.id,
+            "name": node.name,
+            "description": node.description,
+            "rule_type": node.rule_type,
+            "source_table": node.source_table,
+            "usage_count": node.usage_count,
+            "created_at": node.created_at.isoformat() if node.created_at else None,
+        }
+        for node in nodes
+    ]
+
+
+@router.get("/hierarchy")
+async def get_hierarchy_nodes(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取层级节点树（只包含 category 和 type，用于层级选择）"""
+    result = await db.execute(
+        select(TagNode)
+        .filter(TagNode.is_active == True)
+        .filter(TagNode.node_type.in_(["category", "type"]))
+        .order_by(TagNode.sort_order, TagNode.id)
+    )
+    all_nodes = result.scalars().all()
+
+    # 构建树形结构
+    node_map = {}
+    for node in all_nodes:
+        node_map[node.id] = {
+            "id": node.id,
+            "name": node.name,
+            "node_type": node.node_type,
+            "parent_id": node.parent_id,
+            "children": []
+        }
+
+    root_nodes = []
+    for node_id, node_data in node_map.items():
+        parent_id = node_data.pop("parent_id")
+        if parent_id and parent_id in node_map:
+            node_map[parent_id]["children"].append(node_data)
+        else:
+            root_nodes.append(node_data)
+
+    return root_nodes
+
+
+@router.put("/nodes/{node_id}/bind")
+async def bind_tag_to_parent(
+    node_id: int,
+    parent_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """绑定标签到层级（设置 parent_id）"""
+    # 获取标签节点
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    node = result.scalars().first()
+    if not node:
+        raise HTTPException(status_code=404, detail="标签不存在")
+    if node.node_type != "tag":
+        raise HTTPException(status_code=400, detail="只能绑定标签类型的节点")
+
+    # 验证父节点
+    if parent_id:
+        parent_result = await db.execute(select(TagNode).filter(TagNode.id == parent_id))
+        parent = parent_result.scalars().first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="父节点不存在")
+        if parent.node_type == "tag":
+            raise HTTPException(status_code=400, detail="不能绑定到标签下")
+
+        # 更新层级信息
+        node.parent_id = parent_id
+        node.level = parent.level + 1
+        node.path = f"{parent.path or ''}/{parent.id}"
+    else:
+        # 解绑
+        node.parent_id = None
+        node.level = 1
+        node.path = f"/{node.id}"
+
+    await db.flush()
+    await db.refresh(node)
+
+    return {
+        "message": "绑定成功" if parent_id else "已解绑",
+        "id": node.id,
+        "parent_id": node.parent_id,
+    }
+
+
+# ==================== AI 对话打标 ====================
+
+import uuid
+from datetime import datetime
+from app.schemas.tag import (
+    CreateChatRequest, CreateChatResponse,
+    SendMessageRequest, SendMessageResponse,
+    ChatMessage, ChatSessionResponse,
+    ConfirmSchemaRequest, DataSchema
+)
+
+# 内存会话存储（简化版，生产环境建议使用 Redis）
+_chat_sessions: dict = {}
+
+
+@router.post("/chat/create", response_model=CreateChatResponse)
+async def create_chat_session(
+    data: CreateChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    创建对话会话
+    - 传 table_name: 单表模式，获取指定表的结构和样本数据
+    - 不传 table_name: 全库模式，获取所有表的结构信息
+    """
+    engine, config = await get_warehouse_engine(db)
+
+    table_schema = ""
+    sample_data = []
+    initial_prompt = ""
+
+    try:
+        with engine.connect() as conn:
+            if data.table_name:
+                # 单表模式
+                desc_result = conn.execute(text(f"DESCRIBE `{data.table_name}`"))
+                columns = desc_result.fetchall()
+                table_schema = f"表名: {data.table_name}\n字段:\n"
+                for col in columns:
+                    table_schema += f"  - {col[0]}: {col[1]}\n"
+
+                sample_result = conn.execute(text(f"SELECT * FROM `{data.table_name}` LIMIT 5"))
+                column_names = list(sample_result.keys())
+                rows = sample_result.fetchall()
+                sample_data = [dict(zip(column_names, row)) for row in rows]
+
+                initial_prompt = data.first_message or "你好，我想看看这张表的数据"
+            else:
+                # 全库模式：获取所有表的结构信息
+                schema_name = config.get("schema_name") or config.get("database")
+                tables_result = conn.execute(text(
+                    f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'"
+                ))
+                all_tables = [row[0] for row in tables_result.fetchall()]
+
+                table_schema = f"数据库: {schema_name}\n共 {len(all_tables)} 张表:\n\n"
+
+                # 获取每张表的结构（限制最多20张表的详细信息）
+                for i, tbl in enumerate(all_tables[:20]):
+                    try:
+                        desc_result = conn.execute(text(f"DESCRIBE `{tbl}`"))
+                        columns = desc_result.fetchall()
+                        table_schema += f"【{tbl}】\n"
+                        for col in columns:
+                            table_schema += f"  - {col[0]}: {col[1]}\n"
+                        table_schema += "\n"
+                    except:
+                        table_schema += f"【{tbl}】(无法获取结构)\n\n"
+
+                if len(all_tables) > 20:
+                    table_schema += f"\n... 还有 {len(all_tables) - 20} 张表未列出\n"
+                    table_schema += f"所有表名: {', '.join(all_tables)}\n"
+
+                # 全库模式不获取样本数据，由用户指定后再获取
+                sample_data = [{"_info": f"全库模式，共 {len(all_tables)} 张表可用"}]
+                initial_prompt = data.first_message or "你好，我想看看有什么数据"
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取数据失败: {str(e)}")
+
+    # 创建会话
+    session_id = str(uuid.uuid4())
+    now = datetime.now()
+
+    # AI 初始分析
+    ai_assistant = AIAssistant()
+    initial_result = ai_assistant.chat_for_tagging(
+        table_schema=table_schema,
+        sample_data=sample_data,
+        messages=[],
+        user_message=initial_prompt
+    )
+
+    # 保存会话
+    _chat_sessions[session_id] = {
+        "session_id": session_id,
+        "table_name": data.table_name,  # 可能为 None（全库模式）
+        "table_schema": table_schema,
+        "sample_data": sample_data,
+        "messages": [
+            {"role": "user", "content": initial_prompt, "timestamp": now.isoformat()},
+            {"role": "assistant", "content": initial_result["reply"], "timestamp": now.isoformat()},
+        ],
+        "confirmed_schemas": [],  # 已确认的数据方案列表
+        "generated_sql": None,
+        "created_at": now.isoformat(),
+        "user_id": current_user.id,
+    }
+
+    return CreateChatResponse(
+        session_id=session_id,
+        table_schema=table_schema,
+        sample_data=sample_data,
+        initial_message=initial_result["reply"]
+    )
+
+
+@router.post("/chat/send", response_model=SendMessageResponse)
+async def send_chat_message(
+    data: SendMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """发送对话消息"""
+    session = _chat_sessions.get(data.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    # 构建消息历史
+    messages = [{"role": m["role"], "content": m["content"]} for m in session["messages"]]
+
+    # 调用 AI，传递已确认的方案
+    ai_assistant = AIAssistant()
+    result = ai_assistant.chat_for_tagging(
+        table_schema=session["table_schema"],
+        sample_data=session["sample_data"],
+        messages=messages,
+        user_message=data.message,
+        confirmed_schemas=session.get("confirmed_schemas", [])
+    )
+
+    # 更新会话
+    now = datetime.now()
+    session["messages"].append({"role": "user", "content": data.message, "timestamp": now.isoformat()})
+    session["messages"].append({"role": "assistant", "content": result["reply"], "timestamp": now.isoformat()})
+
+    if result["is_final"]:
+        session["generated_sql"] = result["sql"]
+        session["task_name"] = result.get("task_name")
+        session["task_desc"] = result.get("task_desc")
+        session["table_name"] = result.get("table_name")
+
+    # 构建方案响应
+    schema_response = None
+    if result.get("schema"):
+        schema_response = DataSchema(**result["schema"])
+
+    return SendMessageResponse(
+        session_id=data.session_id,
+        reply=result["reply"],
+        schema=schema_response,
+        generated_sql=result["sql"],
+        is_final=result["is_final"],
+        task_name=result.get("task_name"),
+        task_desc=result.get("task_desc"),
+        table_name=result.get("table_name")
+    )
+
+
+@router.post("/chat/confirm-schema")
+async def confirm_schema(
+    data: ConfirmSchemaRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """确认方案，添加到已确认列表"""
+    session = _chat_sessions.get(data.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    # 添加到已确认方案列表
+    schema_dict = data.schema.model_dump()
+    session["confirmed_schemas"].append(schema_dict)
+
+    return {
+        "message": "方案已确认",
+        "confirmed_count": len(session["confirmed_schemas"]),
+        "schemas": session["confirmed_schemas"]
+    }
+
+
+@router.delete("/chat/{session_id}/schema/{index}")
+async def remove_confirmed_schema(
+    session_id: str,
+    index: int,
+    current_user: User = Depends(get_current_user)
+):
+    """移除已确认的方案"""
+    session = _chat_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    schemas = session.get("confirmed_schemas", [])
+    if 0 <= index < len(schemas):
+        removed = schemas.pop(index)
+        return {"message": "方案已移除", "removed": removed, "remaining": len(schemas)}
+    else:
+        raise HTTPException(status_code=400, detail="无效的方案索引")
+
+
+@router.get("/chat/{session_id}", response_model=ChatSessionResponse)
+async def get_chat_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """获取对话会话信息"""
+    session = _chat_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    return ChatSessionResponse(
+        session_id=session["session_id"],
+        table_name=session["table_name"],
+        messages=[
+            ChatMessage(role=m["role"], content=m["content"], timestamp=m.get("timestamp"))
+            for m in session["messages"]
+        ],
+        confirmed_schemas=[DataSchema(**s) for s in session.get("confirmed_schemas", [])],
+        generated_sql=session.get("generated_sql")
+    )
+
+
+@router.delete("/chat/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """删除对话会话"""
+    if session_id in _chat_sessions:
+        del _chat_sessions[session_id]
+    return {"message": "会话已删除"}
+
+
+# ==================== AI 维度标签对话 ====================
+
+# 维度对话会话存储
+_dimension_chat_sessions: dict = {}
+
+
+@router.post("/chat/dimension/create")
+async def create_dimension_chat_session(
+    dimension_id: int,
+    first_message: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    创建维度标签对话会话
+    """
+    # 验证维度存在
+    dimension_result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
+    dimension = dimension_result.scalars().first()
+    if not dimension:
+        raise HTTPException(status_code=404, detail="维度不存在")
+
+    # 获取仓库连接
+    engine, config = await get_warehouse_engine(db)
+
+    table_schema = ""
+    sample_data = []
+
+    try:
+        with engine.connect() as conn:
+            # 全库模式：获取所有表的结构信息
+            schema_name = config.get("schema_name") or config.get("database")
+            tables_result = conn.execute(text(
+                f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'"
+            ))
+            all_tables = [row[0] for row in tables_result.fetchall()]
+
+            table_schema = f"数据库: {schema_name}\n共 {len(all_tables)} 张表:\n\n"
+
+            # 获取每张表的结构（限制最多20张表）
+            for tbl in all_tables[:20]:
+                try:
+                    desc_result = conn.execute(text(f"DESCRIBE `{tbl}`"))
+                    columns = desc_result.fetchall()
+                    table_schema += f"【{tbl}】\n"
+                    for col in columns:
+                        table_schema += f"  - {col[0]}: {col[1]}\n"
+                    table_schema += "\n"
+                except:
+                    table_schema += f"【{tbl}】(无法获取结构)\n\n"
+
+            if len(all_tables) > 20:
+                table_schema += f"\n... 还有 {len(all_tables) - 20} 张表未列出\n"
+                table_schema += f"所有表名: {', '.join(all_tables)}\n"
+
+            sample_data = [{"_info": f"全库模式，共 {len(all_tables)} 张表可用"}]
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取数据失败: {str(e)}")
+
+    # 创建会话
+    session_id = str(uuid.uuid4())
+    now = datetime.now()
+
+    dimension_info = {
+        "id": dimension.id,
+        "display_name": dimension.display_name,
+        "id_field": dimension.id_field,
+        "name": dimension.name
+    }
+
+    initial_prompt = first_message or f"你好，我想在{dimension.display_name}下创建一些标签"
+
+    # AI 初始分析
+    ai_assistant = AIAssistant()
+    initial_result = ai_assistant.chat_for_dimension_tagging(
+        table_schema=table_schema,
+        sample_data=sample_data,
+        messages=[],
+        user_message=initial_prompt,
+        dimension_info=dimension_info
+    )
+
+    # 保存会话
+    _dimension_chat_sessions[session_id] = {
+        "session_id": session_id,
+        "dimension_id": dimension_id,
+        "dimension_info": dimension_info,
+        "table_schema": table_schema,
+        "sample_data": sample_data,
+        "messages": [
+            {"role": "user", "content": initial_prompt, "timestamp": now.isoformat()},
+            {"role": "assistant", "content": initial_result["reply"], "timestamp": now.isoformat()},
+        ],
+        "confirmed_tags": [],
+        "created_at": now.isoformat(),
+        "user_id": current_user.id,
+    }
+
+    return {
+        "session_id": session_id,
+        "dimension": dimension_info,
+        "table_schema": table_schema,
+        "initial_message": initial_result["reply"]
+    }
+
+
+@router.post("/chat/dimension/send")
+async def send_dimension_chat_message(
+    session_id: str,
+    message: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """发送维度标签对话消息"""
+    session = _dimension_chat_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    # 构建消息历史
+    messages = [{"role": m["role"], "content": m["content"]} for m in session["messages"]]
+
+    # 调用 AI
+    ai_assistant = AIAssistant()
+    result = ai_assistant.chat_for_dimension_tagging(
+        table_schema=session["table_schema"],
+        sample_data=session["sample_data"],
+        messages=messages,
+        user_message=message,
+        dimension_info=session["dimension_info"],
+        confirmed_tags=session.get("confirmed_tags", [])
+    )
+
+    # 更新消息历史
+    now = datetime.now()
+    session["messages"].append({"role": "user", "content": message, "timestamp": now.isoformat()})
+    session["messages"].append({"role": "assistant", "content": result["reply"], "timestamp": now.isoformat()})
+
+    response = {
+        "session_id": session_id,
+        "reply": result["reply"],
+        "tags": result.get("tags"),
+        "type_name": result.get("type_name"),
+        "type_description": result.get("type_description"),
+        "sql": result.get("sql"),
+        "is_final": result.get("is_final", False),
+        "dimension_tags_list": result.get("dimension_tags_list"),  # 多个类型标签
+    }
+
+    # 如果是最终结果，保存到会话
+    if result.get("is_final"):
+        if result.get("dimension_tags_list"):
+            # 多个类型标签
+            session["dimension_tags_list"] = result.get("dimension_tags_list")
+        else:
+            session["generated_sql"] = result.get("sql")
+            session["type_name"] = result.get("type_name")
+            session["type_description"] = result.get("type_description")
+            session["confirmed_tags"] = result.get("tags", [])
+
+    return response
+
+
+@router.get("/chat/dimension/{session_id}")
+async def get_dimension_chat_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """获取维度标签对话会话信息"""
+    session = _dimension_chat_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    return {
+        "session_id": session["session_id"],
+        "dimension": session["dimension_info"],
+        "messages": [
+            {"role": m["role"], "content": m["content"], "timestamp": m.get("timestamp")}
+            for m in session["messages"]
+        ],
+        "confirmed_tags": session.get("confirmed_tags", []),
+        "generated_sql": session.get("generated_sql"),
+        "type_name": session.get("type_name"),
+        "type_description": session.get("type_description")
+    }
+
+
+@router.delete("/chat/dimension/{session_id}")
+async def delete_dimension_chat_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """删除维度标签对话会话"""
+    if session_id in _dimension_chat_sessions:
+        del _dimension_chat_sessions[session_id]
+    return {"message": "会话已删除"}
+
+
+# ==================== AI 维度定义对话 ====================
+
+# 维度定义会话存储
+_dimension_define_sessions: dict = {}
+
+
+@router.post("/chat/define-dimension/create")
+async def create_dimension_define_session(
+    first_message: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    创建维度定义对话会话
+    用户通过AI对话来定义新的维度
+    """
+    # 获取仓库连接
+    engine, config = await get_warehouse_engine(db)
+
+    table_schema = ""
+
+    try:
+        with engine.connect() as conn:
+            # 获取所有表的结构，只提取ID相关字段
+            schema_name = config.get("schema_name") or config.get("database")
+            tables_result = conn.execute(text(
+                f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'"
+            ))
+            all_tables = [row[0] for row in tables_result.fetchall()]
+
+            # 只列出每个表的ID字段
+            id_fields_info = []
+            for tbl in all_tables[:50]:
+                try:
+                    desc_result = conn.execute(text(f"DESCRIBE `{tbl}`"))
+                    columns = desc_result.fetchall()
+                    id_cols = []
+                    for col in columns:
+                        col_name = col[0].lower()
+                        if '_id' in col_name or col_name == 'id' or col_name.endswith('id'):
+                            id_cols.append(col[0])
+                    if id_cols:
+                        id_fields_info.append(f"{tbl}: {', '.join(id_cols)}")
+                except:
+                    pass
+
+            table_schema = "可用的ID字段:\n" + "\n".join(id_fields_info)
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取数据失败: {str(e)}")
+
+    # 创建会话
+    session_id = str(uuid.uuid4())
+    now = datetime.now()
+
+    initial_prompt = first_message or "你好，我想定义一个新的维度"
+
+    # AI 初始分析
+    ai_assistant = AIAssistant()
+    initial_result = ai_assistant.chat_for_dimension_definition(
+        table_schema=table_schema,
+        messages=[],
+        user_message=initial_prompt
+    )
+
+    # 保存会话
+    _dimension_define_sessions[session_id] = {
+        "session_id": session_id,
+        "table_schema": table_schema,
+        "messages": [
+            {"role": "user", "content": initial_prompt, "timestamp": now.isoformat()},
+            {"role": "assistant", "content": initial_result["reply"], "timestamp": now.isoformat()},
+        ],
+        "defined_dimension": None,
+        "created_at": now.isoformat(),
+        "user_id": current_user.id,
+    }
+
+    return {
+        "session_id": session_id,
+        "initial_message": initial_result["reply"],
+        "dimension": initial_result.get("dimension"),
+        "is_final": initial_result.get("is_final", False)
+    }
+
+
+@router.post("/chat/define-dimension/send")
+async def send_dimension_define_message(
+    session_id: str,
+    message: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """发送维度定义对话消息"""
+    session = _dimension_define_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    # 构建消息历史
+    messages = [{"role": m["role"], "content": m["content"]} for m in session["messages"]]
+
+    # 调用 AI
+    ai_assistant = AIAssistant()
+    result = ai_assistant.chat_for_dimension_definition(
+        table_schema=session["table_schema"],
+        messages=messages,
+        user_message=message
+    )
+
+    # 更新消息历史
+    now = datetime.now()
+    session["messages"].append({"role": "user", "content": message, "timestamp": now.isoformat()})
+    session["messages"].append({"role": "assistant", "content": result["reply"], "timestamp": now.isoformat()})
+
+    # 如果AI返回了维度定义，保存到会话
+    if result.get("is_final") and result.get("dimension"):
+        session["defined_dimension"] = result["dimension"]
+
+    return {
+        "session_id": session_id,
+        "reply": result["reply"],
+        "dimension": result.get("dimension"),
+        "is_final": result.get("is_final", False)
+    }
+
+
+@router.post("/chat/define-dimension/confirm")
+async def confirm_dimension_definition(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """确认并保存维度定义"""
+    session = _dimension_define_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+
+    dimension_data = session.get("defined_dimension")
+    if not dimension_data:
+        raise HTTPException(status_code=400, detail="还没有确定的维度定义")
+
+    # 创建维度
+    dimension = TagDimension(
+        name=dimension_data["name"],
+        display_name=dimension_data["display_name"],
+        id_field=dimension_data["id_field"],
+        description=dimension_data.get("description", ""),
+        is_preset=False,
+        is_active=True,
+        created_by=current_user.id
+    )
+    db.add(dimension)
+    await db.commit()
+    await db.refresh(dimension)
+
+    # 清理会话
+    del _dimension_define_sessions[session_id]
+
+    return {
+        "message": "维度创建成功",
+        "dimension": TagDimensionResponse.model_validate(dimension)
+    }
+
+
+@router.delete("/chat/define-dimension/{session_id}")
+async def delete_dimension_define_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """删除维度定义对话会话"""
+    if session_id in _dimension_define_sessions:
+        del _dimension_define_sessions[session_id]
+    return {"message": "会话已删除"}

@@ -130,8 +130,11 @@ async def delete_schedule(
 
     # Remove DAG file if deployed
     if schedule.is_deployed:
-        dag_generator = DAGGenerator()
-        dag_generator.remove_dag(schedule.dag_id)
+        try:
+            dag_generator = DAGGenerator()
+            dag_generator.remove_dag(schedule.dag_id)
+        except Exception:
+            pass  # 忽略DAG删除错误，继续删除数据库记录
 
     await db.delete(schedule)
     await db.flush()

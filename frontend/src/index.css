@@ -69,3 +69,49 @@ body {
 .apple-style-modal .ant-modal-confirm-content {
   margin: 0;
 }
+
+/* Mini confirm modal */
+.mini-confirm .ant-modal-content {
+  padding: 16px 20px !important;
+}
+
+.mini-confirm .ant-modal-confirm-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mini-confirm .ant-modal-confirm-content {
+  margin: 0 !important;
+}
+
+.mini-confirm .ant-modal-confirm-btns {
+  margin-top: 12px !important;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.mini-confirm .ant-modal-confirm-btns .ant-btn {
+  min-width: 60px;
+  height: 28px;
+  font-size: 13px;
+}
+
+/* Highlighted row animation for task list */
+.highlighted-row {
+  animation: highlightPulse 1.5s ease-in-out 3;
+}
+
+.highlighted-row td {
+  background-color: #fff7e6 !important;
+}
+
+@keyframes highlightPulse {
+  0%, 100% {
+    background-color: #fff7e6;
+  }
+  50% {
+    background-color: #ffe58f;
+  }
+}

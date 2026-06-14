@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -264,11 +265,27 @@ async def execute_warehouse_query(
         )
     except HTTPException:
         raise
+    except SQLAlchemyError as e:
+        # 数据库错误（约束冲突、语法错误等）是用户SQL问题，直接返回给前端
+        error_msg = str(e)
+        if hasattr(e, 'orig') and e.orig:
+            orig_args = getattr(e.orig, 'args', None)
+            if orig_args and len(orig_args) >= 2:
+                error_msg = orig_args[1]
+            elif orig_args:
+                error_msg = str(orig_args[0])
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_msg
+        )
     except Exception as e:
+        # 真正的系统错误才记录日志
         import traceback
         import logging
         logging.error(f"Warehouse query failed: {str(e)}\nSQL: {query_data.sql}\nTraceback: {traceback.format_exc()}")
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"SQL执行失败: {str(e)}"
+            detail=f"系统错误: {str(e)}"
         )

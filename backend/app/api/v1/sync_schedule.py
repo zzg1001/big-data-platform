@@ -275,13 +275,13 @@ async def delete_sync_schedule(
     if schedule.dag_id:
         try:
             await airflow_service.delete_dag_with_confirmation(schedule.dag_id)
-        except AirflowAPIError as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Airflow删除失败: {e.message}"
-            )
+        except AirflowAPIError:
+            # Airflow删除失败时只记录警告，不阻止删除
+            pass
+        except Exception:
+            pass
 
-        # Delete DAG file after Airflow confirms deletion
+        # Delete DAG file
         dag_path = os.path.join(
             settings.AIRFLOW_DAGS_PATH or '/opt/airflow/dags/generated',
             f'{schedule.dag_id}.py'

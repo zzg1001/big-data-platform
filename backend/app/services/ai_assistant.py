@@ -3,8 +3,12 @@ AI assistant service using Anthropic Claude API.
 """
 from typing import Optional, List
 import json
+import logging
 
 import anthropic
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 from app.schemas.ai import (
@@ -40,6 +44,417 @@ class AIAssistant:
             ],
         )
         return response.content[0].text
+
+    def _call_claude_with_history(
+        self, system_prompt: str, messages: List[dict], temperature: float = 0.3
+    ) -> str:
+        """调用 Claude API 支持多轮对话"""
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+            temperature=temperature,
+        )
+        return response.content[0].text
+
+    def chat_for_tagging(
+        self,
+        table_schema: str,
+        sample_data: List[dict],
+        messages: List[dict],
+        user_message: str,
+        confirmed_schemas: List[dict] = None,
+    ) -> dict:
+        """
+        打标对话 - 迭代累积模式
+        每次用户描述业务场景，AI 给出一个数据圈选方案（表+字段）
+        用户确认后累积，最终组合成宽表
+
+        返回: {
+            "reply": str,
+            "schema": Optional[dict],  # 方案：{name, description, table, fields, join_key}
+            "sql": Optional[str],      # 最终宽表SQL
+            "is_final": bool
+        }
+        """
+        sample_json = json.dumps(sample_data, ensure_ascii=False, indent=2, default=str)
+        confirmed_schemas = confirmed_schemas or []
+
+        # 构建已确认方案的描述
+        confirmed_desc = ""
+        if confirmed_schemas:
+            confirmed_desc = "\n\n## 已确认的方案（用户已确认，将组合到最终宽表）\n"
+            for i, schema in enumerate(confirmed_schemas, 1):
+                confirmed_desc += f"{i}. 【{schema['name']}】\n"
+                confirmed_desc += f"   - 表: {schema['table']}\n"
+                confirmed_desc += f"   - 字段: {', '.join(schema['fields'])}\n"
+                if schema.get('join_key'):
+                    confirmed_desc += f"   - 关联键: {schema['join_key']}\n"
+                confirmed_desc += f"   - 说明: {schema.get('description', '')}\n"
+
+        system_prompt = f"""你是业务顾问，帮用户整理数据。用自然的人话沟通，像同事聊天一样。
+
+## 内部参考（绝不展示给用户）
+{table_schema}
+
+{sample_json}
+{confirmed_desc}
+
+## 沟通原则
+1. **说人话**：像同事聊天，不要像机器人
+2. **主动推荐**：告诉用户可以从哪些角度看，让他选
+3. **让用户少说话**：给默认方案，用户说"行"就过
+4. **禁止技术词汇**：不说表名、字段名、数据库、SQL、生成、确认
+
+## 对话示例
+
+用户：我出差帮推荐个酒店
+你：去哪个城市？酒店的话可以看价格、评分、位置、早餐这些，你比较在意哪个？
+
+用户：深圳，看性价比
+你：好，深圳酒店按性价比排。我先给你整理：酒店名、价格、评分、地址。还要加房型、设施这些吗？
+
+用户：不用
+你：那就这些：
+- 深圳的酒店
+- 按性价比排
+- 看：酒店名、价格、评分、地址
+
+这些维度够了吗？还要补充什么？
+
+用户：够了 / 可以 / 行
+你：（返回JSON方案）
+
+## 关键话术
+- 问确认时说：「这些维度够了吗？还要补充什么？」
+- 不要说：「确认吗？」「是否生成？」「请确认」
+- 用户说「行」「可以」「够了」「就这样」「同意」时，返回JSON
+
+## 响应格式
+
+普通对话：自然的文字回复
+
+用户同意后返回JSON：
+{{"type": "schema", "name": "方案名称", "description": "描述", "table": "表名", "fields": ["字段1", "字段2"], "join_key": "关联字段", "explanation": "方案说明"}}
+
+汇总宽表时返回JSON：
+{{"type": "final", "sql": "SQL语句", "task_name": "任务名称", "task_desc": "任务描述", "table_name": "tag_业务推导", "explanation": "说明"}}
+
+注意：
+- task_name：根据业务场景推断一个简洁的中文名称，如「深圳酒店性价比分析」「高价值客户画像」
+- task_desc：根据业务场景推断一段描述，说明这个任务的目的和内容，如「筛选深圳地区性价比高的酒店，包含价格、评分、地址等信息」
+- table_name：英文小写+下划线，格式为 tag_业务推断，如「tag_hotel_value」「tag_high_value_customer」「tag_shenzhen_hotel」，前端会自动加时间戳
+
+## SQL格式要求（非常重要）
+生成的SQL必须美化格式，每个子句换行，适当缩进：
+
+正确示例：
+SELECT
+    h.hotel_name,
+    h.price,
+    h.rating,
+    h.address
+FROM hotel h
+WHERE h.city = '深圳'
+    AND h.price <= 500
+ORDER BY h.rating / h.price DESC
+
+错误示例（禁止）：
+SELECT h.hotel_name, h.price, h.rating, h.address FROM hotel h WHERE h.city = '深圳' AND h.price <= 500 ORDER BY h.rating / h.price DESC
+"""
+
+        # 构建消息历史
+        chat_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+        chat_messages.append({"role": "user", "content": user_message})
+
+        # 打印日志：用户消息和相关上下文
+        logger.info("=" * 50)
+        logger.info("[AI Chat] 用户消息: %s", user_message)
+        logger.info("[AI Chat] 可用表结构:\n%s", table_schema[:500] + "..." if len(table_schema) > 500 else table_schema)
+        if confirmed_schemas:
+            logger.info("[AI Chat] 已确认方案: %s", json.dumps(confirmed_schemas, ensure_ascii=False, indent=2))
+
+        response = self._call_claude_with_history(system_prompt, chat_messages)
+
+        # 打印日志：AI 响应
+        logger.info("[AI Chat] AI 响应: %s", response[:500] + "..." if len(response) > 500 else response)
+
+        result = {"reply": response, "schema": None, "sql": None, "is_final": False}
+
+        # 检查是否包含 JSON 响应
+        if '"type":' in response or '"type" :' in response:
+            try:
+                json_start = response.find("{")
+                json_end = response.rfind("}") + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response[json_start:json_end]
+                    data = json.loads(json_str)
+
+                    if data.get("type") == "schema":
+                        # 返回方案
+                        result["schema"] = {
+                            "name": data.get("name", "未命名方案"),
+                            "description": data.get("description", ""),
+                            "table": data.get("table", ""),
+                            "fields": data.get("fields", []),
+                            "join_key": data.get("join_key", ""),
+                        }
+                        result["reply"] = data.get("explanation", response)
+                        logger.info("[AI Chat] 解析到方案: %s", json.dumps(result["schema"], ensure_ascii=False))
+
+                    elif data.get("type") == "final":
+                        # 返回最终 SQL
+                        result["sql"] = data.get("sql")
+                        result["is_final"] = True
+                        result["task_name"] = data.get("task_name", "数据分析任务")
+                        result["task_desc"] = data.get("task_desc", "")
+                        result["table_name"] = data.get("table_name", "tag_analysis")
+                        result["reply"] = data.get("explanation", response)
+                        logger.info("[AI Chat] 解析到最终SQL: %s", result["sql"][:200] if result["sql"] else "无")
+                        logger.info("[AI Chat] 任务名称: %s, 描述: %s, 表名: %s", result["task_name"], result["task_desc"], result["table_name"])
+
+            except json.JSONDecodeError as e:
+                logger.warning("[AI Chat] JSON解析失败: %s", str(e))
+
+        logger.info("=" * 50)
+        return result
+
+    def chat_for_dimension_tagging(
+        self,
+        table_schema: str,
+        sample_data: List[dict],
+        messages: List[dict],
+        user_message: str,
+        dimension_info: dict,  # {display_name, id_field}
+        confirmed_tags: List[dict] = None,
+    ) -> dict:
+        """
+        维度标签对话 - 基于选定维度生成标签
+
+        约束：
+        1. 生成的SQL必须包含维度的ID字段
+        2. 一次只生成一个类型标签 + 多个子维度标签
+        3. 类型标签由AI根据用户描述推断
+
+        返回: {
+            "reply": str,
+            "tags": Optional[List[dict]],  # 标签列表：[{name, description}]
+            "type_name": Optional[str],    # 类型标签名称
+            "type_description": Optional[str],  # 类型标签描述
+            "sql": Optional[str],          # 完整SQL
+            "is_final": bool
+        }
+        """
+        sample_json = json.dumps(sample_data, ensure_ascii=False, indent=2, default=str)
+        confirmed_tags = confirmed_tags or []
+        dimension_name = dimension_info.get("display_name", "维度")
+        id_field = dimension_info.get("id_field", "id")
+
+        # 构建已确认标签的描述
+        confirmed_desc = ""
+        if confirmed_tags:
+            confirmed_desc = "\n\n## 已确认的标签（将生成SQL）\n"
+            for i, tag in enumerate(confirmed_tags, 1):
+                confirmed_desc += f"{i}. {tag['name']}: {tag.get('description', '')}\n"
+
+        system_prompt = f"""你是标签助手。当前是【{dimension_name}】，一次性列出所有可做的基础标签供用户勾选。
+
+## 当前维度
+- 维度：{dimension_name}
+- ID字段：{id_field}
+{confirmed_desc}
+
+## 实际数据（根据这个推荐，不要编造）
+{table_schema}
+
+样本：
+{sample_json}
+
+## 核心原则
+1. 首次回复：一次性列出所有能做的基础标签，返回JSON格式供前端渲染勾选框
+2. 用户可以勾选、取消勾选、补充新标签
+3. 用户说"确认/生成/好了"时，根据最终选择生成SQL
+
+## 首次回复格式（必须返回JSON）
+
+用户问"帮我做标签"或类似请求时，直接返回：
+{{"type": "tag_suggestions", "message": "根据数据，可做以下标签，请勾选：", "suggestions": [
+  {{"type_name": "性别标签", "type_description": "用户性别", "field": "gender", "values": [
+    {{"name": "男", "description": "男性", "condition": "gender='M'"}},
+    {{"name": "女", "description": "女性", "condition": "gender='F'"}}
+  ]}},
+  {{"type_name": "年龄标签", "type_description": "年龄段", "field": "age", "values": [
+    {{"name": "青年", "description": "18-35岁", "condition": "age BETWEEN 18 AND 35"}},
+    {{"name": "中年", "description": "36-55岁", "condition": "age BETWEEN 36 AND 55"}},
+    {{"name": "老年", "description": "55岁以上", "condition": "age > 55"}}
+  ]}}
+]}}
+
+## 用户补充时
+用户说"加一个XX标签"，返回新的完整suggestions列表（包含原有的+新增的）
+
+## 用户确认时（非常重要！）
+当用户消息包含"请为以下标签生成SQL"时，必须为每个选中的类型生成SQL。
+
+用户可能选择了多个类型，例如：
+请为以下标签生成SQL：[{{"type_name":"性别标签","values":[...]}},{{"type_name":"部门标签","values":[...]}}]
+
+返回JSON数组，每个类型一个对象：
+[
+  {{"type": "dimension_tags", "type_name": "性别标签", "type_description": "性别分类", "tags": [{{"name": "男", "description": "男性"}}, {{"name": "女", "description": "女性"}}], "sql": "SELECT {id_field}, CASE WHEN gender='M' THEN '男' WHEN gender='F' THEN '女' ELSE '未知' END AS tag_name FROM 表名"}},
+  {{"type": "dimension_tags", "type_name": "部门标签", "type_description": "部门分类", "tags": [...], "sql": "SELECT {id_field}, CASE WHEN ... END AS tag_name FROM 表名"}}
+]
+
+## 规则
+- 首次：返回 tag_suggestions
+- 确认时：返回 dimension_tags 数组（每个选中的类型一个对象）
+- 每个对象必须包含: type, type_name, type_description, tags, sql
+- SQL格式：SELECT {id_field}, CASE WHEN 条件 THEN '标签名' ... ELSE '其他' END AS tag_name FROM 表名
+- tags数组包含该类型下所有值标签
+"""
+
+        # 构建消息历史
+        chat_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+        chat_messages.append({"role": "user", "content": user_message})
+
+        # 打印日志
+        logger.info("=" * 50)
+        logger.info("[AI Dimension Chat] 维度: %s, ID字段: %s", dimension_name, id_field)
+        logger.info("[AI Dimension Chat] 用户消息: %s", user_message)
+
+        response = self._call_claude_with_history(system_prompt, chat_messages)
+
+        logger.info("[AI Dimension Chat] AI 响应: %s", response[:500] + "..." if len(response) > 500 else response)
+
+        result = {"reply": response, "tags": None, "type_name": None, "type_description": None, "sql": None, "is_final": False}
+
+        # 检查是否包含 JSON 响应
+        if '"type":' in response or '"type" :' in response:
+            try:
+                # 尝试找到JSON（可能是对象或数组）
+                json_start = response.find("[") if "[" in response and (response.find("[") < response.find("{") or "{" not in response) else response.find("{")
+                json_end = response.rfind("]") + 1 if response.find("[") == json_start else response.rfind("}") + 1
+
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response[json_start:json_end]
+                    parsed = json.loads(json_str)
+
+                    # 如果是数组，返回所有类型标签
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        # 验证所有元素都是 dimension_tags
+                        valid_items = [item for item in parsed if item.get("type") == "dimension_tags"]
+                        if valid_items:
+                            result["dimension_tags_list"] = valid_items  # 返回完整列表
+                            result["is_final"] = True
+                            result["reply"] = f"已生成 {len(valid_items)} 个类型标签"
+                            logger.info("[AI Dimension Chat] AI返回了%d个类型标签", len(valid_items))
+                    else:
+                        data = parsed
+                        if data.get("type") == "dimension_tags":
+                            result["tags"] = data.get("tags", [])
+                            result["type_name"] = data.get("type_name", "标签")
+                            result["type_description"] = data.get("type_description", "")
+                            result["sql"] = data.get("sql")
+                            result["is_final"] = True
+                            result["reply"] = data.get("explanation", response)
+                            logger.info("[AI Dimension Chat] 解析到维度标签: type=%s, tags=%s",
+                                        result["type_name"],
+                                        json.dumps(result["tags"], ensure_ascii=False))
+
+            except json.JSONDecodeError as e:
+                logger.warning("[AI Dimension Chat] JSON解析失败: %s", str(e))
+
+        logger.info("=" * 50)
+        return result
+
+    def chat_for_dimension_definition(
+        self,
+        table_schema: str,
+        messages: List[dict],
+        user_message: str,
+    ) -> dict:
+        """
+        维度定义对话 - 用户通过AI对话来定义维度
+
+        AI扫描数据库表结构，推荐合适的维度定义：
+        - name: 维度标识（英文）
+        - display_name: 显示名（中文）
+        - id_field: ID字段
+
+        返回: {
+            "reply": str,
+            "dimension": Optional[dict],  # {name, display_name, id_field, description}
+            "is_final": bool
+        }
+        """
+        system_prompt = f"""你是数据助手。用户要定义维度，你帮忙检查数据库里有没有对应的ID字段。
+
+## 数据库表结构
+{table_schema}
+
+## 规则
+1. 用户说要什么维度，你就在表里找对应的ID字段
+2. 找到了直接给出定义，让用户确认
+3. 找不到就说没有
+4. 回复要简洁，不要废话
+
+## 示例
+
+用户：用户维度
+你：找到 user_id 字段。
+- 标识：user_dimension
+- 名称：用户维度
+- ID字段：user_id
+
+确认？
+
+用户：确认/行/可以
+你：（返回JSON）
+
+## JSON格式（用户确认后才返回）
+{{"type": "dimension", "name": "user_dimension", "display_name": "用户维度", "id_field": "user_id", "description": "用户维度"}}
+"""
+
+        # 构建消息历史
+        chat_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+        chat_messages.append({"role": "user", "content": user_message})
+
+        logger.info("=" * 50)
+        logger.info("[AI Dimension Define] 用户消息: %s", user_message)
+
+        response = self._call_claude_with_history(system_prompt, chat_messages)
+
+        logger.info("[AI Dimension Define] AI 响应: %s", response[:500] + "..." if len(response) > 500 else response)
+
+        result = {"reply": response, "dimension": None, "is_final": False}
+
+        # 检查是否包含 JSON 响应
+        if '"type":' in response or '"type" :' in response:
+            try:
+                json_start = response.find("{")
+                json_end = response.rfind("}") + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response[json_start:json_end]
+                    data = json.loads(json_str)
+
+                    if data.get("type") == "dimension":
+                        result["dimension"] = {
+                            "name": data.get("name", ""),
+                            "display_name": data.get("display_name", ""),
+                            "id_field": data.get("id_field", ""),
+                            "description": data.get("description", ""),
+                        }
+                        result["is_final"] = True
+                        result["reply"] = data.get("explanation", response)
+                        logger.info("[AI Dimension Define] 解析到维度: %s",
+                                    json.dumps(result["dimension"], ensure_ascii=False))
+
+            except json.JSONDecodeError as e:
+                logger.warning("[AI Dimension Define] JSON解析失败: %s", str(e))
+
+        logger.info("=" * 50)
+        return result
 
     def text_to_sql(
         self,

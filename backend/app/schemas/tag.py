@@ -6,13 +6,79 @@ from typing import Optional, List
 from pydantic import BaseModel
 
 
+# ==================== 标签维度 ====================
+
+class TagDimensionBase(BaseModel):
+    name: str
+    display_name: str
+    id_field: str
+    description: Optional[str] = None
+
+
+class TagDimensionCreate(TagDimensionBase):
+    pass
+
+
+class TagDimensionUpdate(BaseModel):
+    name: Optional[str] = None
+    display_name: Optional[str] = None
+    id_field: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class TagDimensionResponse(TagDimensionBase):
+    id: int
+    is_preset: bool = False
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ==================== 标签项目 ====================
+
+class TagProjectBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    color: Optional[str] = "#1890ff"
+    icon: Optional[str] = None
+
+
+class TagProjectCreate(TagProjectBase):
+    pass
+
+
+class TagProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    icon: Optional[str] = None
+
+
+class TagProjectResponse(TagProjectBase):
+    id: int
+    node_count: int = 0
+    tag_count: int = 0
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # ==================== 标签节点 ====================
 
 class TagNodeBase(BaseModel):
     name: str
     description: Optional[str] = None
-    node_type: str = "tag"  # category 或 tag
+    node_type: str = "tag"  # category, type, tag, detail
     parent_id: Optional[int] = None
+    project_id: Optional[int] = None
+    dimension_id: Optional[int] = None  # 维度ID（维度标签专用）
     color: Optional[str] = "#1890ff"
     icon: Optional[str] = None
     sort_order: Optional[int] = 0
@@ -27,6 +93,8 @@ class TagNodeUpdate(BaseModel):
     description: Optional[str] = None
     node_type: Optional[str] = None
     parent_id: Optional[int] = None
+    project_id: Optional[int] = None
+    dimension_id: Optional[int] = None
     color: Optional[str] = None
     icon: Optional[str] = None
     sort_order: Optional[int] = None
@@ -37,6 +105,8 @@ class TagNodeUpdate(BaseModel):
 
 class TagNodeResponse(TagNodeBase):
     id: int
+    project_id: Optional[int] = None
+    dimension_id: Optional[int] = None
     path: Optional[str] = None
     level: int
     rule_type: Optional[str] = None
@@ -53,6 +123,7 @@ class TagNodeResponse(TagNodeBase):
     # 额外字段
     parent_name: Optional[str] = None
     children_count: Optional[int] = 0
+    dimension_name: Optional[str] = None  # 维度显示名
 
     class Config:
         from_attributes = True
@@ -67,6 +138,9 @@ class TagNodeTree(BaseModel):
     color: Optional[str] = None
     icon: Optional[str] = None
     level: int
+    parent_id: Optional[int] = None  # 父节点ID
+    project_id: Optional[int] = None  # 所属项目ID
+    dimension_id: Optional[int] = None  # 维度ID
     usage_count: int = 0
     rule_type: Optional[str] = None
     rule_config: Optional[str] = None  # 规则配置JSON
@@ -112,10 +186,12 @@ class CompositeTagRef(BaseModel):
 class RuleTagConfig(BaseModel):
     """规则标签配置"""
     datasource_id: Optional[int] = None  # 为空时使用平台仓库
-    source_table: str
+    source_table: Optional[str] = None  # 全库模式时可能为空
     sql_condition: Optional[str] = None  # WHERE条件
     full_sql: Optional[str] = None  # 完整SQL
     composite_tags: Optional[List[CompositeTagRef]] = None  # 复合智能标签来源
+    source: Optional[str] = None  # 来源标识：ai, ai_chat, sql, composite, graph
+    tag_table_name: Optional[str] = None  # AI生成的目标表名
 
 
 class RuleTagCreate(BaseModel):
@@ -123,6 +199,8 @@ class RuleTagCreate(BaseModel):
     name: str
     description: Optional[str] = None
     parent_id: Optional[int] = None
+    node_type: Optional[str] = "tag"  # tag=维度标签, detail=粒度标签
+    dimension_id: Optional[int] = None  # 维度ID（维度标签专用）
     color: Optional[str] = "#1890ff"
     rule_config: RuleTagConfig
 
@@ -227,3 +305,92 @@ class TagStatistics(BaseModel):
     composite_tag_count: int = 0  # 复合智能标签任务数
     graph_tag_count: int = 0  # Graph Intelligence任务数
     top_tags: List[dict]
+
+
+# ==================== AI 对话打标 ====================
+
+class ChatMessage(BaseModel):
+    """对话消息"""
+    role: str  # "user" | "assistant"
+    content: str
+    timestamp: Optional[datetime] = None
+
+
+class DataSchema(BaseModel):
+    """数据圈选方案"""
+    name: str  # 方案名称
+    description: Optional[str] = None  # 方案说明
+    table: str  # 表名
+    fields: List[str]  # 字段列表
+    join_key: Optional[str] = None  # 关联键
+
+
+class CreateChatRequest(BaseModel):
+    """创建对话会话请求"""
+    table_name: Optional[str] = None  # 为空时获取整个库的表信息（全库模式）
+    first_message: Optional[str] = None  # 用户的第一条消息（全库模式时使用）
+
+
+class CreateChatResponse(BaseModel):
+    """创建对话会话响应"""
+    session_id: str
+    table_schema: str
+    sample_data: List[dict]
+    initial_message: str
+
+
+class SendMessageRequest(BaseModel):
+    """发送消息请求"""
+    session_id: str
+    message: str
+
+
+class SendMessageResponse(BaseModel):
+    """发送消息响应"""
+    session_id: str
+    reply: str
+    schema: Optional[DataSchema] = None  # AI 给出的方案
+    generated_sql: Optional[str] = None  # 最终宽表 SQL
+    is_final: bool = False
+    task_name: Optional[str] = None  # AI 生成的任务名称
+    task_desc: Optional[str] = None  # AI 生成的任务描述
+    table_name: Optional[str] = None  # AI 生成的表名（tag_业务推导）
+
+
+class ConfirmSchemaRequest(BaseModel):
+    """确认方案请求"""
+    session_id: str
+    schema: DataSchema
+
+
+class ChatSessionResponse(BaseModel):
+    """对话会话信息响应"""
+    session_id: str
+    table_name: Optional[str] = None
+    messages: List[ChatMessage]
+    confirmed_schemas: List[DataSchema] = []  # 已确认的方案列表
+    generated_sql: Optional[str] = None
+
+
+# ==================== 维度标签批量创建 ====================
+
+class DimensionTagItem(BaseModel):
+    """单个维度标签"""
+    name: str
+    description: Optional[str] = None
+
+
+class BatchDimensionTagCreate(BaseModel):
+    """批量创建维度标签请求"""
+    type_name: str  # 类型标签名称（AI推断）
+    type_description: Optional[str] = None  # 类型标签描述
+    parent_id: Optional[int] = None  # 父节点ID（可选，为空时创建在根目录）
+    dimension_id: int  # 维度ID
+    tags: List[DimensionTagItem]  # 子标签列表
+    rule_config: RuleTagConfig  # 规则配置（共享）
+
+
+class BatchDimensionTagResponse(BaseModel):
+    """批量创建维度标签响应"""
+    type_node: TagNodeResponse  # 创建的类型标签
+    tag_nodes: List[TagNodeResponse]  # 创建的子标签列表

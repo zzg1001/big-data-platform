@@ -357,11 +357,42 @@ export const sqlScriptApi = {
 
 // 标签管理平台 API
 export const tagApi = {
+  // 标签项目
+  listProjects: () => api.get('/api/v1/tags/projects'),
+  createProject: (data: { name: string; description?: string; color?: string; icon?: string }) =>
+    api.post('/api/v1/tags/projects', data),
+  getProject: (id: number) => api.get(`/api/v1/tags/projects/${id}`),
+  updateProject: (id: number, data: { name?: string; description?: string; color?: string; icon?: string }) =>
+    api.put(`/api/v1/tags/projects/${id}`, data),
+  deleteProject: (id: number) => api.delete(`/api/v1/tags/projects/${id}`),
+
+  // 标签维度
+  listDimensions: () => api.get('/api/v1/tags/dimensions'),
+  createDimension: (data: { name: string; display_name: string; id_field: string; description?: string }) =>
+    api.post('/api/v1/tags/dimensions', data),
+  getDimension: (id: number) => api.get(`/api/v1/tags/dimensions/${id}`),
+  deleteDimension: (id: number) => api.delete(`/api/v1/tags/dimensions/${id}`),
+
+  // 批量创建维度标签
+  batchCreateDimensionTags: (data: {
+    type_name: string;
+    type_description?: string;
+    parent_id: number;
+    dimension_id: number;
+    tags: { name: string; description?: string }[];
+    rule_config: {
+      full_sql?: string;
+      source_table?: string;
+      source?: string;
+    };
+  }) => api.post('/api/v1/tags/batch-create', data),
+
   // 标签节点
-  listNodes: (params?: { parent_id?: number; node_type?: string; keyword?: string }) =>
+  listNodes: (params?: { parent_id?: number; node_type?: string; keyword?: string; project_id?: number }) =>
     api.get('/api/v1/tags/nodes', { params }),
-  getTree: () => api.get('/api/v1/tags/tree'),
-  createNode: (data: { name: string; description?: string; node_type: string; parent_id?: number; color?: string }) =>
+  getTree: (projectId?: number) => api.get('/api/v1/tags/tree', { params: { project_id: projectId } }),
+  getNode: (id: number) => api.get(`/api/v1/tags/nodes/${id}`),
+  createNode: (data: { name: string; description?: string; node_type: string; parent_id?: number; project_id?: number; color?: string }) =>
     api.post('/api/v1/tags/nodes', data),
   updateNode: (id: number, data: any) =>
     api.put(`/api/v1/tags/nodes/${id}`, data),
@@ -381,13 +412,16 @@ export const tagApi = {
     name: string;
     description?: string;
     parent_id?: number;
+    node_type?: string;  // tag=维度标签, detail=粒度标签
     color?: string;
     rule_config: {
       datasource_id?: number;
-      source_table: string;
+      source_table?: string;  // 全库模式时可选
       sql_condition?: string;
       full_sql?: string;
       composite_tags?: { id: number; name: string }[];  // 复合标签来源
+      source?: string;  // 来源：ai, ai_chat, sql, composite, graph
+      tag_table_name?: string;  // AI生成的目标表名
     };
   }) => api.post('/api/v1/tags/rule-tag', data),
 
@@ -454,4 +488,59 @@ export const tagApi = {
 
   // 统计
   getStatistics: () => api.get('/api/v1/tags/statistics'),
+
+  // 层级管理
+  getUnboundTags: () => api.get('/api/v1/tags/unbound'),
+  getHierarchy: () => api.get('/api/v1/tags/hierarchy'),
+  bindTagToParent: (tagId: number, parentId: number | null) =>
+    api.put(`/api/v1/tags/nodes/${tagId}/bind`, null, { params: { parent_id: parentId } }),
+
+  // AI 对话打标
+  createChatSession: (tableName?: string, firstMessage?: string) =>
+    api.post('/api/v1/tags/chat/create', {
+      table_name: tableName || undefined,
+      first_message: firstMessage || undefined
+    }),
+  sendChatMessage: (sessionId: string, message: string) =>
+    api.post('/api/v1/tags/chat/send', { session_id: sessionId, message }),
+  getChatSession: (sessionId: string) =>
+    api.get(`/api/v1/tags/chat/${sessionId}`),
+  deleteChatSession: (sessionId: string) =>
+    api.delete(`/api/v1/tags/chat/${sessionId}`),
+  // 确认方案
+  confirmSchema: (sessionId: string, schema: { name: string; description?: string; table: string; fields: string[]; join_key?: string }) =>
+    api.post('/api/v1/tags/chat/confirm-schema', { session_id: sessionId, schema }),
+  // 移除已确认方案
+  removeSchema: (sessionId: string, index: number) =>
+    api.delete(`/api/v1/tags/chat/${sessionId}/schema/${index}`),
+
+  // AI 维度标签对话
+  createDimensionChatSession: (dimensionId: number, firstMessage?: string) =>
+    api.post('/api/v1/tags/chat/dimension/create', null, {
+      params: { dimension_id: dimensionId, first_message: firstMessage || undefined }
+    }),
+  sendDimensionChatMessage: (sessionId: string, message: string) =>
+    api.post('/api/v1/tags/chat/dimension/send', null, {
+      params: { session_id: sessionId, message }
+    }),
+  getDimensionChatSession: (sessionId: string) =>
+    api.get(`/api/v1/tags/chat/dimension/${sessionId}`),
+  deleteDimensionChatSession: (sessionId: string) =>
+    api.delete(`/api/v1/tags/chat/dimension/${sessionId}`),
+
+  // AI 维度定义对话
+  createDimensionDefineSession: (firstMessage?: string) =>
+    api.post('/api/v1/tags/chat/define-dimension/create', null, {
+      params: { first_message: firstMessage || undefined }
+    }),
+  sendDimensionDefineMessage: (sessionId: string, message: string) =>
+    api.post('/api/v1/tags/chat/define-dimension/send', null, {
+      params: { session_id: sessionId, message }
+    }),
+  confirmDimensionDefinition: (sessionId: string) =>
+    api.post('/api/v1/tags/chat/define-dimension/confirm', null, {
+      params: { session_id: sessionId }
+    }),
+  deleteDimensionDefineSession: (sessionId: string) =>
+    api.delete(`/api/v1/tags/chat/define-dimension/${sessionId}`),
 }

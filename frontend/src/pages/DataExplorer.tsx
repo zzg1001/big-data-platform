@@ -192,10 +192,13 @@ export default function DataExplorer() {
   // 防止重复加载 ETL 任务
   const etlLoadedRef = useRef(false)
 
-  // 从 URL 参数加载 ETL 任务的 SQL
+  // 从 URL 参数加载 ETL 任务的 SQL 或直接传入的 SQL
   useEffect(() => {
     const etlId = searchParams.get('etl_id')
     const etlName = searchParams.get('etl_name')
+    const urlSql = searchParams.get('sql')
+    const sqlTitle = searchParams.get('title')
+
     if (etlId && !etlLoadedRef.current) {
       etlLoadedRef.current = true
       // 获取 ETL 任务的 SQL
@@ -217,6 +220,21 @@ export default function DataExplorer() {
       }).catch(() => {
         message.error('加载 ETL 任务失败')
       })
+      // 清除 URL 参数
+      setSearchParams({})
+    } else if (urlSql && !etlLoadedRef.current) {
+      etlLoadedRef.current = true
+      // 直接使用 URL 中的 SQL
+      const title = sqlTitle || '标签规则'
+      setEditorTabs([{
+        id: '1',
+        title,
+        sql: urlSql,
+        savedSql: '',
+        isNew: true,
+      }])
+      setActiveEditorTab('1')
+      setTabCounter(1)
       // 清除 URL 参数
       setSearchParams({})
     }
