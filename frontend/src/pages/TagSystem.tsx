@@ -1229,16 +1229,28 @@ export default function TagSystem() {
       return
     }
 
+    // 计算子节点数量
+    let childCount = 0
+    for (const task of selectedTasks) {
+      const children = tasks.filter(t => t.parent_id === task.id)
+      childCount += children.length
+    }
+
     Modal.confirm({
       title: '批量删除',
       content: (
         <div>
-          <div>确定要删除 {selectedTasks.length} 个任务吗？</div>
+          <div>确定要删除 {selectedTasks.length} 个标签吗？</div>
+          {childCount > 0 && (
+            <div style={{ marginTop: 8, padding: 8, background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 4 }}>
+              <span style={{ color: '#fa8c16' }}>⚠️ 这些标签下共有 {childCount} 个子标签，将一并删除</span>
+            </div>
+          )}
           <div style={{ marginTop: 8, color: '#666', fontSize: 13 }}>
             删除后：
             <ul style={{ margin: '4px 0', paddingLeft: 20 }}>
-              <li>任务配置和SQL将被清除</li>
-              <li>标签本身将保留</li>
+              <li>标签及其所有子标签将被永久删除</li>
+              <li>相关的任务配置和数据将被清除</li>
             </ul>
           </div>
         </div>
@@ -1252,10 +1264,13 @@ export default function TagSystem() {
 
         for (const task of selectedTasks) {
           try {
-            // 清除任务配置
-            await tagApi.updateNode(task.id, {
-              rule_type: null,
-              rule_config: null,
+            // 真正删除节点（后端会级联删除子节点）
+            await tagApi.deleteNode(task.id)
+            // 清理 pendingConnections
+            setPendingConnections(prev => {
+              const next = { ...prev }
+              delete next[task.id]
+              return next
             })
             successCount++
           } catch {
@@ -1264,7 +1279,7 @@ export default function TagSystem() {
         }
 
         if (successCount > 0) {
-          message.success(`成功删除 ${successCount} 个任务${failCount > 0 ? `，${failCount} 个失败` : ''}`)
+          message.success(`成功删除 ${successCount} 个标签${childCount > 0 ? '（含子标签）' : ''}${failCount > 0 ? `，${failCount} 个失败` : ''}`)
           setSelectedTaskKeys([])
           loadTasks()
           loadTagNodes()
@@ -1619,12 +1634,20 @@ export default function TagSystem() {
 
       // 先保存待处理的连接变更（避免刷新时丢失拖拽的标签）
       if (Object.keys(pendingConnections).length > 0) {
-        const promises = Object.entries(pendingConnections).map(([nodeId, data]) =>
-          tagApi.updateNode(Number(nodeId), {
-            parent_id: data.parentId,
-            project_id: data.projectId
-          })
-        )
+        const promises = Object.entries(pendingConnections).map(async ([nodeId, data]) => {
+          try {
+            await tagApi.updateNode(Number(nodeId), {
+              parent_id: data.parentId,
+              project_id: data.projectId
+            })
+          } catch (err: any) {
+            // 忽略 404 错误（节点可能已被删除）
+            if (err.response?.status !== 404) {
+              throw err
+            }
+            console.warn(`节点 ${nodeId} 不存在，跳过连接保存`)
+          }
+        })
         await Promise.all(promises)
         setPendingConnections({})
       }
@@ -1634,9 +1657,10 @@ export default function TagSystem() {
         message.success('更新成功')
       } else {
         // 如果有父节点，添加 parent_id；独立创建模式不设置 project_id
+        // 显式设置 parent_id，确保创建根节点时一定是 null（避免表单残留值）
         const createData = {
           ...processedValues,
-          ...(creatingParent ? { parent_id: creatingParent.id } : {}),
+          parent_id: creatingParent ? creatingParent.id : null,
           ...(!creatingStandalone && currentProject ? { project_id: currentProject.id } : {}),
         }
 
@@ -1773,6 +1797,12 @@ export default function TagSystem() {
         try {
           await tagApi.deleteNode(id)
           message.success('删除成功')
+          // 清理 pendingConnections 中的对应节点
+          setPendingConnections(prev => {
+            const next = { ...prev }
+            delete next[id]
+            return next
+          })
           loadTagNodes()
           loadStatistics()
         } catch (error) {
@@ -3001,21 +3031,25 @@ export default function TagSystem() {
       }
 
       // 检查维度一致性：不同维度的标签不能相连
+      // 但分类节点（category）可以连接任何节点，因为分类是容器，不受维度限制
       const sourceTag = allTags.find(t => t.id === connectingFrom.id)
       const targetTag = allTags.find(t => t.id === targetNodeId)
       if (sourceTag && targetTag) {
-        const sourceDimension = sourceTag.dimension_id
-        const targetDimension = targetTag.dimension_id
-        // 如果维度不一致，不允许连接（包括一个有维度一个没有的情况）
-        if (sourceDimension !== targetDimension) {
-          const sourceDim = dimensions.find(d => d.id === sourceDimension)
-          const targetDim = dimensions.find(d => d.id === targetDimension)
-          const sourceLabel = sourceDim?.display_name || (sourceDimension ? '未知维度' : '无维度')
-          const targetLabel = targetDim?.display_name || (targetDimension ? '未知维度' : '无维度')
-          message.warning(`不能连接不同维度的标签：${sourceLabel} 与 ${targetLabel}`)
-          setConnectingFrom(null)
-          setConnectingTo(null)
-          return
+        // 如果源节点是分类，跳过维度检查
+        if (sourceTag.node_type !== 'category') {
+          const sourceDimension = sourceTag.dimension_id
+          const targetDimension = targetTag.dimension_id
+          // 只有当两个节点都有维度且不同时，才阻止连接
+          if (sourceDimension && targetDimension && sourceDimension !== targetDimension) {
+            const sourceDim = dimensions.find(d => d.id === sourceDimension)
+            const targetDim = dimensions.find(d => d.id === targetDimension)
+            const sourceLabel = sourceDim?.display_name || '未知维度'
+            const targetLabel = targetDim?.display_name || '未知维度'
+            message.warning(`不能连接不同维度的标签：${sourceLabel} 与 ${targetLabel}`)
+            setConnectingFrom(null)
+            setConnectingTo(null)
+            return
+          }
         }
       }
 
@@ -4152,6 +4186,7 @@ export default function TagSystem() {
               overflow: 'auto',
               background: 'linear-gradient(180deg, #fafbfc 0%, #f5f6f8 100%)',
               cursor: draggingNodeId ? 'grabbing' : 'default',
+              position: 'relative',
             }}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
@@ -4249,10 +4284,10 @@ export default function TagSystem() {
 
               e.preventDefault()
               const rect = mindMapRef.current?.getBoundingClientRect()
-              if (rect) {
+              if (rect && mindMapRef.current) {
                 setCanvasContextMenu({
-                  x: e.clientX - rect.left,
-                  y: e.clientY - rect.top,
+                  x: e.clientX - rect.left + mindMapRef.current.scrollLeft,
+                  y: e.clientY - rect.top + mindMapRef.current.scrollTop,
                   step: 'type'
                 })
               }
@@ -4260,15 +4295,18 @@ export default function TagSystem() {
           >
             <Spin spinning={loading}>
               {mapNodes.length === 0 ? (
-              <div style={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                height: '100%',
-                minHeight: 400,
-                color: '#999',
-              }}>
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  height: '100%',
+                  minHeight: 400,
+                  color: '#999',
+                }}
+                onClick={() => setCanvasContextMenu(null)}
+              >
                 <TagOutlined style={{ fontSize: 64, marginBottom: 24, color: '#d9d9d9' }} />
                 <div style={{ fontSize: 16, marginBottom: 8 }}>暂无节点</div>
                 <div style={{ fontSize: 13 }}>右键点击画布创建节点，或从左侧拖拽标签到画布</div>
@@ -4708,147 +4746,147 @@ export default function TagSystem() {
                   </div>
                 )}
 
-                {/* 画布右键菜单 - 新建节点 */}
-                {canvasContextMenu && (
-                  <div
-                    style={{
-                      position: 'absolute',
-                      left: canvasContextMenu.x,
-                      top: canvasContextMenu.y,
-                      background: '#fff',
-                      borderRadius: 8,
-                      boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-                      zIndex: 2000,
-                      overflow: 'hidden',
-                      minWidth: 120,
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {canvasContextMenu.step === 'type' ? (
-                      <>
-                        <div style={{
-                          padding: '6px 10px',
-                          fontSize: 11,
-                          color: '#999',
-                          borderBottom: '1px solid #f0f0f0',
-                          background: '#fafafa',
-                        }}>
-                          选择节点类型
-                        </div>
-                        {[
-                          { value: 'category', label: '分类', icon: <FolderOutlined />, color: '#722ed1' },
-                          { value: 'type', label: '类型', icon: <AppstoreOutlined />, color: '#1890ff' },
-                          { value: 'value', label: '标签', icon: <TagOutlined />, color: '#52c41a' },
-                        ].map(item => (
-                          <div
-                            key={item.value}
-                            style={{
-                              padding: '8px 12px',
-                              cursor: 'pointer',
-                              fontSize: 13,
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 8,
-                            }}
-                            onClick={() => {
-                              setCanvasContextMenu({
-                                ...canvasContextMenu,
-                                step: 'dimension',
-                                nodeType: item.value as 'category' | 'type' | 'value',
-                              })
-                            }}
-                            onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
-                            onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
-                          >
-                            <span style={{ color: item.color, fontSize: 14 }}>{item.icon}</span>
-                            <span>{item.label}</span>
-                          </div>
-                        ))}
-                        <div
-                          style={{
-                            padding: '6px 12px',
-                            borderTop: '1px solid #f0f0f0',
-                            fontSize: 12,
-                            color: '#999',
-                            cursor: 'pointer',
-                          }}
-                          onClick={() => setCanvasContextMenu(null)}
-                          onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
-                        >
-                          取消
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <div style={{
-                          padding: '6px 10px',
-                          fontSize: 11,
-                          color: '#999',
-                          borderBottom: '1px solid #f0f0f0',
-                          background: '#fafafa',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 4,
-                        }}>
-                          <span
-                            style={{ cursor: 'pointer', color: '#1890ff' }}
-                            onClick={() => setCanvasContextMenu({ ...canvasContextMenu, step: 'type', nodeType: undefined })}
-                          >
-                            ←
-                          </span>
-                          选择维度
-                        </div>
-                        {dimensions.map(dim => (
-                          <div
-                            key={dim.id}
-                            style={{
-                              padding: '8px 12px',
-                              cursor: 'pointer',
-                              fontSize: 13,
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 6,
-                            }}
-                            onClick={() => {
-                              // 创建新节点
-                              tagForm.resetFields()
-                              tagForm.setFieldValue('node_type', canvasContextMenu.nodeType)
-                              tagForm.setFieldValue('dimension_id', dim.id)
-                              setEditingTag(null)
-                              setCreatingParent(null)
-                              setTagModalVisible(true)
-                              setCanvasContextMenu(null)
-                            }}
-                            onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
-                            onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
-                          >
-                            <TagsOutlined style={{ color: '#1890ff', fontSize: 12 }} />
-                            <span>{dim.display_name}</span>
-                            <span style={{ fontSize: 11, color: '#999' }}>({dim.id_field})</span>
-                          </div>
-                        ))}
-                        <div
-                          style={{
-                            padding: '6px 12px',
-                            borderTop: '1px solid #f0f0f0',
-                            fontSize: 12,
-                            color: '#999',
-                            cursor: 'pointer',
-                          }}
-                          onClick={() => setCanvasContextMenu(null)}
-                          onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
-                        >
-                          取消
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )}
               </div>
             )}
           </Spin>
+          {/* 画布右键菜单 - 新建节点 */}
+          {canvasContextMenu && (
+            <div
+              style={{
+                position: 'absolute',
+                left: canvasContextMenu.x,
+                top: canvasContextMenu.y,
+                background: '#fff',
+                borderRadius: 8,
+                boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                zIndex: 2000,
+                overflow: 'hidden',
+                minWidth: 120,
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {canvasContextMenu.step === 'type' ? (
+                <>
+                  <div style={{
+                    padding: '6px 10px',
+                    fontSize: 11,
+                    color: '#999',
+                    borderBottom: '1px solid #f0f0f0',
+                    background: '#fafafa',
+                  }}>
+                    选择节点类型
+                  </div>
+                  {[
+                    { value: 'category', label: '分类', icon: <FolderOutlined />, color: '#722ed1' },
+                    { value: 'type', label: '类型', icon: <AppstoreOutlined />, color: '#1890ff' },
+                    { value: 'value', label: '标签', icon: <TagOutlined />, color: '#52c41a' },
+                  ].map(item => (
+                    <div
+                      key={item.value}
+                      style={{
+                        padding: '8px 12px',
+                        cursor: 'pointer',
+                        fontSize: 13,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                      }}
+                      onClick={() => {
+                        setCanvasContextMenu({
+                          ...canvasContextMenu,
+                          step: 'dimension',
+                          nodeType: item.value as 'category' | 'type' | 'value',
+                        })
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                    >
+                      <span style={{ color: item.color, fontSize: 14 }}>{item.icon}</span>
+                      <span>{item.label}</span>
+                    </div>
+                  ))}
+                  <div
+                    style={{
+                      padding: '6px 12px',
+                      borderTop: '1px solid #f0f0f0',
+                      fontSize: 12,
+                      color: '#999',
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => setCanvasContextMenu(null)}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                  >
+                    取消
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{
+                    padding: '6px 10px',
+                    fontSize: 11,
+                    color: '#999',
+                    borderBottom: '1px solid #f0f0f0',
+                    background: '#fafafa',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                  }}>
+                    <span
+                      style={{ cursor: 'pointer', color: '#1890ff' }}
+                      onClick={() => setCanvasContextMenu({ ...canvasContextMenu, step: 'type', nodeType: undefined })}
+                    >
+                      ←
+                    </span>
+                    选择维度
+                  </div>
+                  {dimensions.map(dim => (
+                    <div
+                      key={dim.id}
+                      style={{
+                        padding: '8px 12px',
+                        cursor: 'pointer',
+                        fontSize: 13,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                      }}
+                      onClick={() => {
+                        // 创建新节点
+                        tagForm.resetFields()
+                        tagForm.setFieldValue('node_type', canvasContextMenu.nodeType)
+                        tagForm.setFieldValue('dimension_id', dim.id)
+                        setEditingTag(null)
+                        setCreatingParent(null)
+                        setTagModalVisible(true)
+                        setCanvasContextMenu(null)
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                    >
+                      <TagsOutlined style={{ color: '#1890ff', fontSize: 12 }} />
+                      <span>{dim.display_name}</span>
+                      <span style={{ fontSize: 11, color: '#999' }}>({dim.id_field})</span>
+                    </div>
+                  ))}
+                  <div
+                    style={{
+                      padding: '6px 12px',
+                      borderTop: '1px solid #f0f0f0',
+                      fontSize: 12,
+                      color: '#999',
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => setCanvasContextMenu(null)}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = '#f5f5f5')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                  >
+                    取消
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </div>
         </div>
       </div>

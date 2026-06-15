@@ -630,10 +630,11 @@ async def create_tag_node(
         path = f"{parent.path or ''}/{parent.id}"
         parent_name = parent.name
 
-    # 检查同级同名
+    # 检查同项目同级同名
     check_query = select(TagNode).filter(
         TagNode.name == data.name,
         TagNode.parent_id == data.parent_id,
+        TagNode.project_id == data.project_id,
         TagNode.is_active == True
     )
     result = await db.execute(check_query)
@@ -646,6 +647,7 @@ async def create_tag_node(
         node_type=data.node_type,
         parent_id=data.parent_id,
         project_id=data.project_id,
+        dimension_id=data.dimension_id,
         level=level,
         path=path,
         color=data.color,
