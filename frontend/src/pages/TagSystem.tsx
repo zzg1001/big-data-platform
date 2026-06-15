@@ -204,6 +204,7 @@ export default function TagSystem() {
     setCollapsedDimensions(prev => ({ ...prev, [dimId]: !prev[dimId] }))
   }
   const [detailGroupCollapsed, setDetailGroupCollapsed] = useState(false)
+  const [templateGroupCollapsed, setTemplateGroupCollapsed] = useState(false)
 
   // 标签列表页面状态
   const [tagSearchText, setTagSearchText] = useState('')
@@ -2632,6 +2633,7 @@ export default function TagSystem() {
     // 按维度分组标签
     const dimensionGroups: { [key: number]: { dimension: Dimension; typeTags: any[]; valueTags: any[] } } = {}
     const detailTags: any[] = []
+    const templateTags: any[] = []
     const unassignedTypeTags: any[] = []
     const unassignedValueTags: any[] = []
 
@@ -2655,6 +2657,8 @@ export default function TagSystem() {
 
       if (tag.node_type === 'detail') {
         detailTags.push(tag)
+      } else if (tag.node_type === 'template') {
+        templateTags.push(tag)
       } else if (tag.node_type === 'type') {
         if (tag.dimension_id) {
           if (!dimensionGroups[tag.dimension_id]) {
@@ -2832,6 +2836,22 @@ export default function TagSystem() {
             </div>
           ) : (
             <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无粒度标签</div>
+          )}
+        </div>
+
+        {/* 模版标签 */}
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: '#13c2c2', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <FileTextOutlined />
+            模版标签
+            <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>({templateTags.length})</span>
+          </div>
+          {templateTags.length > 0 ? (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginLeft: 16 }}>
+              {templateTags.map(tag => renderTagItem(tag, '#13c2c2'))}
+            </div>
+          ) : (
+            <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无模版标签</div>
           )}
         </div>
       </div>
@@ -4171,6 +4191,113 @@ export default function TagSystem() {
                     ))}
                     {sidebarTags.filter(t => t.node_type === 'detail').length === 0 && (
                       <div style={{ fontSize: 11, color: '#999', padding: '8px', textAlign: 'center' }}>暂无粒度标签</div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* 模版标签组 */}
+              <div style={{
+                background: '#e6fffb',
+                borderRadius: 8,
+                border: '1px solid #87e8de',
+                overflow: 'hidden',
+              }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: '#13c2c2',
+                    padding: '8px 12px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    fontWeight: 500,
+                    background: '#b5f5ec',
+                  }}
+                >
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', flex: 1 }}
+                    onClick={() => setTemplateGroupCollapsed && setTemplateGroupCollapsed(!templateGroupCollapsed)}
+                  >
+                    <CaretRightOutlined style={{
+                      fontSize: 10,
+                      transition: 'transform 0.2s',
+                      transform: templateGroupCollapsed ? 'rotate(0deg)' : 'rotate(90deg)',
+                    }} />
+                    <FileTextOutlined />
+                    <span>模版标签</span>
+                  </div>
+                  <span style={{
+                    background: '#13c2c2',
+                    color: '#fff',
+                    padding: '0 8px',
+                    borderRadius: 10,
+                    fontSize: 11,
+                  }}>
+                    {sidebarTags.filter(t => t.node_type === 'template').length}
+                  </span>
+                </div>
+                {!templateGroupCollapsed && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '8px' }}>
+                    {sidebarTags.filter(t => t.node_type === 'template').map(tag => (
+                      <Dropdown
+                        key={tag.id}
+                        trigger={['contextMenu']}
+                        menu={{
+                          items: [
+                            { key: 'edit', label: '编辑', onClick: () => handleEditTag(tag) },
+                            { key: 'delete', label: '删除', danger: true, onClick: () => handleDeleteTag(tag.id) },
+                          ]
+                        }}
+                      >
+                        <div
+                          draggable
+                          onDragStart={(e) => {
+                            e.dataTransfer.setData('tagId', String(tag.id))
+                            e.dataTransfer.setData('tagType', 'template')
+                            e.dataTransfer.effectAllowed = 'copy'
+                            setDraggingTagFromSidebar({ id: tag.id, type: 'template' })
+                          }}
+                          onDragEnd={() => {
+                            setDraggingTagFromSidebar(null)
+                            setDragOverNodeId(null)
+                          }}
+                          style={{
+                            padding: '6px 10px',
+                            background: '#fff',
+                            borderRadius: 4,
+                            fontSize: 11,
+                            cursor: 'grab',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            border: '1px solid #87e8de',
+                            transition: 'all 0.2s',
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.borderColor = '#13c2c2'
+                            e.currentTarget.style.background = '#e6fffb'
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.borderColor = '#87e8de'
+                            e.currentTarget.style.background = '#fff'
+                          }}
+                          onClick={() => handleEditTag(tag)}
+                        >
+                          <div style={{
+                            width: 6,
+                            height: 6,
+                            borderRadius: '50%',
+                            background: tag.color || '#13c2c2',
+                          }} />
+                          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {tag.name}
+                          </span>
+                        </div>
+                      </Dropdown>
+                    ))}
+                    {sidebarTags.filter(t => t.node_type === 'template').length === 0 && (
+                      <div style={{ fontSize: 11, color: '#999', padding: '8px', textAlign: 'center' }}>暂无模版标签</div>
                     )}
                   </div>
                 )}
@@ -7330,14 +7457,15 @@ export default function TagSystem() {
   // 标签管理弹框
   const renderTagModal = () => {
     // 根据父节点类型确定可选的子类型
-    // 规则：分类可创建3种（分类/类型/值标签/粒度标签），类型只能创建标签，标签无子类
+    // 规则：分类可创建多种（分类/类型/值标签/粒度标签/模版标签），类型可创建值/粒度/模版标签，标签无子类
     const getNodeTypeOptions = () => {
-      // 独立创建模式：可创建类型、值标签和粒度标签
+      // 独立创建模式：可创建类型、值标签、粒度标签和模版标签
       if (creatingStandalone) {
         return [
           { value: 'type', label: '类型', icon: <TagsOutlined />, desc: '类型标签', color: '#1890ff' },
           { value: 'tag', label: '维度', icon: <TagOutlined />, desc: '值标签', color: '#52c41a' },
           { value: 'detail', label: '明细', icon: <DatabaseOutlined />, desc: '粒度标签', color: '#722ed1' },
+          { value: 'template', label: '模版', icon: <FileTextOutlined />, desc: '模版标签', color: '#13c2c2' },
         ]
       }
       if (!creatingParent) {
@@ -7347,19 +7475,21 @@ export default function TagSystem() {
         ]
       }
       if (creatingParent.node_type === 'category') {
-        // 分类下可创建：子分类、类型、值标签、粒度标签
+        // 分类下可创建：子分类、类型、值标签、粒度标签、模版标签
         return [
           { value: 'category', label: '分类', icon: <FolderOpenOutlined />, desc: '子分类', color: '#fa8c16' },
           { value: 'type', label: '类型', icon: <TagsOutlined />, desc: '分类下的细分', color: '#1890ff' },
           { value: 'tag', label: '维度', icon: <TagOutlined />, desc: '值标签', color: '#52c41a' },
           { value: 'detail', label: '明细', icon: <DatabaseOutlined />, desc: '粒度标签', color: '#722ed1' },
+          { value: 'template', label: '模版', icon: <FileTextOutlined />, desc: '模版标签', color: '#13c2c2' },
         ]
       }
       if (creatingParent.node_type === 'type') {
-        // 类型下可创建值标签和粒度标签
+        // 类型下可创建值标签、粒度标签和模版标签
         return [
           { value: 'tag', label: '维度', icon: <TagOutlined />, desc: '值标签', color: '#52c41a' },
           { value: 'detail', label: '明细', icon: <DatabaseOutlined />, desc: '粒度标签', color: '#722ed1' },
+          { value: 'template', label: '模版', icon: <FileTextOutlined />, desc: '模版标签', color: '#13c2c2' },
         ]
       }
       // 标签没有子类
@@ -7390,6 +7520,7 @@ export default function TagSystem() {
       category: { icon: <FolderOpenOutlined />, color: '#fa8c16', label: '分类' },
       type: { icon: <TagsOutlined />, color: '#1890ff', label: '类型' },
       tag: { icon: <TagOutlined />, color: '#52c41a', label: '标签' },
+      template: { icon: <FileTextOutlined />, color: '#13c2c2', label: '模版' },
     }
 
     return (

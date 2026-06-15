@@ -78,8 +78,8 @@ class TagNode(Base):
     # 所属维度（维度标签专用）
     dimension_id = Column(BigInteger, ForeignKey("big_tag_dimensions.id"))
 
-    # 节点类型: category=分类, type=类型标签, tag=维度标签, detail=粒度标签
-    # 层级规则: category下可放任何, type下可放tag/detail, tag/detail下不能放任何
+    # 节点类型: category=分类, type=类型标签, tag=维度标签, detail=粒度标签, template=模版标签
+    # 层级规则: category下可放任何, type下可放tag/detail/template, tag/detail/template下不能放任何
     node_type = Column(String(20), nullable=False, default="tag")
 
     # 树形结构
