@@ -114,6 +114,7 @@ class TagNodeResponse(TagNodeBase):
     tag_table_name: Optional[str] = None
     source_datasource_id: Optional[int] = None
     source_table: Optional[str] = None
+    source_node_id: Optional[int] = None  # 模版标签引用的原标签ID
     ai_generated: bool = False
     ai_confidence: Optional[int] = None
     usage_count: int = 0

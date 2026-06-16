@@ -206,6 +206,20 @@ export default function TagSystem() {
   const [detailGroupCollapsed, setDetailGroupCollapsed] = useState(false)
   const [templateGroupCollapsed, setTemplateGroupCollapsed] = useState(false)
 
+  // 模版收藏列表
+  interface TemplateFavorite {
+    favorite_id: number
+    node_id: number
+    name: string
+    description?: string
+    node_type: string
+    color?: string
+    icon?: string
+    children_count: number
+    created_at?: string
+  }
+  const [templateFavorites, setTemplateFavorites] = useState<TemplateFavorite[]>([])
+
   // 标签列表页面状态
   const [tagSearchText, setTagSearchText] = useState('')
   // tagFilterType removed - now using dimension-based grouping
@@ -812,10 +826,22 @@ export default function TagSystem() {
       }
       flattenAll(allTreeRes.data || [])
       setSidebarTags(allFlat)
+      // 加载模版收藏
+      await loadTemplateFavorites()
     } catch (error) {
       message.error('加载标签失败')
     } finally {
       setLoading(false)
+    }
+  }
+
+  // 加载模版收藏列表
+  const loadTemplateFavorites = async () => {
+    try {
+      const res = await tagApi.listTemplateFavorites()
+      setTemplateFavorites(res.data || [])
+    } catch (error) {
+      console.error('加载模版收藏失败', error)
     }
   }
 
@@ -1808,6 +1834,36 @@ export default function TagSystem() {
           loadStatistics()
         } catch (error) {
           message.error('删除失败')
+        }
+      }
+    })
+  }
+
+  // 收藏分类标签到模版（包含所有子标签）
+  const handleSaveToTemplate = async (nodeId: number, nodeName: string) => {
+    Modal.confirm({
+      title: '收藏到模版',
+      content: (
+        <div>
+          <div style={{ marginBottom: 12 }}>
+            确定要将分类「{nodeName}」收藏到模版吗？
+          </div>
+          <div style={{ padding: 12, background: '#e6fffb', border: '1px solid #87e8de', borderRadius: 6, fontSize: 13 }}>
+            <StarOutlined style={{ color: '#13c2c2', marginRight: 8 }} />
+            收藏后可在模版区快速拖拽使用，标签全局唯一，修改会同步
+          </div>
+        </div>
+      ),
+      okText: '收藏',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          const res = await tagApi.saveToTemplate(nodeId)
+          message.success(res.data.message || '收藏成功')
+          // 刷新收藏列表
+          loadTemplateFavorites()
+        } catch (error: any) {
+          message.error(error.response?.data?.detail || '收藏失败')
         }
       }
     })
@@ -3107,18 +3163,76 @@ export default function TagSystem() {
       message.info('连接已删除，点击保存按钮提交')
     }
 
-    // 从项目中移出节点
-    const handleRemoveFromProject = (nodeId: number) => {
-      // 添加到待保存变更（设置 projectId 为 null）
-      setPendingConnections(prev => ({
-        ...prev,
-        [nodeId]: { parentId: null, projectId: null }
-      }))
+    // 从画布删除标签（真正删除，全局同步）
+    const handleDeleteTagFromCanvas = (nodeId: number, nodeName: string) => {
+      // 递归获取所有子节点ID
+      const getAllChildIds = (parentId: number): number[] => {
+        const children = allTags.filter(t => t.parent_id === parentId)
+        let allIds: number[] = []
+        children.forEach(child => {
+          allIds.push(child.id)
+          allIds = [...allIds, ...getAllChildIds(child.id)]
+        })
+        return allIds
+      }
 
-      // 更新本地显示（从画布移除）
-      setAllTags(prev => prev.filter(t => t.id !== nodeId))
+      const childIds = getAllChildIds(nodeId)
+      const childCount = childIds.length
 
-      message.info('已标记移出，点击保存按钮提交')
+      Modal.confirm({
+        title: '确认删除',
+        content: (
+          <div>
+            <div style={{ marginBottom: 12 }}>
+              确定要删除标签「{nodeName}」吗？
+            </div>
+            {childCount > 0 && (
+              <div style={{ padding: 12, background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 6, fontSize: 13 }}>
+                <span style={{ color: '#fa8c16' }}>⚠️ 该标签下有 {childCount} 个子标签，将一并删除</span>
+              </div>
+            )}
+            <div style={{ marginTop: 12, color: '#999', fontSize: 12 }}>
+              此操作会永久删除标签，全局生效，不可恢复
+            </div>
+          </div>
+        ),
+        okText: '删除',
+        okType: 'danger',
+        cancelText: '取消',
+        onOk: async () => {
+          try {
+            // 删除所有子标签（从叶子节点开始）
+            const allIdsToDelete = [...childIds.reverse(), nodeId]
+            for (const id of allIdsToDelete) {
+              await tagApi.deleteNode(id)
+            }
+
+            // 从画布中移除
+            setAllTags(prev => prev.filter(t => !allIdsToDelete.includes(t.id)))
+            setNodePositions(prev => {
+              const updated = { ...prev }
+              allIdsToDelete.forEach(id => {
+                delete updated[id]
+              })
+              return updated
+            })
+            setPendingConnections(prev => {
+              const updated = { ...prev }
+              allIdsToDelete.forEach(id => {
+                delete updated[id]
+              })
+              return updated
+            })
+
+            message.success(`已删除 ${allIdsToDelete.length} 个标签`)
+            // 刷新侧边栏
+            loadTagNodes()
+            loadStatistics()
+          } catch (error: any) {
+            message.error(error.response?.data?.detail || '删除失败')
+          }
+        }
+      })
     }
 
     // 保存所有待保存的连接变更
@@ -4234,29 +4348,41 @@ export default function TagSystem() {
                     borderRadius: 10,
                     fontSize: 11,
                   }}>
-                    {sidebarTags.filter(t => t.node_type === 'template').length}
+                    {templateFavorites.length}
                   </span>
                 </div>
                 {!templateGroupCollapsed && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '8px' }}>
-                    {sidebarTags.filter(t => t.node_type === 'template').map(tag => (
+                    {templateFavorites.map(fav => (
                       <Dropdown
-                        key={tag.id}
+                        key={fav.favorite_id}
                         trigger={['contextMenu']}
                         menu={{
                           items: [
-                            { key: 'edit', label: '编辑', onClick: () => handleEditTag(tag) },
-                            { key: 'delete', label: '删除', danger: true, onClick: () => handleDeleteTag(tag.id) },
+                            {
+                              key: 'unfavorite',
+                              label: '取消收藏',
+                              danger: true,
+                              onClick: async () => {
+                                try {
+                                  await tagApi.removeTemplateFavorite(fav.node_id)
+                                  message.success('已取消收藏')
+                                  loadTemplateFavorites()
+                                } catch {
+                                  message.error('取消收藏失败')
+                                }
+                              }
+                            },
                           ]
                         }}
                       >
                         <div
                           draggable
                           onDragStart={(e) => {
-                            e.dataTransfer.setData('tagId', String(tag.id))
-                            e.dataTransfer.setData('tagType', 'template')
+                            e.dataTransfer.setData('tagId', String(fav.node_id))
+                            e.dataTransfer.setData('tagType', 'template-favorite')
                             e.dataTransfer.effectAllowed = 'copy'
-                            setDraggingTagFromSidebar({ id: tag.id, type: 'template' })
+                            setDraggingTagFromSidebar({ id: fav.node_id, type: 'template-favorite' })
                           }}
                           onDragEnd={() => {
                             setDraggingTagFromSidebar(null)
@@ -4282,22 +4408,24 @@ export default function TagSystem() {
                             e.currentTarget.style.borderColor = '#87e8de'
                             e.currentTarget.style.background = '#fff'
                           }}
-                          onClick={() => handleEditTag(tag)}
                         >
                           <div style={{
                             width: 6,
                             height: 6,
                             borderRadius: '50%',
-                            background: tag.color || '#13c2c2',
+                            background: fav.color || '#13c2c2',
                           }} />
                           <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {tag.name}
+                            {fav.name}
                           </span>
+                          {fav.children_count > 0 && (
+                            <span style={{ fontSize: 10, color: '#999' }}>+{fav.children_count}</span>
+                          )}
                         </div>
                       </Dropdown>
                     ))}
-                    {sidebarTags.filter(t => t.node_type === 'template').length === 0 && (
-                      <div style={{ fontSize: 11, color: '#999', padding: '8px', textAlign: 'center' }}>暂无模版标签</div>
+                    {templateFavorites.length === 0 && (
+                      <div style={{ fontSize: 11, color: '#999', padding: '8px', textAlign: 'center' }}>暂无模版收藏</div>
                     )}
                   </div>
                 )}
@@ -4333,15 +4461,28 @@ export default function TagSystem() {
               const y = e.clientY - rect.top + mindMapRef.current.scrollTop
 
               const numTagId = Number(tagId)
+              const tagType = e.dataTransfer.getData('tagType')
               const draggedTag = sidebarTags.find(t => t.id === numTagId)
               if (!draggedTag) return
 
-              // 如果是类型标签，展开子标签
-              if (draggedTag.node_type === 'type') {
-                // 找出所有子标签
-                const childTags = sidebarTags.filter(t => t.parent_id === numTagId)
+              // 如果是类型标签、模版标签或模版收藏（category），展开子标签
+              const shouldExpandChildren = draggedTag.node_type === 'type' ||
+                draggedTag.node_type === 'template' ||
+                tagType === 'template-favorite' ||
+                draggedTag.node_type === 'category'
+              if (shouldExpandChildren) {
+                // 递归获取所有子标签（模版可能有多层子标签）
+                const getAllChildren = (parentId: number): any[] => {
+                  const children = sidebarTags.filter(t => t.parent_id === parentId)
+                  let allChildren = [...children]
+                  children.forEach(child => {
+                    allChildren = [...allChildren, ...getAllChildren(child.id)]
+                  })
+                  return allChildren
+                }
+                const childTags = getAllChildren(numTagId)
 
-                // 添加类型标签
+                // 添加类型/模版标签
                 setPendingConnections(prev => ({
                   ...prev,
                   [numTagId]: { parentId: null, projectId: currentProject.id }
@@ -4359,30 +4500,42 @@ export default function TagSystem() {
                   [numTagId]: { x, y }
                 }))
 
-                // 添加子标签，垂直排列在类型标签下方
-                childTags.forEach((child, index) => {
-                  const childX = x + 30
-                  const childY = y + 50 + index * 40
+                // 添加子标签，按层级垂直排列
+                let yOffset = 50
+                const addChildrenRecursively = (parentId: number, baseX: number, level: number) => {
+                  const children = sidebarTags.filter(t => t.parent_id === parentId)
+                  children.forEach((child) => {
+                    const childX = baseX + level * 30
+                    const childY = y + yOffset
+                    yOffset += 40
 
-                  setPendingConnections(prev => ({
-                    ...prev,
-                    [child.id]: { parentId: numTagId, projectId: currentProject.id }
-                  }))
-                  setAllTags(prev => {
-                    const exists = prev.some(t => t.id === child.id)
-                    if (exists) {
-                      return prev.map(t => t.id === child.id ? { ...t, parent_id: numTagId } : t)
-                    } else {
-                      return [...prev, { ...child, parent_id: numTagId }]
-                    }
+                    setPendingConnections(prev => ({
+                      ...prev,
+                      [child.id]: { parentId: child.parent_id, projectId: currentProject.id }
+                    }))
+                    setAllTags(prev => {
+                      const exists = prev.some(t => t.id === child.id)
+                      if (exists) {
+                        return prev.map(t => t.id === child.id ? { ...t, parent_id: child.parent_id } : t)
+                      } else {
+                        return [...prev, { ...child }]
+                      }
+                    })
+                    setNodePositions(prev => ({
+                      ...prev,
+                      [child.id]: { x: childX, y: childY }
+                    }))
+
+                    // 递归添加子标签的子标签
+                    addChildrenRecursively(child.id, baseX, level + 1)
                   })
-                  setNodePositions(prev => ({
-                    ...prev,
-                    [child.id]: { x: childX, y: childY }
-                  }))
-                })
+                }
+                addChildrenRecursively(numTagId, x, 1)
 
-                message.info(`已添加类型标签及 ${childTags.length} 个子标签`)
+                const tagTypeLabel = tagType === 'template-favorite' ? '模版收藏' :
+                  draggedTag.node_type === 'template' ? '模版' :
+                  draggedTag.node_type === 'category' ? '分类' : '类型'
+                message.info(`已添加${tagTypeLabel}及 ${childTags.length} 个子标签`)
               } else {
                 // 普通标签，单独添加
                 setPendingConnections(prev => ({
@@ -4851,25 +5004,25 @@ export default function TagSystem() {
                         添加子级
                       </div>
                     )}
-                    {nodeContextMenu.node.node_type === 'category' ? (
+                    {nodeContextMenu.node.node_type === 'category' && (
                       <div
-                        style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
-                        onClick={() => { handleDeleteTag(nodeContextMenu.node.id); setNodeContextMenu(null) }}
-                        onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
+                        style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#13c2c2' }}
+                        onClick={() => { handleSaveToTemplate(nodeContextMenu.node.id, nodeContextMenu.node.name); setNodeContextMenu(null) }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = '#e6fffb')}
                         onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
                       >
-                        删除
-                      </div>
-                    ) : (
-                      <div
-                        style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
-                        onClick={() => { handleRemoveFromProject(nodeContextMenu.node.id); setNodeContextMenu(null) }}
-                        onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
-                        onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
-                      >
-                        移出
+                        <StarOutlined style={{ marginRight: 6 }} />
+                        收藏到模版
                       </div>
                     )}
+                    <div
+                      style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
+                      onClick={() => { handleDeleteTagFromCanvas(nodeContextMenu.node.id, nodeContextMenu.node.name); setNodeContextMenu(null) }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
+                    >
+                      删除
+                    </div>
                   </div>
                 )}
 

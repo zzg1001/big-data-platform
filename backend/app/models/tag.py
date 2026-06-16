@@ -101,6 +101,9 @@ class TagNode(Base):
     source_datasource_id = Column(BigInteger)  # 数据源ID
     source_table = Column(String(255))  # 源表名
 
+    # 模版标签引用（指向原始标签，用于同步名字等信息）
+    source_node_id = Column(BigInteger, ForeignKey("big_tag_nodes.id"))
+
     # AI相关
     ai_generated = Column(Boolean, default=False)
     ai_confidence = Column(BigInteger)
@@ -119,7 +122,8 @@ class TagNode(Base):
     # 关系
     project = relationship("TagProject", back_populates="nodes")
     dimension = relationship("TagDimension", back_populates="nodes")
-    parent = relationship("TagNode", remote_side=[id], backref="children")
+    parent = relationship("TagNode", remote_side=[id], backref="children", foreign_keys=[parent_id])
+    source_node = relationship("TagNode", remote_side=[id], foreign_keys=[source_node_id])
     tag_data = relationship("TagData", back_populates="tag_node", cascade="all, delete-orphan")
 
     __table_args__ = (
@@ -163,4 +167,29 @@ class TagData(Base):
     __table_args__ = (
         Index('idx_tag_data_node', 'tag_node_id'),
         Index('idx_tag_data_source', 'datasource_id', 'table_name'),
+    )
+
+
+class TagTemplateFavorite(Base):
+    """
+    模版收藏 - 收藏分类标签到模版（只存储引用关系，不复制标签）
+    收藏后在侧边栏模版区显示，拖到画布时展开原标签及其子标签
+    """
+    __tablename__ = "big_tag_template_favorites"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # 收藏的标签节点（必须是 category 类型）
+    node_id = Column(BigInteger, ForeignKey("big_tag_nodes.id"), nullable=False)
+
+    # 审计
+    created_by = Column(BigInteger, ForeignKey("big_users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # 关系
+    node = relationship("TagNode")
+
+    __table_args__ = (
+        Index('idx_template_favorite_node', 'node_id'),
+        Index('idx_template_favorite_user', 'created_by'),
     )

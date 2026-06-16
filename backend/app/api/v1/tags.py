@@ -319,6 +319,20 @@ async def batch_create_dimension_tags(
     一次创建一个类型标签 + 多个子维度标签
     parent_id 可选，为空时创建在根目录
     """
+    # 检查全局同名（类型标签名 + 所有子标签名）
+    all_names = [data.type_name] + [tag.name for tag in data.tags]
+    check_query = select(TagNode).filter(
+        TagNode.name.in_(all_names),
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    existing_names = [node.name for node in check_result.scalars().all()]
+    if existing_names:
+        raise HTTPException(
+            status_code=400,
+            detail=f"以下标签名已存在：{', '.join(existing_names)}，标签名称必须全局唯一"
+        )
+
     parent_node = None
     project_id = None
     parent_path = ""
@@ -502,9 +516,17 @@ async def list_tag_nodes(
         )
         children_count = children_result.scalar() or 0
 
+        # 如果是模版标签且有引用原标签，获取原标签的名字
+        display_name = node.name
+        if node.source_node_id:
+            source_result = await db.execute(select(TagNode).filter(TagNode.id == node.source_node_id))
+            source_node = source_result.scalars().first()
+            if source_node:
+                display_name = source_node.name
+
         responses.append(TagNodeResponse(
             id=node.id,
-            name=node.name,
+            name=display_name,  # 使用原标签名字（如果有引用）
             description=node.description,
             node_type=node.node_type,
             parent_id=node.parent_id,
@@ -519,6 +541,7 @@ async def list_tag_nodes(
             tag_table_name=node.tag_table_name,
             source_datasource_id=node.source_datasource_id,
             source_table=node.source_table,
+            source_node_id=node.source_node_id,
             ai_generated=node.ai_generated,
             ai_confidence=node.ai_confidence,
             usage_count=node.usage_count,
@@ -557,14 +580,25 @@ async def get_tag_tree(
     )
     deployed_dag_ids = {row[0] for row in schedule_result.fetchall()}
 
+    # 先收集所有需要查询原标签名字的 source_node_id
+    source_ids = [node.source_node_id for node in all_nodes if node.source_node_id]
+    source_names = {}
+    if source_ids:
+        source_result = await db.execute(
+            select(TagNode.id, TagNode.name).filter(TagNode.id.in_(source_ids))
+        )
+        source_names = {row[0]: row[1] for row in source_result.fetchall()}
+
     # 构建树
     node_map = {}
     for node in all_nodes:
         # 判断是否已上线
         is_scheduled = f"tag_task_{node.id}" in deployed_dag_ids
+        # 如果有引用原标签，使用原标签名字
+        display_name = source_names.get(node.source_node_id, node.name) if node.source_node_id else node.name
         node_map[node.id] = {
             "id": node.id,
-            "name": node.name,
+            "name": display_name,  # 使用原标签名字（如果有引用）
             "description": node.description,
             "node_type": node.node_type,
             "color": node.color,
@@ -573,6 +607,7 @@ async def get_tag_tree(
             "parent_id": node.parent_id,
             "project_id": node.project_id,
             "dimension_id": node.dimension_id,
+            "source_node_id": node.source_node_id,
             "usage_count": node.usage_count,
             "rule_type": node.rule_type,
             "rule_config": node.rule_config,
@@ -630,16 +665,14 @@ async def create_tag_node(
         path = f"{parent.path or ''}/{parent.id}"
         parent_name = parent.name
 
-    # 检查同项目同级同名
+    # 检查全局同名（标签名字全局唯一）
     check_query = select(TagNode).filter(
         TagNode.name == data.name,
-        TagNode.parent_id == data.parent_id,
-        TagNode.project_id == data.project_id,
         TagNode.is_active == True
     )
     result = await db.execute(check_query)
     if result.scalars().first():
-        raise HTTPException(status_code=400, detail="同级下已存在同名节点")
+        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
 
     node = TagNode(
         name=data.name,
@@ -748,6 +781,17 @@ async def update_tag_node(
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
 
+    # 如果修改了名字，检查全局唯一性
+    if data.name is not None and data.name != node.name:
+        check_query = select(TagNode).filter(
+            TagNode.name == data.name,
+            TagNode.id != node_id,
+            TagNode.is_active == True
+        )
+        check_result = await db.execute(check_query)
+        if check_result.scalars().first():
+            raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
+
     # 如果修改了父节点，需要重新计算层级和路径
     if data.parent_id is not None and data.parent_id != node.parent_id:
         if data.parent_id == node_id:
@@ -819,12 +863,33 @@ async def delete_tag_node(
     current_user: User = Depends(get_current_user)
 ):
     """删除标签节点（包括所有子节点）"""
+    from app.models.tag import TagTemplateFavorite
+
     result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
     node = result.scalars().first()
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
 
-    # 先删除所有子节点（parent_id 指向当前节点的）
+    # 收集所有要删除的节点ID（包括子节点）
+    all_node_ids = [node_id]
+
+    async def collect_children_ids(parent_id: int):
+        children_result = await db.execute(
+            select(TagNode).filter(TagNode.parent_id == parent_id)
+        )
+        children = children_result.scalars().all()
+        for child in children:
+            all_node_ids.append(child.id)
+            await collect_children_ids(child.id)
+
+    await collect_children_ids(node_id)
+
+    # 先删除相关的收藏记录
+    await db.execute(
+        delete(TagTemplateFavorite).filter(TagTemplateFavorite.node_id.in_(all_node_ids))
+    )
+
+    # 删除所有子节点（parent_id 指向当前节点的）
     async def delete_children(parent_id: int):
         children_result = await db.execute(
             select(TagNode).filter(TagNode.parent_id == parent_id)
@@ -839,6 +904,150 @@ async def delete_tag_node(
     await db.flush()
 
     return {"message": "删除成功"}
+
+
+# ==================== 模版收藏 ====================
+
+@router.post("/nodes/{node_id}/save-to-template")
+async def save_to_template(
+    node_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    收藏分类标签到模版（只存储引用关系，不复制标签）
+    标签全局唯一，任何地方修改都会同步
+    """
+    from app.models.tag import TagTemplateFavorite
+
+    # 获取源节点
+    result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    source_node = result.scalars().first()
+    if not source_node:
+        raise HTTPException(status_code=404, detail="节点不存在")
+
+    # 只有分类标签可以收藏到模版
+    if source_node.node_type != "category":
+        raise HTTPException(status_code=400, detail="只有分类标签可以收藏到模版")
+
+    # 检查是否已收藏
+    existing = await db.execute(
+        select(TagTemplateFavorite).filter(TagTemplateFavorite.node_id == node_id)
+    )
+    if existing.scalars().first():
+        raise HTTPException(status_code=400, detail="该分类已收藏到模版")
+
+    # 创建收藏记录
+    favorite = TagTemplateFavorite(
+        node_id=node_id,
+        created_by=current_user.id
+    )
+    db.add(favorite)
+    await db.commit()
+    await db.refresh(favorite)
+
+    # 统计子标签数量
+    async def count_children(parent_id: int) -> int:
+        children_result = await db.execute(
+            select(func.count(TagNode.id)).filter(
+                TagNode.parent_id == parent_id,
+                TagNode.is_active == True
+            )
+        )
+        count = children_result.scalar() or 0
+        if count > 0:
+            children = await db.execute(
+                select(TagNode.id).filter(
+                    TagNode.parent_id == parent_id,
+                    TagNode.is_active == True
+                )
+            )
+            for child_id in children.scalars().all():
+                count += await count_children(child_id)
+        return count
+
+    child_count = await count_children(node_id)
+
+    return {
+        "message": f"成功收藏到模版",
+        "favorite_id": favorite.id,
+        "node_id": node_id,
+        "node_name": source_node.name,
+        "child_count": child_count
+    }
+
+
+@router.get("/template-favorites")
+async def list_template_favorites(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取所有模版收藏（返回原标签信息）
+    """
+    from app.models.tag import TagTemplateFavorite
+
+    result = await db.execute(
+        select(TagTemplateFavorite).order_by(TagTemplateFavorite.created_at.desc())
+    )
+    favorites = result.scalars().all()
+
+    responses = []
+    for fav in favorites:
+        # 获取原标签信息
+        node_result = await db.execute(
+            select(TagNode).filter(TagNode.id == fav.node_id, TagNode.is_active == True)
+        )
+        node = node_result.scalars().first()
+        if not node:
+            continue  # 原标签已删除，跳过
+
+        # 统计子标签数量
+        children_result = await db.execute(
+            select(func.count(TagNode.id)).filter(
+                TagNode.parent_id == node.id,
+                TagNode.is_active == True
+            )
+        )
+        children_count = children_result.scalar() or 0
+
+        responses.append({
+            "favorite_id": fav.id,
+            "node_id": node.id,
+            "name": node.name,
+            "description": node.description,
+            "node_type": node.node_type,
+            "color": node.color,
+            "icon": node.icon,
+            "children_count": children_count,
+            "created_at": fav.created_at.isoformat() if fav.created_at else None
+        })
+
+    return responses
+
+
+@router.delete("/template-favorites/{node_id}")
+async def remove_template_favorite(
+    node_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    取消模版收藏
+    """
+    from app.models.tag import TagTemplateFavorite
+
+    result = await db.execute(
+        select(TagTemplateFavorite).filter(TagTemplateFavorite.node_id == node_id)
+    )
+    favorite = result.scalars().first()
+    if not favorite:
+        raise HTTPException(status_code=404, detail="收藏记录不存在")
+
+    await db.delete(favorite)
+    await db.commit()
+
+    return {"message": "已取消收藏"}
 
 
 # ==================== 标签数据 ====================
@@ -971,6 +1180,15 @@ async def create_rule_tag(
 ):
     """创建规则标签（SQL逻辑保存为标签）"""
     import json
+
+    # 检查全局同名
+    check_query = select(TagNode).filter(
+        TagNode.name == data.name,
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    if check_result.scalars().first():
+        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
 
     # 计算层级和路径
     level = 1
@@ -1613,6 +1831,15 @@ async def create_row_tag_task(
     2. 创建标签数据表（使用自定义字段名）
     3. 保存配置
     """
+    # 检查全局同名
+    check_query = select(TagNode).filter(
+        TagNode.name == data.name,
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    if check_result.scalars().first():
+        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
+
     # 验证标签字段配置
     tag_fields_info = []
     for field in data.tag_fields:
@@ -1933,6 +2160,15 @@ async def create_dataset_tag(
     2. 创建新表存储数据
     3. 创建新标签节点
     """
+    # 检查全局同名
+    check_query = select(TagNode).filter(
+        TagNode.name == data.name,
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    if check_result.scalars().first():
+        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
+
     # 验证源标签
     for tag_id in data.source_tag_ids:
         result = await db.execute(select(TagNode).filter(TagNode.id == tag_id))

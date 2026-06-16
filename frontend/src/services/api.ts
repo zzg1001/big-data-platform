@@ -543,6 +543,14 @@ export const tagApi = {
     }),
   deleteDimensionDefineSession: (sessionId: string) =>
     api.delete(`/api/v1/tags/chat/define-dimension/${sessionId}`),
+
+  // 模版收藏（只存储引用关系，不复制标签）
+  saveToTemplate: (nodeId: number) =>
+    api.post(`/api/v1/tags/nodes/${nodeId}/save-to-template`),
+  listTemplateFavorites: () =>
+    api.get('/api/v1/tags/template-favorites'),
+  removeTemplateFavorite: (nodeId: number) =>
+    api.delete(`/api/v1/tags/template-favorites/${nodeId}`),
 }
 
 // 数据服务 API
