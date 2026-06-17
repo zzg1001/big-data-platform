@@ -18,6 +18,7 @@ from app.schemas.schedule import (
     ScheduleLogResponse,
 )
 from app.services.dag_generator import DAGGenerator
+from app.services.airflow_service import AirflowService
 
 router = APIRouter()
 
@@ -218,14 +219,24 @@ async def pause_schedule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Pause a schedule."""
+    """Pause a schedule (下线调度任务)."""
     result = await db.execute(select(Schedule).where(Schedule.id == schedule_id))
     schedule = result.scalar_one_or_none()
     if not schedule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
 
+    # 调用 Airflow API 暂停 DAG
+    if schedule.dag_id:
+        airflow_service = AirflowService()
+        success = await airflow_service.pause_dag(schedule.dag_id)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Airflow API 调用失败，无法暂停 DAG: {schedule.dag_id}"
+            )
+
     schedule.status = ScheduleStatus.PAUSED
-    await db.flush()
+    await db.commit()
     await db.refresh(schedule)
     return schedule
 
@@ -236,7 +247,7 @@ async def resume_schedule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Resume a paused schedule."""
+    """Resume a paused schedule (上线调度任务)."""
     result = await db.execute(select(Schedule).where(Schedule.id == schedule_id))
     schedule = result.scalar_one_or_none()
     if not schedule:
@@ -248,8 +259,18 @@ async def resume_schedule(
             detail="Schedule not deployed",
         )
 
+    # 调用 Airflow API 恢复 DAG
+    if schedule.dag_id:
+        airflow_service = AirflowService()
+        success = await airflow_service.unpause_dag(schedule.dag_id)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Airflow API 调用失败，无法恢复 DAG: {schedule.dag_id}"
+            )
+
     schedule.status = ScheduleStatus.ACTIVE
-    await db.flush()
+    await db.commit()
     await db.refresh(schedule)
     return schedule
 
