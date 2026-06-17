@@ -2895,16 +2895,68 @@ export default function TagSystem() {
           )}
         </div>
 
-        {/* 模版标签 */}
+        {/* 模版标签（只展示收藏的分类标签，不展示子级） */}
         <div style={{ marginBottom: 24 }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: '#13c2c2', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
             <FileTextOutlined />
             模版标签
-            <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>({templateTags.length})</span>
+            <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>({templateFavorites.length})</span>
           </div>
-          {templateTags.length > 0 ? (
+          {templateFavorites.length > 0 ? (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginLeft: 16 }}>
-              {templateTags.map(tag => renderTagItem(tag, '#13c2c2'))}
+              {templateFavorites.map(fav => (
+                <Dropdown
+                  key={fav.favorite_id}
+                  trigger={['contextMenu']}
+                  menu={{
+                    items: [
+                      {
+                        key: 'unfavorite',
+                        label: '取消收藏',
+                        danger: true,
+                        onClick: async () => {
+                          try {
+                            await tagApi.removeTemplateFavorite(fav.node_id)
+                            message.success('已取消收藏')
+                            loadTemplateFavorites()
+                          } catch {
+                            message.error('取消收藏失败')
+                          }
+                        }
+                      },
+                    ]
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: '4px 10px',
+                      background: '#fff',
+                      border: '1px solid #d9d9d9',
+                      borderRadius: 4,
+                      fontSize: 12,
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      transition: 'all 0.2s',
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = '#13c2c2'
+                      e.currentTarget.style.color = '#13c2c2'
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = '#d9d9d9'
+                      e.currentTarget.style.color = 'inherit'
+                    }}
+                  >
+                    <div style={{ width: 6, height: 6, borderRadius: 2, background: fav.color || '#13c2c2' }} />
+                    {fav.name}
+                    {fav.children_count > 0 && (
+                      <span style={{ fontSize: 10, color: '#999', marginLeft: 4 }}>+{fav.children_count}</span>
+                    )}
+                  </div>
+                </Dropdown>
+              ))}
             </div>
           ) : (
             <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无模版标签</div>

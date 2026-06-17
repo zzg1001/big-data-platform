@@ -319,26 +319,12 @@ async def batch_create_dimension_tags(
     一次创建一个类型标签 + 多个子维度标签
     parent_id 可选，为空时创建在根目录
     """
-    # 检查全局同名（类型标签名 + 所有子标签名）
-    all_names = [data.type_name] + [tag.name for tag in data.tags]
-    check_query = select(TagNode).filter(
-        TagNode.name.in_(all_names),
-        TagNode.is_active == True
-    )
-    check_result = await db.execute(check_query)
-    existing_names = [node.name for node in check_result.scalars().all()]
-    if existing_names:
-        raise HTTPException(
-            status_code=400,
-            detail=f"以下标签名已存在：{', '.join(existing_names)}，标签名称必须全局唯一"
-        )
-
     parent_node = None
     project_id = None
     parent_path = ""
     parent_level = 0
 
-    # 如果指定了父节点，验证其存在
+    # 如果指定了父节点，验证其存在并获取 project_id
     if data.parent_id:
         parent_result = await db.execute(select(TagNode).filter(TagNode.id == data.parent_id))
         parent_node = parent_result.scalars().first()
@@ -347,6 +333,21 @@ async def batch_create_dimension_tags(
         project_id = parent_node.project_id
         parent_path = parent_node.path or f"/{parent_node.id}"
         parent_level = parent_node.level or 1
+
+    # 检查画布内同名（类型标签名 + 所有子标签名）
+    all_names = [data.type_name] + [tag.name for tag in data.tags]
+    check_query = select(TagNode).filter(
+        TagNode.name.in_(all_names),
+        TagNode.project_id == project_id,
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    existing_names = [node.name for node in check_result.scalars().all()]
+    if existing_names:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前画布中以下标签名已存在：{', '.join(existing_names)}"
+        )
 
     # 验证维度存在
     dimension_result = await db.execute(select(TagDimension).filter(TagDimension.id == data.dimension_id))
@@ -665,14 +666,15 @@ async def create_tag_node(
         path = f"{parent.path or ''}/{parent.id}"
         parent_name = parent.name
 
-    # 检查全局同名（标签名字全局唯一）
+    # 检查画布内同名（标签名在当前画布内唯一）
     check_query = select(TagNode).filter(
         TagNode.name == data.name,
+        TagNode.project_id == data.project_id,
         TagNode.is_active == True
     )
     result = await db.execute(check_query)
     if result.scalars().first():
-        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
+        raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
 
     node = TagNode(
         name=data.name,
@@ -781,16 +783,17 @@ async def update_tag_node(
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
 
-    # 如果修改了名字，检查全局唯一性
+    # 如果修改了名字，检查画布内唯一性
     if data.name is not None and data.name != node.name:
         check_query = select(TagNode).filter(
             TagNode.name == data.name,
             TagNode.id != node_id,
+            TagNode.project_id == node.project_id,
             TagNode.is_active == True
         )
         check_result = await db.execute(check_query)
         if check_result.scalars().first():
-            raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
+            raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
 
     # 如果修改了父节点，需要重新计算层级和路径
     if data.parent_id is not None and data.parent_id != node.parent_id:
@@ -916,7 +919,7 @@ async def save_to_template(
 ):
     """
     收藏分类标签到模版（只存储引用关系，不复制标签）
-    标签全局唯一，任何地方修改都会同步
+    收藏不影响其他画布的标签命名
     """
     from app.models.tag import TagTemplateFavorite
 
@@ -1181,19 +1184,11 @@ async def create_rule_tag(
     """创建规则标签（SQL逻辑保存为标签）"""
     import json
 
-    # 检查全局同名
-    check_query = select(TagNode).filter(
-        TagNode.name == data.name,
-        TagNode.is_active == True
-    )
-    check_result = await db.execute(check_query)
-    if check_result.scalars().first():
-        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
-
-    # 计算层级和路径
+    # 计算层级和路径，获取 project_id
     level = 1
     path = ""
     parent_name = None
+    project_id = None
 
     if data.parent_id:
         result = await db.execute(select(TagNode).filter(TagNode.id == data.parent_id))
@@ -1203,12 +1198,24 @@ async def create_rule_tag(
         level = parent.level + 1
         path = f"{parent.path or ''}/{parent.id}"
         parent_name = parent.name
+        project_id = parent.project_id
+
+    # 检查画布内同名
+    check_query = select(TagNode).filter(
+        TagNode.name == data.name,
+        TagNode.project_id == project_id,
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    if check_result.scalars().first():
+        raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
 
     node = TagNode(
         name=data.name,
         description=data.description,
         node_type=data.node_type or "tag",  # 支持维度标签(tag)和粒度标签(detail)
         parent_id=data.parent_id,
+        project_id=project_id,
         level=level,
         path=path,
         color=data.color,
@@ -1831,14 +1838,31 @@ async def create_row_tag_task(
     2. 创建标签数据表（使用自定义字段名）
     3. 保存配置
     """
-    # 检查全局同名
+    # 计算层级和路径，获取 project_id
+    level = 1
+    path = ""
+    parent_name = None
+    project_id = None
+
+    if data.parent_id:
+        result = await db.execute(select(TagNode).filter(TagNode.id == data.parent_id))
+        parent = result.scalars().first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="父节点不存在")
+        level = parent.level + 1
+        path = f"{parent.path or ''}/{parent.id}"
+        parent_name = parent.name
+        project_id = parent.project_id
+
+    # 检查画布内同名
     check_query = select(TagNode).filter(
         TagNode.name == data.name,
+        TagNode.project_id == project_id,
         TagNode.is_active == True
     )
     check_result = await db.execute(check_query)
     if check_result.scalars().first():
-        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
+        raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
 
     # 验证标签字段配置
     tag_fields_info = []
@@ -1867,20 +1891,6 @@ async def create_row_tag_task(
             "tags": [{"id": t.id, "name": t.name} for t in tags]
         })
 
-    # 计算层级和路径
-    level = 1
-    path = ""
-    parent_name = None
-
-    if data.parent_id:
-        result = await db.execute(select(TagNode).filter(TagNode.id == data.parent_id))
-        parent = result.scalars().first()
-        if not parent:
-            raise HTTPException(status_code=404, detail="父节点不存在")
-        level = parent.level + 1
-        path = f"{parent.path or ''}/{parent.id}"
-        parent_name = parent.name
-
     # 生成目标表名
     target_table = data.target_table
     if not target_table:
@@ -1893,6 +1903,7 @@ async def create_row_tag_task(
         description=data.description,
         node_type="category",  # 行级标签任务作为分类节点
         parent_id=data.parent_id,
+        project_id=project_id,
         level=level,
         path=path,
         color=data.color,
@@ -2160,25 +2171,11 @@ async def create_dataset_tag(
     2. 创建新表存储数据
     3. 创建新标签节点
     """
-    # 检查全局同名
-    check_query = select(TagNode).filter(
-        TagNode.name == data.name,
-        TagNode.is_active == True
-    )
-    check_result = await db.execute(check_query)
-    if check_result.scalars().first():
-        raise HTTPException(status_code=400, detail="已存在同名标签，标签名称必须全局唯一")
-
-    # 验证源标签
-    for tag_id in data.source_tag_ids:
-        result = await db.execute(select(TagNode).filter(TagNode.id == tag_id))
-        if not result.scalars().first():
-            raise HTTPException(status_code=404, detail=f"标签 {tag_id} 不存在")
-
-    # 计算层级和路径
+    # 计算层级和路径，获取 project_id
     level = 1
     path = ""
     parent_name = None
+    project_id = None
 
     if data.parent_id:
         result = await db.execute(select(TagNode).filter(TagNode.id == data.parent_id))
@@ -2188,6 +2185,23 @@ async def create_dataset_tag(
         level = parent.level + 1
         path = f"{parent.path or ''}/{parent.id}"
         parent_name = parent.name
+        project_id = parent.project_id
+
+    # 检查画布内同名
+    check_query = select(TagNode).filter(
+        TagNode.name == data.name,
+        TagNode.project_id == project_id,
+        TagNode.is_active == True
+    )
+    check_result = await db.execute(check_query)
+    if check_result.scalars().first():
+        raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
+
+    # 验证源标签
+    for tag_id in data.source_tag_ids:
+        result = await db.execute(select(TagNode).filter(TagNode.id == tag_id))
+        if not result.scalars().first():
+            raise HTTPException(status_code=404, detail=f"标签 {tag_id} 不存在")
 
     # 生成目标表名
     target_table = data.target_table
@@ -2247,6 +2261,7 @@ async def create_dataset_tag(
         description=data.description,
         node_type="tag",
         parent_id=data.parent_id,
+        project_id=project_id,
         level=level,
         path=path,
         color=data.color,

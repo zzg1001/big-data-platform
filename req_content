@@ -1,1 +1,30 @@
-标签页面：维度标签，粒度标签，现在再添加一个：模版标签（功能待定）。
+curl -X POST "https://10.93.109.24/label" \
+  -H "X-API-Token: <YOUR_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "labelScene": "差旅推荐", ### 不同的参数不同的数据
+    "labelData": [
+        { 
+               "employeeId": "E10086",
+                "employeeName": "张三",
+                "department": "销售部",
+                "tripType": "business",
+                "fromCity": "上海",
+                "toCity": "北京",
+                "departureDate": "2026-01-15",
+                "returnDate": "2026-01-18",
+                "destinationAddress": "北京市朝阳区建国门外大街"
+        }
+       ,{
+            "employeeId": "E10086",
+            "employeeName": "张三",
+            "department": "销售部",
+            "tripType": "business",
+            "fromCity": "上海",
+            "toCity": "北京",
+            "departureDate": "2026-01-15",
+            "returnDate": "2026-01-18",
+            "destinationAddress": "北京市朝阳区建国门外大街",
+        }
+    ]
+  }'
