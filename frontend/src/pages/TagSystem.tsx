@@ -3215,7 +3215,9 @@ export default function TagSystem() {
       message.info('连接已删除，点击保存按钮提交')
     }
 
-    // 从画布删除标签（真正删除，全局同步）
+    // 从画布删除/移除标签
+    // - 在标签页面的标签（sidebarTags）：只能移除，不能删除
+    // - 不在标签页面的标签（画布新建的）：可以真正删除
     const handleDeleteTagFromCanvas = (nodeId: number, nodeName: string) => {
       // 递归获取所有子节点ID
       const getAllChildIds = (parentId: number): number[] => {
@@ -3230,61 +3232,113 @@ export default function TagSystem() {
 
       const childIds = getAllChildIds(nodeId)
       const childCount = childIds.length
+      const allIds = [nodeId, ...childIds]
 
-      Modal.confirm({
-        title: '确认删除',
-        content: (
-          <div>
-            <div style={{ marginBottom: 12 }}>
-              确定要删除标签「{nodeName}」吗？
-            </div>
-            {childCount > 0 && (
-              <div style={{ padding: 12, background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 6, fontSize: 13 }}>
-                <span style={{ color: '#fa8c16' }}>⚠️ 该标签下有 {childCount} 个子标签，将一并删除</span>
+      // 判断是否在标签页面中（sidebarTags）
+      const isInSidebar = sidebarTags.some(t => t.id === nodeId)
+
+      if (isInSidebar) {
+        // 在标签页面的标签：只能移除（断开与当前画布的关联）
+        Modal.confirm({
+          title: '从画布移除',
+          content: (
+            <div>
+              <div style={{ marginBottom: 12 }}>
+                确定要从画布移除标签「{nodeName}」吗？
               </div>
-            )}
-            <div style={{ marginTop: 12, color: '#999', fontSize: 12 }}>
-              此操作会永久删除标签，全局生效，不可恢复
+              {childCount > 0 && (
+                <div style={{ padding: 12, background: '#e6f7ff', border: '1px solid #91d5ff', borderRadius: 6, fontSize: 13 }}>
+                  <span style={{ color: '#1890ff' }}>ℹ️ 该标签下有 {childCount} 个子标签，将一并从画布移除</span>
+                </div>
+              )}
+              <div style={{ marginTop: 12, color: '#999', fontSize: 12 }}>
+                仅从当前画布移除，标签本身不会被删除。如需删除标签请到「标签管理 → 标签」页面操作。
+              </div>
             </div>
-          </div>
-        ),
-        okText: '删除',
-        okType: 'danger',
-        cancelText: '取消',
-        onOk: async () => {
-          try {
-            // 删除所有子标签（从叶子节点开始）
-            const allIdsToDelete = [...childIds.reverse(), nodeId]
-            for (const id of allIdsToDelete) {
-              await tagApi.deleteNode(id)
+          ),
+          okText: '移除',
+          cancelText: '取消',
+          onOk: async () => {
+            try {
+              // 调用 API 将节点的 project_id 设为 null（断开与画布的关联）
+              for (const id of allIds) {
+                await tagApi.updateNode(id, { project_id: null, parent_id: null })
+              }
+
+              // 从画布中移除
+              setAllTags(prev => prev.filter(t => !allIds.includes(t.id)))
+              setNodePositions(prev => {
+                const updated = { ...prev }
+                allIds.forEach(id => delete updated[id])
+                return updated
+              })
+              setPendingConnections(prev => {
+                const updated = { ...prev }
+                allIds.forEach(id => delete updated[id])
+                return updated
+              })
+
+              message.success(`已从画布移除 ${allIds.length} 个标签`)
+              // 刷新侧边栏
+              loadTagNodes()
+            } catch (error: any) {
+              message.error(error.response?.data?.detail || '移除失败')
             }
-
-            // 从画布中移除
-            setAllTags(prev => prev.filter(t => !allIdsToDelete.includes(t.id)))
-            setNodePositions(prev => {
-              const updated = { ...prev }
-              allIdsToDelete.forEach(id => {
-                delete updated[id]
-              })
-              return updated
-            })
-            setPendingConnections(prev => {
-              const updated = { ...prev }
-              allIdsToDelete.forEach(id => {
-                delete updated[id]
-              })
-              return updated
-            })
-
-            message.success(`已删除 ${allIdsToDelete.length} 个标签`)
-            // 刷新侧边栏
-            loadTagNodes()
-            loadStatistics()
-          } catch (error: any) {
-            message.error(error.response?.data?.detail || '删除失败')
           }
-        }
-      })
+        })
+      } else {
+        // 不在标签页面的标签（画布新建的）：可以真正删除
+        Modal.confirm({
+          title: '确认删除',
+          content: (
+            <div>
+              <div style={{ marginBottom: 12 }}>
+                确定要删除标签「{nodeName}」吗？
+              </div>
+              {childCount > 0 && (
+                <div style={{ padding: 12, background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 6, fontSize: 13 }}>
+                  <span style={{ color: '#fa8c16' }}>⚠️ 该标签下有 {childCount} 个子标签，将一并删除</span>
+                </div>
+              )}
+              <div style={{ marginTop: 12, color: '#999', fontSize: 12 }}>
+                此操作会永久删除标签，不可恢复
+              </div>
+            </div>
+          ),
+          okText: '删除',
+          okType: 'danger',
+          cancelText: '取消',
+          onOk: async () => {
+            try {
+              // 删除所有子标签（从叶子节点开始）
+              const allIdsToDelete = [...childIds.reverse(), nodeId]
+              for (const id of allIdsToDelete) {
+                await tagApi.deleteNode(id)
+              }
+
+              // 从画布中移除
+              setAllTags(prev => prev.filter(t => !allIdsToDelete.includes(t.id)))
+              setNodePositions(prev => {
+                const updated = { ...prev }
+                allIdsToDelete.forEach(id => delete updated[id])
+                return updated
+              })
+              setPendingConnections(prev => {
+                const updated = { ...prev }
+                allIdsToDelete.forEach(id => delete updated[id])
+                return updated
+              })
+
+              message.success(`已删除 ${allIdsToDelete.length} 个标签`)
+              // 刷新侧边栏
+              loadTagNodes()
+              loadStatistics()
+            } catch (error: any) {
+              message.error(error.response?.data?.detail || '删除失败')
+            }
+          }
+        })
+      }
     }
 
     // 保存所有待保存的连接变更
@@ -5068,12 +5122,17 @@ export default function TagSystem() {
                       </div>
                     )}
                     <div
-                      style={{ padding: '6px 12px', cursor: 'pointer', fontSize: 13, color: '#ff4d4f' }}
+                      style={{
+                        padding: '6px 12px',
+                        cursor: 'pointer',
+                        fontSize: 13,
+                        color: sidebarTags.some(t => t.id === nodeContextMenu.node.id) ? '#999' : '#ff4d4f'
+                      }}
                       onClick={() => { handleDeleteTagFromCanvas(nodeContextMenu.node.id, nodeContextMenu.node.name); setNodeContextMenu(null) }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = '#fff1f0')}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = sidebarTags.some(t => t.id === nodeContextMenu.node.id) ? '#f5f5f5' : '#fff1f0')}
                       onMouseLeave={(e) => (e.currentTarget.style.background = '#fff')}
                     >
-                      删除
+                      {sidebarTags.some(t => t.id === nodeContextMenu.node.id) ? '从画布移除' : '删除'}
                     </div>
                   </div>
                 )}
