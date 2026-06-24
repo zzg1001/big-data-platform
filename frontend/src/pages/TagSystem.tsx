@@ -916,6 +916,8 @@ export default function TagSystem() {
         // 规则引擎视图：只显示手动创建的规则引擎（不是AI生成的，也不是复合智能标签）
         const filtered = allNodes.filter((t) => {
           if (t.rule_type !== 'sql') return false
+          // 排除 node_type === 'value' 的值标签（AI打标生成的子标签）
+          if (t.node_type === 'value') return false
           if (t.rule_config) {
             try {
               const config = JSON.parse(t.rule_config)
@@ -2106,8 +2108,10 @@ export default function TagSystem() {
         width: 160,
         fixed: 'right' as const,
         render: (_: any, record: TagTask) => {
-          // 值标签禁用执行和调度按钮
-          const isValueTag = record.node_type === 'value' || record.node_type === 'tag'
+          // 值标签禁用执行和调度按钮（只有没有独立SQL规则的值标签才禁用）
+          // node_type === 'value' 是AI打标生成的子标签，没有独立SQL
+          // node_type === 'tag' 且 rule_type === 'sql' 是规则引擎创建的，有独立SQL，可以执行
+          const isValueTag = record.node_type === 'value' || (record.node_type === 'tag' && record.rule_type !== 'sql')
           return (
             <Space size={4}>
               {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
@@ -3159,12 +3163,13 @@ export default function TagSystem() {
       }
 
       // 检查维度一致性：不同维度的标签不能相连
-      // 但分类节点（category）可以连接任何节点，因为分类是容器，不受维度限制
+      // 但分类节点（category）和粒度标签（detail）可以连接任何节点，不受维度限制
       const sourceTag = allTags.find(t => t.id === connectingFrom.id)
       const targetTag = allTags.find(t => t.id === targetNodeId)
       if (sourceTag && targetTag) {
-        // 如果源节点是分类，跳过维度检查
-        if (sourceTag.node_type !== 'category') {
+        // 如果源节点是分类或粒度标签，或目标是分类，跳过维度检查
+        const skipDimensionCheck = sourceTag.node_type === 'category' || sourceTag.node_type === 'detail' || targetTag.node_type === 'category'
+        if (!skipDimensionCheck) {
           const sourceDimension = sourceTag.dimension_id
           const targetDimension = targetTag.dimension_id
           // 只有当两个节点都有维度且不同时，才阻止连接
@@ -4861,9 +4866,10 @@ export default function TagSystem() {
                           return
                         }
 
-                        // 检查维度一致性
+                        // 检查维度一致性（粒度标签和分类不受维度限制）
                         const targetTag = allTags.find(t => t.id === node.id)
-                        if (targetTag && sourceTag.dimension_id !== targetTag.dimension_id) {
+                        const skipDimensionCheck = sourceTag.node_type === 'detail' || node.node_type === 'category'
+                        if (!skipDimensionCheck && targetTag && sourceTag.dimension_id !== targetTag.dimension_id) {
                           const sourceDim = dimensions.find(d => d.id === sourceTag.dimension_id)
                           const targetDim = dimensions.find(d => d.id === targetTag.dimension_id)
                           const sourceLabel = sourceDim?.display_name || (sourceTag.dimension_id ? '未知维度' : '无维度')
@@ -4895,10 +4901,11 @@ export default function TagSystem() {
                         }
                         // 拖拽连线释放到节点上 - 重新连接
                         if (draggingLine && canReceiveConnection && draggingLine.childId !== node.id && currentProject) {
-                          // 检查维度一致性
+                          // 检查维度一致性（粒度标签和分类不受维度限制）
                           const childTag = allTags.find(t => t.id === draggingLine.childId)
                           const parentTag = allTags.find(t => t.id === node.id)
-                          if (childTag && parentTag && childTag.dimension_id !== parentTag.dimension_id) {
+                          const skipDimCheck = childTag?.node_type === 'detail' || node.node_type === 'category'
+                          if (!skipDimCheck && childTag && parentTag && childTag.dimension_id !== parentTag.dimension_id) {
                             const childDim = dimensions.find(d => d.id === childTag.dimension_id)
                             const parentDim = dimensions.find(d => d.id === parentTag.dimension_id)
                             const childLabel = childDim?.display_name || (childTag.dimension_id ? '未知维度' : '无维度')

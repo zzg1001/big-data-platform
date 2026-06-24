@@ -1213,7 +1213,7 @@ async def create_rule_tag(
     node = TagNode(
         name=data.name,
         description=data.description,
-        node_type=data.node_type or "tag",  # 支持维度标签(tag)和粒度标签(detail)
+        node_type=data.node_type or "detail",  # 规则引擎默认为粒度标签(detail)
         parent_id=data.parent_id,
         project_id=project_id,
         level=level,
