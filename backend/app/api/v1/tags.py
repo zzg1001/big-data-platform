@@ -13,7 +13,7 @@ from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.api.v1.warehouse import get_warehouse_engine
 from app.models.user import User
-from app.models.tag import TagNode, TagData, TagProject, TagDimension
+from app.models.tag import TagNode, TagData, TagProject, TagDimension, TagNodeProject
 from app.models.datasource import DataSource
 from app.schemas.tag import (
     TagNodeCreate, TagNodeUpdate, TagNodeResponse, TagNodeTree,
@@ -27,6 +27,39 @@ from app.schemas.tag import (
 from app.services.ai_assistant import AIAssistant
 
 router = APIRouter()
+
+
+# ==================== 成员关系辅助函数 ====================
+
+async def _collect_node_and_descendant_ids(db: AsyncSession, node_id: int) -> List[int]:
+    """收集 node_id 及其所有子孙节点的 id（含自身）。"""
+    all_ids = [node_id]
+
+    async def _collect(parent_id: int):
+        children_result = await db.execute(
+            select(TagNode.id).filter(TagNode.parent_id == parent_id)
+        )
+        for (child_id,) in children_result.all():
+            all_ids.append(child_id)
+            await _collect(child_id)
+
+    await _collect(node_id)
+    return all_ids
+
+
+async def _ensure_node_membership(db: AsyncSession, node_id: int, project_id: Optional[int], created_by: Optional[int] = None):
+    """幂等地为单个节点插入项目成员行（已存在或 project_id 为空则跳过）。"""
+    if project_id is None:
+        return
+    exists_result = await db.execute(
+        select(TagNodeProject.id).filter(
+            TagNodeProject.node_id == node_id,
+            TagNodeProject.project_id == project_id,
+        )
+    )
+    if exists_result.scalars().first():
+        return
+    db.add(TagNodeProject(node_id=node_id, project_id=project_id, created_by=created_by))
 
 
 # ==================== 标签项目 CRUD ====================
@@ -43,18 +76,22 @@ async def list_tag_projects(
 
     responses = []
     for project in projects:
-        # 获取节点统计
+        # 获取节点统计（按成员关系：共享节点在每个所属项目都计数）
         node_count_result = await db.execute(
-            select(func.count(TagNode.id)).filter(
-                TagNode.project_id == project.id,
+            select(func.count(TagNode.id))
+            .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+            .filter(
+                TagNodeProject.project_id == project.id,
                 TagNode.is_active == True
             )
         )
         node_count = node_count_result.scalar() or 0
 
         tag_count_result = await db.execute(
-            select(func.count(TagNode.id)).filter(
-                TagNode.project_id == project.id,
+            select(func.count(TagNode.id))
+            .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+            .filter(
+                TagNodeProject.project_id == project.id,
                 TagNode.is_active == True,
                 TagNode.node_type.in_(['tag', 'value'])
             )
@@ -122,18 +159,22 @@ async def get_tag_project(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
 
-    # 获取节点统计
+    # 获取节点统计（按成员关系：共享节点在每个所属项目都计数）
     node_count_result = await db.execute(
-        select(func.count(TagNode.id)).filter(
-            TagNode.project_id == project.id,
+        select(func.count(TagNode.id))
+        .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+        .filter(
+            TagNodeProject.project_id == project.id,
             TagNode.is_active == True
         )
     )
     node_count = node_count_result.scalar() or 0
 
     tag_count_result = await db.execute(
-        select(func.count(TagNode.id)).filter(
-            TagNode.project_id == project.id,
+        select(func.count(TagNode.id))
+        .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+        .filter(
+            TagNodeProject.project_id == project.id,
             TagNode.is_active == True,
             TagNode.node_type.in_(['tag', 'value'])
         )
@@ -180,18 +221,22 @@ async def update_tag_project(
     await db.commit()
     await db.refresh(project)
 
-    # 获取节点统计
+    # 获取节点统计（按成员关系：共享节点在每个所属项目都计数）
     node_count_result = await db.execute(
-        select(func.count(TagNode.id)).filter(
-            TagNode.project_id == project.id,
+        select(func.count(TagNode.id))
+        .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+        .filter(
+            TagNodeProject.project_id == project.id,
             TagNode.is_active == True
         )
     )
     node_count = node_count_result.scalar() or 0
 
     tag_count_result = await db.execute(
-        select(func.count(TagNode.id)).filter(
-            TagNode.project_id == project.id,
+        select(func.count(TagNode.id))
+        .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+        .filter(
+            TagNodeProject.project_id == project.id,
             TagNode.is_active == True,
             TagNode.node_type.in_(['tag', 'value'])
         )
@@ -412,6 +457,11 @@ async def batch_create_dimension_tags(
     for tag_node in tag_nodes:
         tag_node.path = f"{type_node.path}/{tag_node.id}"
 
+    # 加入归属项目成员关系
+    await _ensure_node_membership(db, type_node.id, project_id, current_user.id)
+    for tag_node in tag_nodes:
+        await _ensure_node_membership(db, tag_node.id, project_id, current_user.id)
+
     await db.commit()
 
     # 刷新获取完整数据
@@ -567,7 +617,12 @@ async def get_tag_tree(
 
     query = select(TagNode).filter(TagNode.is_active == True)
     if project_id is not None:
-        query = query.filter(TagNode.project_id == project_id)
+        # 按成员关系过滤：返回所有"属于该项目"的节点（含被其他项目共享拖入的节点）
+        member_subq = (
+            select(TagNodeProject.node_id)
+            .filter(TagNodeProject.project_id == project_id)
+        )
+        query = query.filter(TagNode.id.in_(member_subq))
     query = query.order_by(TagNode.sort_order, TagNode.id)
 
     result = await db.execute(query)
@@ -695,6 +750,10 @@ async def create_tag_node(
 
     # 更新path包含自己的id
     node.path = f"{path}/{node.id}" if path else f"/{node.id}"
+    await db.flush()
+
+    # 新建节点加入其归属项目（使其立即出现在自己项目的画布中）
+    await _ensure_node_membership(db, node.id, node.project_id, current_user.id)
     await db.flush()
     await db.refresh(node)
 
@@ -892,6 +951,11 @@ async def delete_tag_node(
         delete(TagTemplateFavorite).filter(TagTemplateFavorite.node_id.in_(all_node_ids))
     )
 
+    # 删除这些节点在所有项目中的成员关系
+    await db.execute(
+        delete(TagNodeProject).filter(TagNodeProject.node_id.in_(all_node_ids))
+    )
+
     # 删除所有子节点（parent_id 指向当前节点的）
     async def delete_children(parent_id: int):
         children_result = await db.execute(
@@ -907,6 +971,71 @@ async def delete_tag_node(
     await db.flush()
 
     return {"message": "删除成功"}
+
+
+@router.post("/nodes/{node_id}/projects/{project_id}")
+async def add_node_to_project(
+    node_id: int,
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    将标签节点（及其所有子孙节点）加入某个项目。
+    用于从"标签池子"拖拽共享标签到项目画布——不移动/复制原标签，只新增成员关系。
+    幂等：已存在的成员关系会被跳过。
+    """
+    node_result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+    if not node_result.scalars().first():
+        raise HTTPException(status_code=404, detail="节点不存在")
+
+    project_result = await db.execute(select(TagProject).filter(TagProject.id == project_id))
+    if not project_result.scalars().first():
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    # 收集节点 + 全部子孙，连子树一起加入
+    all_node_ids = await _collect_node_and_descendant_ids(db, node_id)
+
+    # 查出已存在的成员关系，避免重复插入
+    existing_result = await db.execute(
+        select(TagNodeProject.node_id).filter(
+            TagNodeProject.project_id == project_id,
+            TagNodeProject.node_id.in_(all_node_ids),
+        )
+    )
+    existing_ids = {row[0] for row in existing_result.all()}
+
+    added_ids = []
+    for nid in all_node_ids:
+        if nid not in existing_ids:
+            db.add(TagNodeProject(node_id=nid, project_id=project_id, created_by=current_user.id))
+            added_ids.append(nid)
+
+    await db.flush()
+    return {"message": "已加入项目", "added_node_ids": added_ids}
+
+
+@router.delete("/nodes/{node_id}/projects/{project_id}")
+async def remove_node_from_project(
+    node_id: int,
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    将标签节点（及其所有子孙节点）从某个项目的画布中移除（只删成员关系）。
+    节点本身与打标数据保留，仍存在于其他项目中。
+    """
+    all_node_ids = await _collect_node_and_descendant_ids(db, node_id)
+
+    await db.execute(
+        delete(TagNodeProject).filter(
+            TagNodeProject.project_id == project_id,
+            TagNodeProject.node_id.in_(all_node_ids),
+        )
+    )
+    await db.flush()
+    return {"message": "已从项目移除", "removed_node_ids": all_node_ids}
 
 
 # ==================== 模版收藏 ====================
@@ -1230,6 +1359,10 @@ async def create_rule_tag(
     await db.flush()
 
     node.path = f"{path}/{node.id}" if path else f"/{node.id}"
+    await db.flush()
+
+    # 加入归属项目成员关系
+    await _ensure_node_membership(db, node.id, project_id, current_user.id)
     await db.flush()
     await db.refresh(node)
 
@@ -1923,6 +2056,10 @@ async def create_row_tag_task(
     node.path = f"{path}/{node.id}" if path else f"/{node.id}"
     await db.flush()
 
+    # 加入归属项目成员关系
+    await _ensure_node_membership(db, node.id, project_id, current_user.id)
+    await db.flush()
+
     # 在平台仓库中创建标签表
     engine, _ = await get_warehouse_engine(db)
 
@@ -2277,6 +2414,10 @@ async def create_dataset_tag(
     await db.flush()
 
     node.path = f"{path}/{node.id}" if path else f"/{node.id}"
+    await db.flush()
+
+    # 加入归属项目成员关系
+    await _ensure_node_membership(db, node.id, project_id, current_user.id)
     await db.flush()
     await db.refresh(node)
 

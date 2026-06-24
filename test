@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+zhangyuan_ontime_pv_v3.py
+功能：原逻辑不变，新增 cameraId 分流；任何异常直接 exit(1) 便于 Azkaban 捕捉失败。
+"""
+
+import logging
+import sys
+from datetime import datetime, timedelta
+
+import redis
+import requests
+import time
+# ---------- 日志 ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def log_and_exit(msg: str, ret=1):
+    logging.error(msg)
+    sys.exit(ret)
+
+# ---------- Redis ----------
+try:
+    redis_client = redis.Redis(
+        host="172.16.0.5",
+        port=6379,
+        password="syf133618",
+        decode_responses=True
+    )
+    redis_client.ping()
+except Exception as e:
+    log_and_exit(f"Redis connect failed: {e}")
+
+# ---------- API ----------
+API_URL = "https://api.deepeleph.com/api/v1/stat/pv"
+
+# ---------- 时间窗口 ----------
+now = datetime.now()
+start = now - timedelta(minutes=10)
+start_str = start.strftime("%Y-%m-%d %H:%M:%S")
+end_str   = now.strftime("%Y-%m-%d %H:%M:%S")
+logging.info(f"Time window: {start_str}  ->  {end_str}")
+
+# ---------- Token ----------
+token = redis_client.get("token")
+if not token:
+    log_and_exit("Token not found in Redis")
+
+# ---------- 分页 ----------
+PAGE_LIMIT = 200
+page_num   = 1
+
+# ---------- 主循环 ----------
+try:
+    while True:
+        payload = {
+            "token": token,
+            "tenantCode": "dazhangyuan",
+            "fieldId": "001",
+            "startTime": start_str,
+            "endTime": end_str,
+            "pageNum": page_num,
+            "pageLimit": PAGE_LIMIT
+        }
+
+        try:
+            resp = requests.post(API_URL, json=payload, timeout=30)
+            time.sleep(0.5)
+        except Exception as e:
+            log_and_exit(f"Request exception: {e}")
+
+        if resp.status_code != 200:
+            log_and_exit(f"HTTP error {resp.status_code}")
+
+        try:
+            data = resp.json()
+        except Exception:
+            log_and_exit("Response body is not valid JSON")
+
+        if data.get("code") != 200:
+            log_and_exit(f"API error: {data.get('message')}")
+
+        items = data["data"].get("items", [])
+        if not items:
+            logging.info("No more items — collection completed.")
+            break
+
+        # ---------- 分流统计 ----------
+        hour_key = now.strftime("%Y-%m-%d-%H")
+        mmbl_cnt, zy_cnt = 0, 0
+
+        for obj in items:          # obj 才是单行数据
+
+            eventType = obj.get("eventType", "")
+            
+            fieldId = obj.get("fieldId", "")
+            if fieldId != '001':
+               continue
+
+            cam_id = obj.get("cameraId", "")
+            if cam_id in ("cam-001-172-17-10-73", "cam-001-172-17-10-32","cam-001-172-17-10-130","cam-001-172-17-10-135","cam-001-172-17-10-134"):
+                print(cam_id)
+   
+
+except Exception as e:
+    log_and_exit(f"Unhandled exception: {e}")
+
+logging.info("All done.")
+sys.exit(0)

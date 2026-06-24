@@ -398,6 +398,11 @@ export const tagApi = {
     api.put(`/api/v1/tags/nodes/${id}`, data),
   deleteNode: (id: number) =>
     api.delete(`/api/v1/tags/nodes/${id}`),
+  // 将节点（含子树）加入/移出某个项目（多对多共享，不移动/复制原标签）
+  addNodeToProject: (nodeId: number, projectId: number) =>
+    api.post(`/api/v1/tags/nodes/${nodeId}/projects/${projectId}`),
+  removeNodeFromProject: (nodeId: number, projectId: number) =>
+    api.delete(`/api/v1/tags/nodes/${nodeId}/projects/${projectId}`),
 
   // 标签数据
   listData: (params?: { tag_node_id?: number; datasource_id?: number; table_name?: string }) =>

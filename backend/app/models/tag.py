@@ -2,7 +2,7 @@
 标签管理平台 - 统一树形结构模型
 """
 from datetime import datetime
-from sqlalchemy import Column, BigInteger, String, Boolean, DateTime, ForeignKey, Text, Index
+from sqlalchemy import Column, BigInteger, String, Boolean, DateTime, ForeignKey, Text, Index, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -58,7 +58,9 @@ class TagProject(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # 关系
-    nodes = relationship("TagNode", back_populates="project", cascade="all, delete-orphan")
+    # 注意：不使用 delete-orphan 级联，避免硬删项目时误删被其他项目共享的节点。
+    # 删项目时只清理 big_tag_node_projects 成员关系（见 API 层）。
+    nodes = relationship("TagNode", back_populates="project", cascade="save-update, merge")
 
 
 class TagNode(Base):
@@ -125,6 +127,12 @@ class TagNode(Base):
     parent = relationship("TagNode", remote_side=[id], backref="children", foreign_keys=[parent_id])
     source_node = relationship("TagNode", remote_side=[id], foreign_keys=[source_node_id])
     tag_data = relationship("TagData", back_populates="tag_node", cascade="all, delete-orphan")
+    # 节点↔项目多对多成员关系（一个节点可同时出现在多个项目画布中）
+    project_memberships = relationship(
+        "TagNodeProject",
+        cascade="all, delete-orphan",
+        foreign_keys="TagNodeProject.node_id",
+    )
 
     __table_args__ = (
         Index('idx_tag_node_parent', 'parent_id'),
@@ -132,6 +140,27 @@ class TagNode(Base):
         Index('idx_tag_node_type', 'node_type'),
         Index('idx_tag_node_project', 'project_id'),
         Index('idx_tag_node_dimension', 'dimension_id'),
+    )
+
+
+class TagNodeProject(Base):
+    """
+    标签节点↔项目 成员关系（多对多）
+    记录某个标签节点出现在哪些项目画布中。标签本身（身份/规则/打标数据）只存一份，
+    通过此表让同一个标签可被多个项目共享引用，改一处所有项目生效。
+    """
+    __tablename__ = "big_tag_node_projects"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    node_id = Column(BigInteger, ForeignKey("big_tag_nodes.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(BigInteger, ForeignKey("big_tag_projects.id", ondelete="CASCADE"), nullable=False)
+    created_by = Column(BigInteger, ForeignKey("big_users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('node_id', 'project_id', name='uq_node_project'),
+        Index('idx_nodeproj_node', 'node_id'),
+        Index('idx_nodeproj_project', 'project_id'),
     )
 
 

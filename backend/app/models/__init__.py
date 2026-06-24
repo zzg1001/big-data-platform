@@ -12,7 +12,7 @@ from app.models.sync_schedule import SyncSchedule
 from app.models.etl_task import EtlTask, EtlLog
 from app.models.dw_layer import DwLayer
 from app.models.task_dependency import TaskDependency
-from app.models.tag import TagNode, TagData
+from app.models.tag import TagNode, TagData, TagNodeProject
 from app.models.api_key import ApiKey, ApiAccessLog
 
 __all__ = [
@@ -39,6 +39,7 @@ __all__ = [
     "TaskDependency",
     "TagNode",
     "TagData",
+    "TagNodeProject",
     "ApiKey",
     "ApiAccessLog",
 ]

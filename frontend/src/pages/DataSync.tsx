@@ -341,6 +341,12 @@ export default function DataSync() {
   const handleMoveRight = async () => {
     if (leftSelected.length === 0 || !sourceDsId) return
 
+    // 必须先选择目标层级，否则目标表名无法正确生成（会错误地默认成 ods 前缀）
+    if (!selectedLayerId) {
+      message.warning('请先选择目标层级')
+      return
+    }
+
     // 检查冲突
     const conflicts: {tableName: string, targetTableName: string, existingTasks: SyncTaskItem[]}[] = []
     const newOnes: {tableName: string, targetTableName: string}[] = []
@@ -2401,7 +2407,7 @@ export default function DataSync() {
             gap: 8,
             padding: '0 4px',
           }}>
-            <Tooltip title="添加到待同步">
+            <Tooltip title={!selectedLayerId ? '请先选择目标层级' : '添加到待同步'}>
               <Button
                 type="primary"
                 size="small"

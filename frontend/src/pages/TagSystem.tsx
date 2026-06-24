@@ -182,8 +182,10 @@ export default function TagSystem() {
   const [connectingFrom, setConnectingFrom] = useState<{ id: number; x: number; y: number; nodeType: string } | null>(null)
   const [connectingTo, setConnectingTo] = useState<{ x: number; y: number } | null>(null)
 
-  // 待保存的连接变更 { nodeId: { parentId: number | null, projectId: number | null } }
-  const [pendingConnections, setPendingConnections] = useState<Record<number, { parentId: number | null; projectId: number | null }>>({})
+  // 待保存的连接变更（仅父子关系，全局结构）{ nodeId: { parentId: number | null } }
+  const [pendingConnections, setPendingConnections] = useState<Record<number, { parentId: number | null }>>({})
+  // 待保存的项目成员变更（从池子拖入：把节点+子树加入当前项目，不移动/复制原标签）{ nodeId: projectId }
+  const [pendingMemberships, setPendingMemberships] = useState<Record<number, number>>({})
   const [savingConnections, setSavingConnections] = useState(false)
 
   // 点击的连线
@@ -1295,8 +1297,13 @@ export default function TagSystem() {
           try {
             // 真正删除节点（后端会级联删除子节点）
             await tagApi.deleteNode(task.id)
-            // 清理 pendingConnections
+            // 清理 pendingConnections / pendingMemberships
             setPendingConnections(prev => {
+              const next = { ...prev }
+              delete next[task.id]
+              return next
+            })
+            setPendingMemberships(prev => {
               const next = { ...prev }
               delete next[task.id]
               return next
@@ -1661,13 +1668,26 @@ export default function TagSystem() {
           : null,
       }
 
-      // 先保存待处理的连接变更（避免刷新时丢失拖拽的标签）
+      // 先保存待处理的成员变更与连接变更（避免刷新时丢失拖拽的标签）
+      if (Object.keys(pendingMemberships).length > 0) {
+        const memberPromises = Object.entries(pendingMemberships).map(async ([nodeId, projectId]) => {
+          try {
+            await tagApi.addNodeToProject(Number(nodeId), projectId)
+          } catch (err: any) {
+            if (err.response?.status !== 404) {
+              throw err
+            }
+            console.warn(`节点 ${nodeId} 不存在，跳过加入项目`)
+          }
+        })
+        await Promise.all(memberPromises)
+        setPendingMemberships({})
+      }
       if (Object.keys(pendingConnections).length > 0) {
         const promises = Object.entries(pendingConnections).map(async ([nodeId, data]) => {
           try {
             await tagApi.updateNode(Number(nodeId), {
-              parent_id: data.parentId,
-              project_id: data.projectId
+              parent_id: data.parentId
             })
           } catch (err: any) {
             // 忽略 404 错误（节点可能已被删除）
@@ -1826,8 +1846,13 @@ export default function TagSystem() {
         try {
           await tagApi.deleteNode(id)
           message.success('删除成功')
-          // 清理 pendingConnections 中的对应节点
+          // 清理 pendingConnections / pendingMemberships 中的对应节点
           setPendingConnections(prev => {
+            const next = { ...prev }
+            delete next[id]
+            return next
+          })
+          setPendingMemberships(prev => {
             const next = { ...prev }
             delete next[id]
             return next
@@ -3186,10 +3211,10 @@ export default function TagSystem() {
         }
       }
 
-      // 添加到待保存变更
+      // 添加到待保存变更（仅改父子关系，全局结构）
       setPendingConnections(prev => ({
         ...prev,
-        [targetNodeId]: { parentId: connectingFrom.id, projectId: currentProject.id }
+        [targetNodeId]: { parentId: connectingFrom.id }
       }))
 
       // 更新本地 allTags 以显示连接
@@ -3209,7 +3234,7 @@ export default function TagSystem() {
       // 添加到待保存变更（设置 parentId 为 null）
       setPendingConnections(prev => ({
         ...prev,
-        [nodeId]: { parentId: null, projectId: currentProject.id }
+        [nodeId]: { parentId: null }
       }))
 
       // 更新本地 allTags
@@ -3265,9 +3290,9 @@ export default function TagSystem() {
           cancelText: '取消',
           onOk: async () => {
             try {
-              // 调用 API 将节点的 project_id 设为 null（断开与画布的关联）
-              for (const id of allIds) {
-                await tagApi.updateNode(id, { project_id: null, parent_id: null })
+              // 仅移除当前项目的成员关系（节点+子树），不删除标签本身、不影响其他项目
+              if (currentProject) {
+                await tagApi.removeNodeFromProject(nodeId, currentProject.id)
               }
 
               // 从画布中移除
@@ -3282,10 +3307,15 @@ export default function TagSystem() {
                 allIds.forEach(id => delete updated[id])
                 return updated
               })
+              setPendingMemberships(prev => {
+                const updated = { ...prev }
+                allIds.forEach(id => delete updated[id])
+                return updated
+              })
 
               message.success(`已从画布移除 ${allIds.length} 个标签`)
-              // 刷新侧边栏
-              loadTagNodes()
+              // 刷新侧边栏与当前项目画布
+              loadTagNodes(currentProject?.id)
             } catch (error: any) {
               message.error(error.response?.data?.detail || '移除失败')
             }
@@ -3348,23 +3378,25 @@ export default function TagSystem() {
 
     // 保存所有待保存的连接变更
     const handleSaveConnections = async () => {
-      if (Object.keys(pendingConnections).length === 0) {
+      if (Object.keys(pendingConnections).length === 0 && Object.keys(pendingMemberships).length === 0) {
         message.info('没有待保存的变更')
         return
       }
 
       setSavingConnections(true)
       try {
-        // 批量保存所有变更
-        const promises = Object.entries(pendingConnections).map(([nodeId, data]) =>
-          tagApi.updateNode(Number(nodeId), {
-            parent_id: data.parentId,
-            project_id: data.projectId
-          })
+        // 1. 池子拖入：把节点（含子树）加入当前项目（成员关系，不移动原标签）
+        const membershipPromises = Object.entries(pendingMemberships).map(([nodeId, projectId]) =>
+          tagApi.addNodeToProject(Number(nodeId), projectId)
         )
-        await Promise.all(promises)
+        // 2. 同项目内连线/断开：仅更新父子关系（全局结构），不改 project_id
+        const connectionPromises = Object.entries(pendingConnections).map(([nodeId, data]) =>
+          tagApi.updateNode(Number(nodeId), { parent_id: data.parentId })
+        )
+        await Promise.all([...membershipPromises, ...connectionPromises])
 
         setPendingConnections({})
+        setPendingMemberships({})
         message.success('保存成功')
         loadTagNodes(currentProject?.id)
       } catch (error: any) {
@@ -3681,14 +3713,14 @@ export default function TagSystem() {
             </Tooltip>
           )}
           <Button icon={<ReloadOutlined />} onClick={() => loadTagNodes()}>刷新</Button>
-          {Object.keys(pendingConnections).length > 0 && (
+          {(Object.keys(pendingConnections).length > 0 || Object.keys(pendingMemberships).length > 0) && (
             <Button
               type="primary"
               icon={<CheckCircleOutlined />}
               loading={savingConnections}
               onClick={handleSaveConnections}
             >
-              保存 ({Object.keys(pendingConnections).length})
+              保存 ({Object.keys(pendingConnections).length + Object.keys(pendingMemberships).length})
             </Button>
           )}
         </div>
@@ -4593,10 +4625,10 @@ export default function TagSystem() {
                 }
                 const childTags = getAllChildren(numTagId)
 
-                // 添加类型/模版标签
-                setPendingConnections(prev => ({
+                // 添加类型/模版标签（记录成员关系：节点+子树加入当前项目）
+                setPendingMemberships(prev => ({
                   ...prev,
-                  [numTagId]: { parentId: null, projectId: currentProject.id }
+                  [numTagId]: currentProject.id
                 }))
                 setAllTags(prev => {
                   const exists = prev.some(t => t.id === numTagId)
@@ -4620,10 +4652,7 @@ export default function TagSystem() {
                     const childY = y + yOffset
                     yOffset += 40
 
-                    setPendingConnections(prev => ({
-                      ...prev,
-                      [child.id]: { parentId: child.parent_id, projectId: currentProject.id }
-                    }))
+                    // 子节点会随父节点一起加入项目（后端 addNodeToProject 级联子树），此处只更新本地显示
                     setAllTags(prev => {
                       const exists = prev.some(t => t.id === child.id)
                       if (exists) {
@@ -4648,10 +4677,10 @@ export default function TagSystem() {
                   draggedTag.node_type === 'category' ? '分类' : '类型'
                 message.info(`已添加${tagTypeLabel}及 ${childTags.length} 个子标签`)
               } else {
-                // 普通标签，单独添加
-                setPendingConnections(prev => ({
+                // 普通标签，单独添加（记录成员关系：加入当前项目）
+                setPendingMemberships(prev => ({
                   ...prev,
-                  [numTagId]: { parentId: null, projectId: currentProject.id }
+                  [numTagId]: currentProject.id
                 }))
                 setAllTags(prev => {
                   const exists = prev.some(t => t.id === numTagId)
@@ -4878,10 +4907,16 @@ export default function TagSystem() {
                           return
                         }
 
-                        // 添加到待保存变更
+                        // 添加到待保存变更：
+                        // 1) 成员关系——把拖入的标签（含子树）加入当前项目（不移动/复制原标签）
+                        setPendingMemberships(prev => ({
+                          ...prev,
+                          [sourceTag.id]: currentProject.id
+                        }))
+                        // 2) 父子关系——连接到目标节点（全局结构）
                         setPendingConnections(prev => ({
                           ...prev,
-                          [sourceTag.id]: { parentId: node.id, projectId: currentProject.id }
+                          [sourceTag.id]: { parentId: node.id }
                         }))
 
                         // 更新本地数据以显示连接
@@ -4915,10 +4950,10 @@ export default function TagSystem() {
                             setDraggingLineEnd(null)
                             return
                           }
-                          // 更新连接：将子节点的父节点改为当前节点
+                          // 更新连接：将子节点的父节点改为当前节点（仅改父子关系）
                           setPendingConnections(prev => ({
                             ...prev,
-                            [draggingLine.childId]: { parentId: node.id, projectId: currentProject.id }
+                            [draggingLine.childId]: { parentId: node.id }
                           }))
                           // 更新本地数据
                           setAllTags(prev => prev.map(t =>
