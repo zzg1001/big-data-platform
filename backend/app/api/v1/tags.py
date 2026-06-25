@@ -5,9 +5,9 @@
 import json
 import re
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete, text
+from sqlalchemy import select, func, delete, text, or_
 
 from app.core.database import get_db
 from app.api.deps import get_current_user
@@ -47,19 +47,42 @@ async def _collect_node_and_descendant_ids(db: AsyncSession, node_id: int) -> Li
     return all_ids
 
 
-async def _ensure_node_membership(db: AsyncSession, node_id: int, project_id: Optional[int], created_by: Optional[int] = None):
-    """幂等地为单个节点插入项目成员行（已存在或 project_id 为空则跳过）。"""
+async def _collect_project_subtree_ids(db: AsyncSession, node_id: int, project_id: int) -> List[int]:
+    """按"项目内父子结构"（big_tag_node_projects.parent_id）收集 node_id 及其在该项目内的所有子孙（含自身）。
+    与全局 TagNode.parent_id 区分——画布重连后两者可能不一致，删除/移除应以画布所见（项目内）为准。"""
+    all_ids = [node_id]
+
+    async def _collect(parent_id: int):
+        children_result = await db.execute(
+            select(TagNodeProject.node_id).filter(
+                TagNodeProject.project_id == project_id,
+                TagNodeProject.parent_id == parent_id,
+            )
+        )
+        for (child_id,) in children_result.all():
+            all_ids.append(child_id)
+            await _collect(child_id)
+
+    await _collect(node_id)
+    return all_ids
+
+
+async def _ensure_node_membership(db: AsyncSession, node_id: int, project_id: Optional[int], created_by: Optional[int] = None, parent_id: Optional[int] = None):
+    """幂等地为单个节点插入项目成员行（已存在则更新其本项目父节点；project_id 为空则跳过）。
+    parent_id 为该节点在本项目中的挂载位置（NULL=本项目根）。"""
     if project_id is None:
         return
     exists_result = await db.execute(
-        select(TagNodeProject.id).filter(
+        select(TagNodeProject).filter(
             TagNodeProject.node_id == node_id,
             TagNodeProject.project_id == project_id,
         )
     )
-    if exists_result.scalars().first():
+    existing = exists_result.scalars().first()
+    if existing:
+        existing.parent_id = parent_id
         return
-    db.add(TagNodeProject(node_id=node_id, project_id=project_id, created_by=created_by))
+    db.add(TagNodeProject(node_id=node_id, project_id=project_id, created_by=created_by, parent_id=parent_id))
 
 
 # ==================== 标签项目 CRUD ====================
@@ -326,6 +349,127 @@ async def get_tag_dimension(
     return TagDimensionResponse.model_validate(dimension)
 
 
+@router.post("/dimensions/{dimension_id}/wide-tables")
+async def create_wide_table(
+    dimension_id: int,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    在实体下新建一张「宽表」节点（node_type='wide_table'）。
+    name=展示名，tag_table_name=真实表名。类型标签将挂在该宽表节点下作为列。
+    一个实体可有多张宽表（每张=一个任务）。
+    """
+    dim_result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
+    dim = dim_result.scalars().first()
+    if not dim:
+        raise HTTPException(status_code=404, detail="实体(维度)不存在")
+
+    display_name = (payload.get("display_name") or "").strip()
+    table_name = (payload.get("table_name") or "").strip()
+    parent_id = payload.get("parent_id")
+    if not display_name or not table_name:
+        raise HTTPException(status_code=400, detail="展示名与真实表名均为必填")
+    if not re.match(r'^[A-Za-z][A-Za-z0-9_]*$', table_name):
+        raise HTTPException(status_code=400, detail="真实表名只能包含字母/数字/下划线，且以字母开头")
+
+    # 同实体下展示名/真实表名唯一
+    dup_result = await db.execute(
+        select(TagNode).filter(
+            TagNode.dimension_id == dimension_id,
+            TagNode.node_type == "wide_table",
+            TagNode.is_active == True,
+            or_(TagNode.name == display_name, TagNode.tag_table_name == table_name),
+        )
+    )
+    if dup_result.scalars().first():
+        raise HTTPException(status_code=400, detail="该实体下已存在同名或同真实表名的宽表")
+
+    level = 1
+    path = ""
+    project_id = None
+    if parent_id:
+        p_result = await db.execute(select(TagNode).filter(TagNode.id == parent_id))
+        parent = p_result.scalars().first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="父节点不存在")
+        level = (parent.level or 1) + 1
+        path = f"{parent.path or ''}/{parent.id}"
+        project_id = parent.project_id
+
+    node = TagNode(
+        name=display_name,
+        node_type="wide_table",
+        parent_id=parent_id if parent_id else None,
+        project_id=project_id,
+        dimension_id=dimension_id,
+        tag_table_name=table_name,
+        level=level,
+        path=path,
+        color="#722ed1",
+        created_by=current_user.id,
+    )
+    db.add(node)
+    await db.flush()
+    node.path = f"{path}/{node.id}" if path else f"/{node.id}"
+    await _ensure_node_membership(db, node.id, project_id, current_user.id, parent_id=parent_id)
+    await db.flush()
+    await db.refresh(node)
+    return {
+        "id": node.id,
+        "name": node.name,
+        "node_type": node.node_type,
+        "tag_table_name": node.tag_table_name,
+        "dimension_id": node.dimension_id,
+        "parent_id": node.parent_id,
+    }
+
+
+@router.get("/dimensions/{dimension_id}/wide-tables")
+async def list_wide_tables(
+    dimension_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """列出某实体下的所有宽表节点。"""
+    result = await db.execute(
+        select(TagNode).filter(
+            TagNode.dimension_id == dimension_id,
+            TagNode.node_type == "wide_table",
+            TagNode.is_active == True,
+        ).order_by(TagNode.id)
+    )
+    return [
+        {"id": n.id, "name": n.name, "tag_table_name": n.tag_table_name, "dimension_id": n.dimension_id}
+        for n in result.scalars().all()
+    ]
+
+
+@router.get("/dimensions/{dimension_id}/preview")
+async def preview_dimension_data(
+    dimension_id: int,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """预览实体的画像宽表数据（一个实体一张表，所有类型标签为列）"""
+    result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
+    dimension = result.scalars().first()
+    if not dimension:
+        raise HTTPException(status_code=404, detail="实体(维度)不存在")
+    if not dimension.tag_table_name:
+        return {"columns": [], "rows": [], "total": 0}
+
+    engine, _ = await get_warehouse_engine(db)
+    with engine.connect() as conn:
+        result_rows = conn.execute(text(f"SELECT * FROM `{dimension.tag_table_name}` LIMIT {limit}"))
+        columns = list(result_rows.keys())
+        rows = [list(row) for row in result_rows.fetchall()]
+        total = conn.execute(text(f"SELECT COUNT(*) FROM `{dimension.tag_table_name}`")).scalar() or 0
+    return {"columns": columns, "rows": rows, "total": total}
+
+
 @router.delete("/dimensions/{dimension_id}")
 async def delete_tag_dimension(
     dimension_id: int,
@@ -458,9 +602,9 @@ async def batch_create_dimension_tags(
         tag_node.path = f"{type_node.path}/{tag_node.id}"
 
     # 加入归属项目成员关系
-    await _ensure_node_membership(db, type_node.id, project_id, current_user.id)
+    await _ensure_node_membership(db, type_node.id, project_id, current_user.id, parent_id=type_node.parent_id)
     for tag_node in tag_nodes:
-        await _ensure_node_membership(db, tag_node.id, project_id, current_user.id)
+        await _ensure_node_membership(db, tag_node.id, project_id, current_user.id, parent_id=tag_node.parent_id)
 
     await db.commit()
 
@@ -616,13 +760,15 @@ async def get_tag_tree(
     from app.models.schedule import Schedule, ScheduleStatus
 
     query = select(TagNode).filter(TagNode.is_active == True)
+    # 本项目内每个节点的挂载父节点（每个项目独立位置）；project_id 为空（池子）时用节点规范 parent_id
+    member_parent: dict = {}
     if project_id is not None:
-        # 按成员关系过滤：返回所有"属于该项目"的节点（含被其他项目共享拖入的节点）
-        member_subq = (
-            select(TagNodeProject.node_id)
+        member_rows = await db.execute(
+            select(TagNodeProject.node_id, TagNodeProject.parent_id)
             .filter(TagNodeProject.project_id == project_id)
         )
-        query = query.filter(TagNode.id.in_(member_subq))
+        member_parent = {nid: pid for nid, pid in member_rows.all()}
+        query = query.filter(TagNode.id.in_(list(member_parent.keys()) or [0]))
     query = query.order_by(TagNode.sort_order, TagNode.id)
 
     result = await db.execute(query)
@@ -652,6 +798,8 @@ async def get_tag_tree(
         is_scheduled = f"tag_task_{node.id}" in deployed_dag_ids
         # 如果有引用原标签，使用原标签名字
         display_name = source_names.get(node.source_node_id, node.name) if node.source_node_id else node.name
+        # 指定项目时用本项目的挂载父节点；否则（池子）用规范 parent_id
+        effective_parent = member_parent.get(node.id) if project_id is not None else node.parent_id
         node_map[node.id] = {
             "id": node.id,
             "name": display_name,  # 使用原标签名字（如果有引用）
@@ -660,7 +808,7 @@ async def get_tag_tree(
             "color": node.color,
             "icon": node.icon,
             "level": node.level,
-            "parent_id": node.parent_id,
+            "parent_id": effective_parent,
             "project_id": node.project_id,
             "dimension_id": node.dimension_id,
             "source_node_id": node.source_node_id,
@@ -753,7 +901,7 @@ async def create_tag_node(
     await db.flush()
 
     # 新建节点加入其归属项目（使其立即出现在自己项目的画布中）
-    await _ensure_node_membership(db, node.id, node.project_id, current_user.id)
+    await _ensure_node_membership(db, node.id, node.project_id, current_user.id, parent_id=node.parent_id)
     await db.flush()
     await db.refresh(node)
 
@@ -977,13 +1125,15 @@ async def delete_tag_node(
 async def add_node_to_project(
     node_id: int,
     project_id: int,
+    payload: Optional[dict] = Body(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     将标签节点（及其所有子孙节点）加入某个项目。
     用于从"标签池子"拖拽共享标签到项目画布——不移动/复制原标签，只新增成员关系。
-    幂等：已存在的成员关系会被跳过。
+    可选 body { parent_id }：根节点在本项目中的挂载父节点（拖到某分类上时=该分类，拖到空白=None）。
+    子孙节点按其规范父子结构挂载，保持子树内部结构。幂等：已存在则更新其本项目父节点。
     """
     node_result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
     if not node_result.scalars().first():
@@ -993,26 +1143,24 @@ async def add_node_to_project(
     if not project_result.scalars().first():
         raise HTTPException(status_code=404, detail="项目不存在")
 
+    root_parent_id = (payload or {}).get("parent_id")
+
     # 收集节点 + 全部子孙，连子树一起加入
     all_node_ids = await _collect_node_and_descendant_ids(db, node_id)
 
-    # 查出已存在的成员关系，避免重复插入
-    existing_result = await db.execute(
-        select(TagNodeProject.node_id).filter(
-            TagNodeProject.project_id == project_id,
-            TagNodeProject.node_id.in_(all_node_ids),
-        )
+    # 取各节点的规范父节点，用于保持子树内部结构
+    canon_result = await db.execute(
+        select(TagNode.id, TagNode.parent_id).filter(TagNode.id.in_(all_node_ids))
     )
-    existing_ids = {row[0] for row in existing_result.all()}
+    canonical_parent = {nid: pid for nid, pid in canon_result.all()}
 
-    added_ids = []
     for nid in all_node_ids:
-        if nid not in existing_ids:
-            db.add(TagNodeProject(node_id=nid, project_id=project_id, created_by=current_user.id))
-            added_ids.append(nid)
+        # 根节点挂到指定的目标分类下；子孙保持各自规范父节点
+        place_parent = root_parent_id if nid == node_id else canonical_parent.get(nid)
+        await _ensure_node_membership(db, nid, project_id, current_user.id, parent_id=place_parent)
 
     await db.flush()
-    return {"message": "已加入项目", "added_node_ids": added_ids}
+    return {"message": "已加入项目", "added_node_ids": all_node_ids}
 
 
 @router.delete("/nodes/{node_id}/projects/{project_id}")
@@ -1024,9 +1172,9 @@ async def remove_node_from_project(
 ):
     """
     将标签节点（及其所有子孙节点）从某个项目的画布中移除（只删成员关系）。
-    节点本身与打标数据保留，仍存在于其他项目中。
+    子孙按"本项目内父子结构"收集（与画布所见一致），节点本身与打标数据保留、仍存在于其他项目。
     """
-    all_node_ids = await _collect_node_and_descendant_ids(db, node_id)
+    all_node_ids = await _collect_project_subtree_ids(db, node_id, project_id)
 
     await db.execute(
         delete(TagNodeProject).filter(
@@ -1036,6 +1184,41 @@ async def remove_node_from_project(
     )
     await db.flush()
     return {"message": "已从项目移除", "removed_node_ids": all_node_ids}
+
+
+@router.put("/nodes/{node_id}/projects/{project_id}/parent")
+async def set_node_project_parent(
+    node_id: int,
+    project_id: int,
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    设置某节点在某项目中的挂载父节点（每个项目独立位置）。
+    用于画布内连线/断开——只改本项目的位置，不影响该共享标签在其他项目中的位置。
+    parent_id 为 None 表示在本项目中置为根节点。
+    """
+    parent_id = payload.get("parent_id")
+
+    result = await db.execute(
+        select(TagNodeProject).filter(
+            TagNodeProject.node_id == node_id,
+            TagNodeProject.project_id == project_id,
+        )
+    )
+    membership = result.scalars().first()
+    if not membership:
+        # 成员行不存在则补建（节点尚未加入该项目时的兜底）
+        node_result = await db.execute(select(TagNode).filter(TagNode.id == node_id))
+        if not node_result.scalars().first():
+            raise HTTPException(status_code=404, detail="节点不存在")
+        membership = TagNodeProject(node_id=node_id, project_id=project_id, created_by=current_user.id)
+        db.add(membership)
+
+    membership.parent_id = parent_id
+    await db.flush()
+    return {"message": "已更新位置", "node_id": node_id, "project_id": project_id, "parent_id": parent_id}
 
 
 # ==================== 模版收藏 ====================
@@ -1362,7 +1545,7 @@ async def create_rule_tag(
     await db.flush()
 
     # 加入归属项目成员关系
-    await _ensure_node_membership(db, node.id, project_id, current_user.id)
+    await _ensure_node_membership(db, node.id, project_id, current_user.id, parent_id=node.parent_id)
     await db.flush()
     await db.refresh(node)
 
@@ -1618,6 +1801,81 @@ async def execute_rule_tag(
     if not full_sql:
         raise HTTPException(status_code=400, detail="SQL规则为空")
 
+    engine, _ = await get_warehouse_engine(db)
+
+    # AI 实体标签：合并进"一个实体一张画像宽表"（每个类型标签为一列），而非每类型一张表
+    is_ai_dimension = config.get("source") == "ai_dimension" and node.dimension_id
+    if is_ai_dimension:
+        dim_result = await db.execute(select(TagDimension).filter(TagDimension.id == node.dimension_id))
+        dim = dim_result.scalars().first()
+        if not dim:
+            raise HTTPException(status_code=404, detail="实体(维度)不存在")
+        id_field = dim.id_field
+
+        # 宽表真实表名：优先取父节点（wide_table）的 tag_table_name（一个实体可多张宽表）
+        entity_table = None
+        if node.parent_id:
+            wt_result = await db.execute(select(TagNode).filter(TagNode.id == node.parent_id))
+            wt = wt_result.scalars().first()
+            if wt and wt.node_type == "wide_table" and wt.tag_table_name:
+                entity_table = wt.tag_table_name
+        # 兜底：父不是宽表（未迁移的旧数据）则退回实体级自动表
+        if not entity_table:
+            entity_table = dim.tag_table_name
+            if not entity_table:
+                slug = re.sub(r'[^a-zA-Z0-9_]', '_', (dim.name or '').lower())
+                slug = re.sub(r'_+', '_', slug).strip('_')
+                entity_table = f"tag_entity_{slug}" if slug else f"tag_entity_{dim.id}"
+                dim.tag_table_name = entity_table
+                await db.flush()
+
+        column = node.name  # 类型标签名作为列名，如"性别"
+
+        try:
+            with engine.connect() as conn:
+                # 0. 探测 full_sql 实际输出的列名（AI 可能把 id 列别名成 user_id 等，未必等于 id_field）
+                sub_cols = list(conn.execute(text(f"SELECT * FROM ({full_sql}) AS sub LIMIT 0")).keys())
+                if not sub_cols:
+                    raise Exception("SQL 没有输出任何列")
+                # id 列 = 非 tag_name 的那一列（一般是第一列）；标签值列固定为 tag_name
+                sql_id_col = next((c for c in sub_cols if c != "tag_name"), sub_cols[0])
+                tag_col = "tag_name" if "tag_name" in sub_cols else sub_cols[-1]
+
+                # 1. 确保宽表存在（id_field 为主键）
+                conn.execute(text(
+                    f"CREATE TABLE IF NOT EXISTS `{entity_table}` (`{id_field}` VARCHAR(255) PRIMARY KEY) "
+                    f"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+                ))
+                # 2. 确保该类型标签列存在（MySQL 老版本不支持 ADD COLUMN IF NOT EXISTS，先查后加）
+                col_exists = conn.execute(text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c"
+                ), {"t": entity_table, "c": column}).scalar()
+                if not col_exists:
+                    conn.execute(text(f"ALTER TABLE `{entity_table}` ADD COLUMN `{column}` VARCHAR(255)"))
+                # 3. UPSERT：把 SQL 实际的 id 列映射到实体表的 id_field 列，标签值并入本列
+                upsert_sql = (
+                    f"INSERT INTO `{entity_table}` (`{id_field}`, `{column}`) "
+                    f"SELECT `{sql_id_col}`, `{tag_col}` FROM ({full_sql}) AS sub "
+                    f"ON DUPLICATE KEY UPDATE `{column}` = VALUES(`{column}`)"
+                )
+                conn.execute(text(upsert_sql))
+                conn.commit()
+
+                count = conn.execute(text(f"SELECT COUNT(*) FROM `{entity_table}`")).scalar() or 0
+
+            node.tag_table_name = entity_table  # 类型/值标签预览复用该宽表
+            node.usage_count = count
+            await db.flush()
+            return {
+                "message": "SQL规则执行成功",
+                "target_table": entity_table,
+                "row_count": count
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"执行失败: {str(e)}")
+
+    # 普通 SQL 规则标签：保持"每标签一张表"（CREATE TABLE AS）
     # 生成目标表名
     if not node.tag_table_name:
         # 默认表名格式：tag_任务名拼音_时间戳
@@ -1630,8 +1888,6 @@ async def execute_rule_tag(
         await db.flush()
     else:
         target_table = node.tag_table_name
-
-    engine, _ = await get_warehouse_engine(db)
 
     try:
         with engine.connect() as conn:
@@ -2057,7 +2313,7 @@ async def create_row_tag_task(
     await db.flush()
 
     # 加入归属项目成员关系
-    await _ensure_node_membership(db, node.id, project_id, current_user.id)
+    await _ensure_node_membership(db, node.id, project_id, current_user.id, parent_id=node.parent_id)
     await db.flush()
 
     # 在平台仓库中创建标签表
@@ -2417,7 +2673,7 @@ async def create_dataset_tag(
     await db.flush()
 
     # 加入归属项目成员关系
-    await _ensure_node_membership(db, node.id, project_id, current_user.id)
+    await _ensure_node_membership(db, node.id, project_id, current_user.id, parent_id=node.parent_id)
     await db.flush()
     await db.refresh(node)
 
@@ -2463,6 +2719,54 @@ async def preview_tag_data(
     node = result.scalars().first()
     if not node:
         raise HTTPException(status_code=404, detail="标签节点不存在")
+
+    # 宽表节点：直接预览整张宽表
+    if node.node_type == 'wide_table' and node.tag_table_name:
+        engine, _ = await get_warehouse_engine(db)
+        with engine.connect() as conn:
+            r = conn.execute(text(f"SELECT * FROM `{node.tag_table_name}` LIMIT {limit}"))
+            columns = list(r.keys())
+            rows = [list(x) for x in r.fetchall()]
+            total = conn.execute(text(f"SELECT COUNT(*) FROM `{node.tag_table_name}`")).scalar() or 0
+        return {"columns": columns, "rows": rows, "total": total, "filter": None}
+
+    # AI 实体标签（类型/值标签）：从其所属「宽表」按列预览
+    if node.dimension_id and node.node_type in ('type', 'value', 'tag'):
+        dim_result = await db.execute(select(TagDimension).filter(TagDimension.id == node.dimension_id))
+        dim = dim_result.scalars().first()
+        # 定位类型节点：type 即自身；value 则取父类型
+        type_node = node
+        if node.node_type in ('value', 'tag') and node.parent_id:
+            p_res = await db.execute(select(TagNode).filter(TagNode.id == node.parent_id))
+            type_node = p_res.scalars().first() or node
+        # 宽表 = 类型节点的父节点
+        entity_table = None
+        if type_node and type_node.parent_id:
+            wt_res = await db.execute(select(TagNode).filter(TagNode.id == type_node.parent_id))
+            wt = wt_res.scalars().first()
+            if wt and wt.node_type == 'wide_table' and wt.tag_table_name:
+                entity_table = wt.tag_table_name
+        if not entity_table:
+            entity_table = dim.tag_table_name if dim else None  # 兜底：未迁移旧数据
+        if not (dim and entity_table):
+            return {"columns": [], "rows": [], "total": 0}
+        id_field = dim.id_field
+        col = type_node.name
+        if node.node_type == 'type':
+            filt = None
+            data_sql = f"SELECT `{id_field}`, `{col}` FROM `{entity_table}` LIMIT {limit}"
+            count_sql = f"SELECT COUNT(*) FROM `{entity_table}`"
+        else:
+            filt = f"`{col}` = '{node.name}'"
+            data_sql = f"SELECT `{id_field}`, `{col}` FROM `{entity_table}` WHERE {filt} LIMIT {limit}"
+            count_sql = f"SELECT COUNT(*) FROM `{entity_table}` WHERE {filt}"
+        engine, _ = await get_warehouse_engine(db)
+        with engine.connect() as conn:
+            result = conn.execute(text(data_sql))
+            columns = list(result.keys())
+            rows = [list(row) for row in result.fetchall()]
+            total = conn.execute(text(count_sql)).scalar() or 0
+        return {"columns": columns, "rows": rows, "total": total, "filter": filt}
 
     # 值标签 (value/tag 类型) 需要从父节点的表中筛选
     tag_table_name = node.tag_table_name

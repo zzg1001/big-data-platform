@@ -61,7 +61,6 @@ import {
   PicCenterOutlined,
   DeploymentUnitOutlined,
   BranchesOutlined,
-  CheckCircleOutlined,
   AppstoreOutlined,
   DownloadOutlined,
   CodeOutlined,
@@ -96,6 +95,9 @@ interface TagTask {
   rule_config?: string
   color?: string
   is_scheduled?: boolean
+  dimension_id?: number
+  tag_table_name?: string
+  is_entity?: boolean  // 合成的"实体任务行"（前端分组用，非真实节点）
 }
 
 export default function TagSystem() {
@@ -127,6 +129,8 @@ export default function TagSystem() {
   }
   const [projects, setProjects] = useState<TagProject[]>([])
   const [currentProject, setCurrentProject] = useState<TagProject | null>(null)
+  // 已打开的项目（多标签页，便于快速切换）
+  const [openProjects, setOpenProjects] = useState<TagProject[]>([])
   const [projectModalVisible, setProjectModalVisible] = useState(false)
   const [editingProject, setEditingProject] = useState<TagProject | null>(null)
   const [projectForm] = Form.useForm()
@@ -181,12 +185,6 @@ export default function TagSystem() {
   // 节点连线相关
   const [connectingFrom, setConnectingFrom] = useState<{ id: number; x: number; y: number; nodeType: string } | null>(null)
   const [connectingTo, setConnectingTo] = useState<{ x: number; y: number } | null>(null)
-
-  // 待保存的连接变更（仅父子关系，全局结构）{ nodeId: { parentId: number | null } }
-  const [pendingConnections, setPendingConnections] = useState<Record<number, { parentId: number | null }>>({})
-  // 待保存的项目成员变更（从池子拖入：把节点+子树加入当前项目，不移动/复制原标签）{ nodeId: projectId }
-  const [pendingMemberships, setPendingMemberships] = useState<Record<number, number>>({})
-  const [savingConnections, setSavingConnections] = useState(false)
 
   // 点击的连线
   const [clickedLine, setClickedLine] = useState<{ childId: number; childName: string; parentName: string; x: number; y: number } | null>(null)
@@ -269,6 +267,7 @@ export default function TagSystem() {
   // 维度定义相关 - 简化为直接输入
   const [dimensionModalVisible, setDimensionModalVisible] = useState(false)
   const [newDimensionName, setNewDimensionName] = useState('')
+  const [newDimensionIdField, setNewDimensionIdField] = useState('')  // 实体ID字段（英文，如 user_id）
   const [dimensionSaving, setDimensionSaving] = useState(false)
 
   // 调度相关
@@ -847,6 +846,33 @@ export default function TagSystem() {
     }
   }
 
+  // 切换到某个已打开的项目标签页（画布改动已自动保存，直接切换）
+  const switchToProject = (project: TagProject) => {
+    if (currentProject?.id === project.id) return
+    setCurrentProject(project)
+    setNodePositions({})
+    loadTagNodes(project.id)
+  }
+
+  // 关闭某个项目标签页
+  const closeProjectTab = (projectId: number) => {
+    const rest = openProjects.filter(p => p.id !== projectId)
+    setOpenProjects(rest)
+    // 关闭的是当前项目：切到相邻标签，没有则回到项目列表
+    if (currentProject?.id === projectId) {
+      if (rest.length > 0) {
+        const next = rest[rest.length - 1]
+        setCurrentProject(next)
+        setNodePositions({})
+        loadTagNodes(next.id)
+      } else {
+        setCurrentProject(null)
+        setAllTags([])
+        setNodePositions({})
+      }
+    }
+  }
+
   const loadTasks = async () => {
     setLoading(true)
     setSelectedTaskKeys([]) // 清除选中状态
@@ -895,12 +921,13 @@ export default function TagSystem() {
 
       // 根据当前视图过滤 - 每个功能只显示自己创建的任务
       if (currentView === 'ai') {
-        // AI打标视图：显示AI生成的任务（类型标签）和对应的值标签
+        // AI打标视图：宽表节点作为任务（任务名=宽表展示名），下挂类型标签、再下值标签；
+        // 兼容旧的单表/粒度 AI 标签（无宽表父）仍作为顶层任务。
         const filtered = allNodes.filter((t) => {
-          // 值标签也显示（它们是AI维度标签的子标签）
-          if (t.node_type === 'value' || t.node_type === 'tag') {
-            return true
-          }
+          // 宽表节点 = 任务
+          if (t.node_type === 'wide_table') return true
+          // 值标签也显示（它们是类型标签的子标签）
+          if (t.node_type === 'value' || t.node_type === 'tag') return true
           if (t.rule_type !== 'sql') return false
           if (t.rule_config) {
             try {
@@ -913,6 +940,7 @@ export default function TagSystem() {
           }
           return false
         })
+        // 类型标签的 parent_id 已是宽表节点 id（迁移/新建时设好），buildTaskTree 会自然嵌套
         setTasks(addScheduleStatus(filtered))
       } else if (currentView === 'sql') {
         // 规则引擎视图：只显示手动创建的规则引擎（不是AI生成的，也不是复合智能标签）
@@ -1171,7 +1199,7 @@ export default function TagSystem() {
 
   // 批量上线
   const handleBatchOnline = () => {
-    const selectedTasks = tasks.filter(t => selectedTaskKeys.includes(t.id))
+    const selectedTasks = tasks.filter(t => selectedTaskKeys.includes(t.id) && !t.is_entity)
     const offlineTasks = selectedTasks.filter(t => !taskScheduleMap[t.id]?.isEnabled)
 
     if (offlineTasks.length === 0) {
@@ -1220,7 +1248,7 @@ export default function TagSystem() {
 
   // 批量删除
   const handleBatchDelete = async () => {
-    const selectedTasks = tasks.filter(t => selectedTaskKeys.includes(t.id))
+    const selectedTasks = tasks.filter(t => selectedTaskKeys.includes(t.id) && !t.is_entity)
 
     // 检查是否有关联调度的任务（无论上线还是下线）
     const tasksWithSchedule = selectedTasks.filter(t => taskScheduleMap[t.id])
@@ -1297,17 +1325,6 @@ export default function TagSystem() {
           try {
             // 真正删除节点（后端会级联删除子节点）
             await tagApi.deleteNode(task.id)
-            // 清理 pendingConnections / pendingMemberships
-            setPendingConnections(prev => {
-              const next = { ...prev }
-              delete next[task.id]
-              return next
-            })
-            setPendingMemberships(prev => {
-              const next = { ...prev }
-              delete next[task.id]
-              return next
-            })
             successCount++
           } catch {
             failCount++
@@ -1346,15 +1363,23 @@ export default function TagSystem() {
           }
 
           // 批量模式：dimensionTags 是完整的 dimension_tags_list
+          // 先建「宽表节点」（展示名=任务名，真实表名），类型标签将作为其列挂在它下面
+          const wtRes = await tagApi.createWideTable(selectedDimension.id, {
+            display_name: values.wide_table_display,
+            table_name: values.wide_table_name,
+            parent_id: values.parent_id || null,
+          })
+          const wideTableId = wtRes.data.id
+
           if (dimensionSql === 'batch' && Array.isArray(dimensionTags) && (dimensionTags as any)[0]?.type_name) {
-            // 批量创建多个类型标签
+            // 批量创建多个类型标签（挂在宽表节点下）
             const tagsList = dimensionTags as any[]
             let totalTags = 0
             for (const typeTag of tagsList) {
               await tagApi.batchCreateDimensionTags({
                 type_name: typeTag.type_name,
                 type_description: typeTag.type_description || '',
-                parent_id: values.parent_id,
+                parent_id: wideTableId,
                 dimension_id: selectedDimension.id,
                 tags: typeTag.tags || [],
                 rule_config: {
@@ -1365,13 +1390,13 @@ export default function TagSystem() {
               })
               totalTags += (typeTag.tags?.length || 0)
             }
-            message.success(`成功创建 ${tagsList.length} 个类型标签 + ${totalTags} 个值标签`)
+            message.success(`宽表「${values.wide_table_display}」已创建：${tagsList.length} 个类型标签 + ${totalTags} 个值标签`)
           } else {
-            // 单个类型标签
+            // 单个类型标签（挂在宽表节点下）
             await tagApi.batchCreateDimensionTags({
               type_name: values.name || dimensionTypeName,
               type_description: values.description || dimensionTypeDesc,
-              parent_id: values.parent_id,
+              parent_id: wideTableId,
               dimension_id: selectedDimension.id,
               tags: dimensionTags,
               rule_config: {
@@ -1380,7 +1405,7 @@ export default function TagSystem() {
                 source: 'ai_dimension',
               },
             })
-            message.success(`成功创建 1 个类型标签 + ${dimensionTags.length} 个值标签`)
+            message.success(`宽表「${values.wide_table_display}」已创建：1 个类型标签 + ${dimensionTags.length} 个值标签`)
           }
           setModalVisible(false)
           // 重置维度相关状态
@@ -1518,6 +1543,72 @@ export default function TagSystem() {
     }
   }
 
+  // 取某宽表节点下的所有类型标签子任务
+  const getWideTableTypeChildren = (wideTable: TagTask) =>
+    tasks.filter(t => t.parent_id === wideTable.id && t.node_type === 'type')
+
+  // 宽表任务：执行该宽表下所有类型标签（都写进该宽表的真实表）
+  const handleExecuteEntity = async (wideTable: TagTask) => {
+    const children = getWideTableTypeChildren(wideTable)
+    if (children.length === 0) {
+      message.warning('该宽表下没有可执行的类型标签')
+      return
+    }
+    setExecuting(wideTable.id)
+    try {
+      for (const child of children) {
+        await tagApi.executeRuleTag(child.id)
+      }
+      message.success(`执行成功！宽表「${wideTable.name}」共 ${children.length} 个标签已生成`)
+      loadTasks()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '执行失败')
+    } finally {
+      setExecuting(null)
+    }
+  }
+
+  // 宽表任务：预览整张宽表
+  const handlePreviewEntity = async (wideTable: TagTask) => {
+    setPreviewLoading(true)
+    setPreviewVisible(true)
+    try {
+      const res = await tagApi.previewTagData(wideTable.id, 100)
+      const { columns = [], rows = [] } = res.data || {}
+      const formattedData = rows.map((row: any[]) => {
+        const obj: Record<string, any> = {}
+        columns.forEach((col: string, index: number) => { obj[col] = row[index] })
+        return obj
+      })
+      setPreviewData(formattedData)
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '加载预览数据失败')
+    } finally {
+      setPreviewLoading(false)
+    }
+  }
+
+  // 宽表任务：删除整张宽表（后端级联删其下类型/值标签）
+  const handleDeleteEntity = (wideTable: TagTask) => {
+    const children = getWideTableTypeChildren(wideTable)
+    Modal.confirm({
+      title: '删除宽表任务',
+      content: `确定删除宽表「${wideTable.name}」及其下 ${children.length} 个类型标签和值标签吗？此操作不可恢复。`,
+      okText: '删除',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await tagApi.deleteNode(wideTable.id)
+          message.success(`已删除宽表「${wideTable.name}」`)
+          loadTasks()
+        } catch (error: any) {
+          message.error(error.response?.data?.detail || '删除失败')
+        }
+      },
+    })
+  }
+
   // 打开调度弹框
   const handleOpenSchedule = (task: TagTask) => {
     setSchedulingTask(task)
@@ -1595,8 +1686,8 @@ export default function TagSystem() {
     setTagShowPreview(false)
     setTagDetailChildren([])
 
-    // 如果是类型标签，加载子标签列表
-    if (tag.node_type === 'type') {
+    // 类型标签加载值标签；宽表加载其下类型标签（结构一致）
+    if (tag.node_type === 'type' || tag.node_type === 'wide_table') {
       try {
         const res = await tagApi.listNodes({ parent_id: tag.id })
         setTagDetailChildren(res.data || [])
@@ -1666,39 +1757,6 @@ export default function TagSystem() {
         color: values.color
           ? (typeof values.color === 'string' ? values.color : values.color.toHexString?.() || null)
           : null,
-      }
-
-      // 先保存待处理的成员变更与连接变更（避免刷新时丢失拖拽的标签）
-      if (Object.keys(pendingMemberships).length > 0) {
-        const memberPromises = Object.entries(pendingMemberships).map(async ([nodeId, projectId]) => {
-          try {
-            await tagApi.addNodeToProject(Number(nodeId), projectId)
-          } catch (err: any) {
-            if (err.response?.status !== 404) {
-              throw err
-            }
-            console.warn(`节点 ${nodeId} 不存在，跳过加入项目`)
-          }
-        })
-        await Promise.all(memberPromises)
-        setPendingMemberships({})
-      }
-      if (Object.keys(pendingConnections).length > 0) {
-        const promises = Object.entries(pendingConnections).map(async ([nodeId, data]) => {
-          try {
-            await tagApi.updateNode(Number(nodeId), {
-              parent_id: data.parentId
-            })
-          } catch (err: any) {
-            // 忽略 404 错误（节点可能已被删除）
-            if (err.response?.status !== 404) {
-              throw err
-            }
-            console.warn(`节点 ${nodeId} 不存在，跳过连接保存`)
-          }
-        })
-        await Promise.all(promises)
-        setPendingConnections({})
       }
 
       if (editingTag) {
@@ -1846,17 +1904,6 @@ export default function TagSystem() {
         try {
           await tagApi.deleteNode(id)
           message.success('删除成功')
-          // 清理 pendingConnections / pendingMemberships 中的对应节点
-          setPendingConnections(prev => {
-            const next = { ...prev }
-            delete next[id]
-            return next
-          })
-          setPendingMemberships(prev => {
-            const next = { ...prev }
-            delete next[id]
-            return next
-          })
           loadTagNodes()
           loadStatistics()
         } catch (error) {
@@ -2052,23 +2099,38 @@ export default function TagSystem() {
         key: 'name',
         width: 200,
         ellipsis: true,
-        render: (name: string, record: TagTask) => (
-          <Space>
-            {record.id === highlightedTagId && (
-              <Tag color="orange" style={{ margin: 0, fontSize: 10, padding: '0 4px' }}>当前</Tag>
-            )}
-            <a
-              style={{ fontWeight: 500, color: record.id === highlightedTagId ? '#fa8c16' : '#1890ff', cursor: 'pointer' }}
-              onClick={(e) => {
-                e.stopPropagation()
-                // 在新标签页打开标签页面，带上标签ID参数
-                window.open(`/tags?tagId=${record.id}&view=manage`, '_blank')
-              }}
-            >
-              {name}
-            </a>
-          </Space>
-        ),
+        render: (name: string, record: TagTask) => {
+          // 宽表任务行：显示宽表展示名 + "宽表"标记 + 真实表名，不跳转
+          if (record.node_type === 'wide_table') {
+            return (
+              <Space>
+                <TagsOutlined style={{ color: '#722ed1' }} />
+                <span style={{ fontWeight: 600 }}>{name}</span>
+                <Tag color="purple" style={{ margin: 0, fontSize: 10, padding: '0 4px' }}>宽表</Tag>
+                {record.tag_table_name && (
+                  <span style={{ color: '#999', fontSize: 11 }}>{record.tag_table_name}</span>
+                )}
+              </Space>
+            )
+          }
+          return (
+            <Space>
+              {record.id === highlightedTagId && (
+                <Tag color="orange" style={{ margin: 0, fontSize: 10, padding: '0 4px' }}>当前</Tag>
+              )}
+              <a
+                style={{ fontWeight: 500, color: record.id === highlightedTagId ? '#fa8c16' : '#1890ff', cursor: 'pointer' }}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  // 在新标签页打开标签页面，带上标签ID参数
+                  window.open(`/tags?tagId=${record.id}&view=manage`, '_blank')
+                }}
+              >
+                {name}
+              </a>
+            </Space>
+          )
+        },
       },
       {
         title: '类型',
@@ -2076,6 +2138,10 @@ export default function TagSystem() {
         key: 'rule_type',
         width: 80,
         render: (type: string, record: TagTask) => {
+          // 宽表行
+          if (record.node_type === 'wide_table') {
+            return <Tag color="purple" style={{ margin: 0 }}>宽表</Tag>
+          }
           // 值标签显示"值标签"
           if (record.node_type === 'value' || record.node_type === 'tag') {
             return <Tag color="green" style={{ margin: 0 }}>值标签</Tag>
@@ -2105,6 +2171,7 @@ export default function TagSystem() {
         key: 'usage_count',
         width: 70,
         align: 'center' as const,
+        render: (count: number, record: TagTask) => record.node_type === 'wide_table' ? '-' : count,
       },
       {
         title: '创建时间',
@@ -2119,8 +2186,8 @@ export default function TagSystem() {
         key: 'status',
         width: 80,
         align: 'center' as const,
-        render: (isScheduled: boolean) => (
-          isScheduled ? (
+        render: (isScheduled: boolean, record: TagTask) => (
+          record.node_type === 'wide_table' ? '-' : isScheduled ? (
             <Tag color="success" style={{ margin: 0 }}>已上线</Tag>
           ) : (
             <Tag color="default" style={{ margin: 0 }}>未上线</Tag>
@@ -2133,6 +2200,42 @@ export default function TagSystem() {
         width: 160,
         fixed: 'right' as const,
         render: (_: any, record: TagTask) => {
+          // 宽表行：执行=跑全部类型标签进真实表；预览=看宽表；删除=删整张宽表（无调度）
+          if (record.node_type === 'wide_table') {
+            return (
+              <Space size={4}>
+                <Tooltip title="执行（生成该实体所有标签到画像宽表）">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    loading={executing === record.id}
+                    onClick={() => handleExecuteEntity(record)}
+                    style={{ padding: '0 4px' }}
+                  />
+                </Tooltip>
+                <Tooltip title="预览画像宽表">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<EyeOutlined />}
+                    onClick={() => handlePreviewEntity(record)}
+                    style={{ padding: '0 4px' }}
+                  />
+                </Tooltip>
+                <Tooltip title="删除该实体的标签任务">
+                  <Button
+                    type="link"
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={() => handleDeleteEntity(record)}
+                    style={{ padding: '0 4px' }}
+                  />
+                </Tooltip>
+              </Space>
+            )
+          }
           // 值标签禁用执行和调度按钮（只有没有独立SQL规则的值标签才禁用）
           // node_type === 'value' 是AI打标生成的子标签，没有独立SQL
           // node_type === 'tag' 且 rule_type === 'sql' 是规则引擎创建的，有独立SQL，可以执行
@@ -2491,7 +2594,10 @@ export default function TagSystem() {
     }
 
     const handleEnterProject = (project: TagProject) => {
+      // 加入已打开列表（多标签页），便于快速切换
+      setOpenProjects(prev => prev.find(p => p.id === project.id) ? prev : [...prev, project])
       setCurrentProject(project)
+      setNodePositions({})
       loadTagNodes(project.id)
     }
 
@@ -2717,6 +2823,16 @@ export default function TagSystem() {
   const renderTagList = () => {
     // 按维度分组标签
     const dimensionGroups: { [key: number]: { dimension: Dimension; typeTags: any[]; valueTags: any[] } } = {}
+    const ensureDimGroup = (dimId: number) => {
+      if (!dimensionGroups[dimId]) {
+        const dim = dimensions.find(d => d.id === dimId)
+        dimensionGroups[dimId] = {
+          dimension: dim || { id: dimId, name: `dim_${dimId}`, display_name: `维度#${dimId}`, id_field: 'unknown', is_preset: false } as any,
+          typeTags: [], valueTags: [],
+        }
+      }
+      return dimensionGroups[dimId]
+    }
     const detailTags: any[] = []
     const templateTags: any[] = []
     const unassignedTypeTags: any[] = []
@@ -2744,33 +2860,17 @@ export default function TagSystem() {
         detailTags.push(tag)
       } else if (tag.node_type === 'template') {
         templateTags.push(tag)
-      } else if (tag.node_type === 'type') {
+      } else if (tag.node_type === 'type' || tag.node_type === 'wide_table') {
+        // 宽表标签归入「类型标签」一起显示（无单独的宽表概念）
         if (tag.dimension_id) {
-          if (!dimensionGroups[tag.dimension_id]) {
-            const dim = dimensions.find(d => d.id === tag.dimension_id)
-            // 即使找不到维度对象，也创建一个占位
-            dimensionGroups[tag.dimension_id] = {
-              dimension: dim || { id: tag.dimension_id, name: `dim_${tag.dimension_id}`, display_name: `维度#${tag.dimension_id}`, id_field: 'unknown', is_preset: false },
-              typeTags: [],
-              valueTags: []
-            }
-          }
-          dimensionGroups[tag.dimension_id].typeTags.push(tag)
+          ensureDimGroup(tag.dimension_id).typeTags.push(tag)
         } else {
           unassignedTypeTags.push(tag)
         }
       } else if (tag.node_type === 'tag' || tag.node_type === 'value') {
         // 值标签直接使用自己的 dimension_id
         if (tag.dimension_id) {
-          if (!dimensionGroups[tag.dimension_id]) {
-            const dim = dimensions.find(d => d.id === tag.dimension_id)
-            dimensionGroups[tag.dimension_id] = {
-              dimension: dim || { id: tag.dimension_id, name: `dim_${tag.dimension_id}`, display_name: `维度#${tag.dimension_id}`, id_field: 'unknown', is_preset: false },
-              typeTags: [],
-              valueTags: []
-            }
-          }
-          dimensionGroups[tag.dimension_id].valueTags.push(tag)
+          ensureDimGroup(tag.dimension_id).valueTags.push(tag)
         } else {
           unassignedValueTags.push(tag)
         }
@@ -2848,7 +2948,7 @@ export default function TagSystem() {
                   <span style={{ fontSize: 11, color: '#999', fontWeight: 400 }}>({group.dimension.id_field})</span>
                 </div>
 
-                {/* 类型标签 */}
+                {/* 类型标签（含宽表标签） */}
                 {group.typeTags.length > 0 && (
                   <div style={{ marginLeft: 16, marginBottom: 8 }}>
                     <div style={{ fontSize: 12, color: '#722ed1', marginBottom: 6 }}>
@@ -3173,13 +3273,7 @@ export default function TagSystem() {
         return
       }
 
-      // 检查层级规则：分类下可放类型或标签，类型下可放类型或标签，标签不能有子节点
-      if (connectingFrom.nodeType === 'category' && targetNodeType === 'category') {
-        message.warning('分类下不能放分类')
-        setConnectingFrom(null)
-        setConnectingTo(null)
-        return
-      }
+      // 检查层级规则：分类下可放分类/类型/标签，类型下可放类型或标签，标签不能有子节点
       if (connectingFrom.nodeType === 'type' && targetNodeType !== 'type' && targetNodeType !== 'tag') {
         message.warning('类型下只能连接类型或标签')
         setConnectingFrom(null)
@@ -3211,38 +3305,35 @@ export default function TagSystem() {
         }
       }
 
-      // 添加到待保存变更（仅改父子关系，全局结构）
-      setPendingConnections(prev => ({
-        ...prev,
-        [targetNodeId]: { parentId: connectingFrom.id }
-      }))
-
-      // 更新本地 allTags 以显示连接
+      // 自动保存：立即把"本项目内父子关系"落库
+      const projectId = currentProject.id
+      const fromId = connectingFrom.id
       setAllTags(prev => prev.map(t =>
-        t.id === targetNodeId ? { ...t, parent_id: connectingFrom.id } : t
+        t.id === targetNodeId ? { ...t, parent_id: fromId } : t
       ))
-
-      message.info('连接已添加，点击保存按钮提交')
       setConnectingFrom(null)
       setConnectingTo(null)
+      tagApi.setNodeProjectParent(targetNodeId, projectId, fromId)
+        .then(() => message.success('已连接'))
+        .catch((err: any) => {
+          message.error(err.response?.data?.detail || '连接失败')
+          loadTagNodes(projectId)
+        })
     }
 
-    // 删除连接
+    // 删除连接（断开与父节点的关系）—— 自动保存
     const handleDeleteConnection = (nodeId: number) => {
       if (!currentProject) return
-
-      // 添加到待保存变更（设置 parentId 为 null）
-      setPendingConnections(prev => ({
-        ...prev,
-        [nodeId]: { parentId: null }
-      }))
-
-      // 更新本地 allTags
+      const projectId = currentProject.id
       setAllTags(prev => prev.map(t =>
         t.id === nodeId ? { ...t, parent_id: null } : t
       ))
-
-      message.info('连接已删除，点击保存按钮提交')
+      tagApi.setNodeProjectParent(nodeId, projectId, null)
+        .then(() => message.success('已断开连接'))
+        .catch((err: any) => {
+          message.error(err.response?.data?.detail || '断开失败')
+          loadTagNodes(projectId)
+        })
     }
 
     // 从画布删除/移除标签
@@ -3302,17 +3393,6 @@ export default function TagSystem() {
                 allIds.forEach(id => delete updated[id])
                 return updated
               })
-              setPendingConnections(prev => {
-                const updated = { ...prev }
-                allIds.forEach(id => delete updated[id])
-                return updated
-              })
-              setPendingMemberships(prev => {
-                const updated = { ...prev }
-                allIds.forEach(id => delete updated[id])
-                return updated
-              })
-
               message.success(`已从画布移除 ${allIds.length} 个标签`)
               // 刷新侧边栏与当前项目画布
               loadTagNodes(currentProject?.id)
@@ -3358,12 +3438,6 @@ export default function TagSystem() {
                 allIdsToDelete.forEach(id => delete updated[id])
                 return updated
               })
-              setPendingConnections(prev => {
-                const updated = { ...prev }
-                allIdsToDelete.forEach(id => delete updated[id])
-                return updated
-              })
-
               message.success(`已删除 ${allIdsToDelete.length} 个标签`)
               // 刷新侧边栏
               loadTagNodes()
@@ -3373,36 +3447,6 @@ export default function TagSystem() {
             }
           }
         })
-      }
-    }
-
-    // 保存所有待保存的连接变更
-    const handleSaveConnections = async () => {
-      if (Object.keys(pendingConnections).length === 0 && Object.keys(pendingMemberships).length === 0) {
-        message.info('没有待保存的变更')
-        return
-      }
-
-      setSavingConnections(true)
-      try {
-        // 1. 池子拖入：把节点（含子树）加入当前项目（成员关系，不移动原标签）
-        const membershipPromises = Object.entries(pendingMemberships).map(([nodeId, projectId]) =>
-          tagApi.addNodeToProject(Number(nodeId), projectId)
-        )
-        // 2. 同项目内连线/断开：仅更新父子关系（全局结构），不改 project_id
-        const connectionPromises = Object.entries(pendingConnections).map(([nodeId, data]) =>
-          tagApi.updateNode(Number(nodeId), { parent_id: data.parentId })
-        )
-        await Promise.all([...membershipPromises, ...connectionPromises])
-
-        setPendingConnections({})
-        setPendingMemberships({})
-        message.success('保存成功')
-        loadTagNodes(currentProject?.id)
-      } catch (error: any) {
-        message.error(error.response?.data?.detail || '保存失败')
-      } finally {
-        setSavingConnections(false)
       }
     }
 
@@ -3424,7 +3468,7 @@ export default function TagSystem() {
         level: number
       }> = []
 
-      // 使用 allTags 构建树形结构 - 显示所有没有父节点的节点
+      // 使用 allTags 构建树形结构 - 显示所有没有父节点的节点（含值标签，画布需要展开展示）
       const buildTree = () => {
         const rootNodes = allTags.filter(t => !t.parent_id)
         return rootNodes
@@ -3672,38 +3716,54 @@ export default function TagSystem() {
           gap: 16,
           flexShrink: 0,
         }}>
-          <Button type="text" icon={<LeftOutlined />} onClick={() => {
-            setCurrentProject(null)
-            setAllTags([])
-            setNodePositions({})
-          }}>
-            返回项目
-          </Button>
+          <Tooltip title="项目列表（打开更多项目）">
+            <Button type="text" icon={<AppstoreOutlined />} onClick={() => {
+              setCurrentProject(null)
+            }}>
+              项目列表
+            </Button>
+          </Tooltip>
           <div style={{
             width: 1,
             height: 20,
             background: '#e8e8e8'
           }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{
-              width: 32,
-              height: 32,
-              borderRadius: 8,
-              background: currentProject.color || 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: '#fff',
-              fontSize: 16,
-            }}>
-              <BranchesOutlined />
-            </div>
-            <div>
-              <div style={{ fontWeight: 600, fontSize: 16 }}>{currentProject.name} - 导图页面</div>
-              <div style={{ fontSize: 12, color: '#999' }}>可视化管理标签层级结构</div>
-            </div>
+          {/* 已打开项目的多标签页，便于快速切换 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, overflowX: 'auto', flex: 1, paddingRight: 8 }}>
+            {openProjects.map(p => {
+              const active = p.id === currentProject.id
+              return (
+                <div
+                  key={p.id}
+                  onClick={() => switchToProject(p)}
+                  title={p.name}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '5px 10px',
+                    borderRadius: 8,
+                    cursor: 'pointer',
+                    flexShrink: 0,
+                    maxWidth: 200,
+                    background: active ? (currentProject.color || '#1890ff') : '#f0f1f3',
+                    color: active ? '#fff' : '#555',
+                    fontWeight: active ? 600 : 400,
+                    fontSize: 13,
+                    border: active ? 'none' : '1px solid #e8e8e8',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  <BranchesOutlined style={{ fontSize: 13 }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+                  <CloseOutlined
+                    style={{ fontSize: 10, opacity: 0.65, marginLeft: 2 }}
+                    onClick={(e) => { e.stopPropagation(); closeProjectTab(p.id) }}
+                  />
+                </div>
+              )
+            })}
           </div>
-          <div style={{ flex: 1 }} />
 
           {Object.keys(nodePositions).length > 0 && (
             <Tooltip title="恢复默认布局">
@@ -3713,16 +3773,6 @@ export default function TagSystem() {
             </Tooltip>
           )}
           <Button icon={<ReloadOutlined />} onClick={() => loadTagNodes()}>刷新</Button>
-          {(Object.keys(pendingConnections).length > 0 || Object.keys(pendingMemberships).length > 0) && (
-            <Button
-              type="primary"
-              icon={<CheckCircleOutlined />}
-              loading={savingConnections}
-              onClick={handleSaveConnections}
-            >
-              保存 ({Object.keys(pendingConnections).length + Object.keys(pendingMemberships).length})
-            </Button>
-          )}
         </div>
 
         {/* 主内容区域：左侧导航 + 右侧画布 */}
@@ -3741,7 +3791,7 @@ export default function TagSystem() {
               <div style={{ fontSize: 11, color: '#999' }}>拖拽到画布建立关联</div>
             </div>
             <div style={{ flex: 1, overflow: 'auto', padding: '8px' }}>
-              {/* 类型标签组 */}
+              {/* 类型标签组（含宽表标签） */}
               <div style={{
                 marginBottom: 12,
                 background: '#e6f7ff',
@@ -3777,7 +3827,7 @@ export default function TagSystem() {
                     trigger="click"
                     placement="rightTop"
                     content={(() => {
-                      const typeTags = sidebarTags.filter(t => t.node_type === 'type')
+                      const typeTags = sidebarTags.filter(t => t.node_type === 'type' || t.node_type === 'wide_table')
                       const groupedByDim: Record<number, { dim: any; tags: any[] }> = {}
                       const ungrouped: any[] = []
 
@@ -3905,12 +3955,12 @@ export default function TagSystem() {
                     borderRadius: 10,
                     fontSize: 11,
                   }}>
-                    {sidebarTags.filter(t => t.node_type === 'type').length}
+                    {sidebarTags.filter(t => t.node_type === 'type' || t.node_type === 'wide_table').length}
                   </span>
                 </div>
                 {!typeGroupCollapsed && (() => {
                   // 按维度分组类型标签
-                  const typeTags = sidebarTags.filter(t => t.node_type === 'type')
+                  const typeTags = sidebarTags.filter(t => t.node_type === 'type' || t.node_type === 'wide_table')
                   const groupedByDim: Record<number, { dim: any; tags: any[] }> = {}
                   const ungrouped: any[] = []
 
@@ -4044,8 +4094,9 @@ export default function TagSystem() {
                 })()}
               </div>
 
-              {/* 值标签组 */}
+              {/* 值标签组（项目画布不展示值标签：值标签跟随类型标签、不可单独修改） */}
               <div style={{
+                display: 'none',
                 background: '#f6ffed',
                 borderRadius: 8,
                 border: '1px solid #b7eb8f',
@@ -4608,8 +4659,9 @@ export default function TagSystem() {
               const draggedTag = sidebarTags.find(t => t.id === numTagId)
               if (!draggedTag) return
 
-              // 如果是类型标签、模版标签或模版收藏（category），展开子标签
-              const shouldExpandChildren = draggedTag.node_type === 'type' ||
+              // 如果是宽表/类型/模版/分类，拖入时展开其子标签
+              const shouldExpandChildren = draggedTag.node_type === 'wide_table' ||
+                draggedTag.node_type === 'type' ||
                 draggedTag.node_type === 'template' ||
                 tagType === 'template-favorite' ||
                 draggedTag.node_type === 'category'
@@ -4626,10 +4678,9 @@ export default function TagSystem() {
                 const childTags = getAllChildren(numTagId)
 
                 // 添加类型/模版标签（记录成员关系：节点+子树加入当前项目）
-                setPendingMemberships(prev => ({
-                  ...prev,
-                  [numTagId]: currentProject.id
-                }))
+                tagApi.addNodeToProject(numTagId, currentProject.id, null)
+                  .then(() => message.success('已添加到画布'))
+                  .catch((err: any) => { message.error(err.response?.data?.detail || '添加失败'); loadTagNodes(currentProject?.id) })
                 setAllTags(prev => {
                   const exists = prev.some(t => t.id === numTagId)
                   if (exists) {
@@ -4678,10 +4729,9 @@ export default function TagSystem() {
                 message.info(`已添加${tagTypeLabel}及 ${childTags.length} 个子标签`)
               } else {
                 // 普通标签，单独添加（记录成员关系：加入当前项目）
-                setPendingMemberships(prev => ({
-                  ...prev,
-                  [numTagId]: currentProject.id
-                }))
+                tagApi.addNodeToProject(numTagId, currentProject.id, null)
+                  .then(() => message.success('已添加到画布'))
+                  .catch((err: any) => { message.error(err.response?.data?.detail || '添加失败'); loadTagNodes(currentProject?.id) })
                 setAllTags(prev => {
                   const exists = prev.some(t => t.id === numTagId)
                   if (exists) {
@@ -4850,8 +4900,8 @@ export default function TagSystem() {
                         if (!hasDragged) {
                           const tag = allTags.find(t => t.id === node.id)
                           if (tag) {
-                            // 与标签页面点击逻辑一致
-                            if (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag') {
+                            // 与标签页面点击逻辑一致；宽表与类型标签一样打开详情
+                            if (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag' || tag.node_type === 'wide_table' || tag.node_type === 'type') {
                               handleViewTagDetail(tag)
                             } else {
                               handleEditTag(tag)
@@ -4885,11 +4935,7 @@ export default function TagSystem() {
                         const sourceTag = sidebarTags.find(t => t.id === Number(tagId))
                         if (!sourceTag || sourceTag.id === node.id) return
 
-                        // 检查层级规则：分类下可放类型或标签，类型下可放类型或标签
-                        if (node.node_type === 'category' && sourceTag.node_type === 'category') {
-                          message.warning('分类下不能放置分类')
-                          return
-                        }
+                        // 检查层级规则：分类下可放分类/类型/标签，类型下可放类型或标签
                         if (node.node_type === 'type' && sourceTag.node_type === 'category') {
                           message.warning('类型下不能放置分类')
                           return
@@ -4907,17 +4953,11 @@ export default function TagSystem() {
                           return
                         }
 
-                        // 添加到待保存变更：
-                        // 1) 成员关系——把拖入的标签（含子树）加入当前项目（不移动/复制原标签）
-                        setPendingMemberships(prev => ({
-                          ...prev,
-                          [sourceTag.id]: currentProject.id
-                        }))
-                        // 2) 父子关系——连接到目标节点（全局结构）
-                        setPendingConnections(prev => ({
-                          ...prev,
-                          [sourceTag.id]: { parentId: node.id }
-                        }))
+                        // 自动保存：把拖入的标签（含子树）加入当前项目，
+                        // 并把目标节点作为它在本项目中的挂载父节点（每个项目独立位置）
+                        tagApi.addNodeToProject(sourceTag.id, currentProject.id, node.id)
+                          .then(() => message.success(`已将"${sourceTag.name}"连接到"${node.name}"`))
+                          .catch((err: any) => { message.error(err.response?.data?.detail || '添加失败'); loadTagNodes(currentProject?.id) })
 
                         // 更新本地数据以显示连接
                         setAllTags(prev => prev.map(t =>
@@ -4926,8 +4966,6 @@ export default function TagSystem() {
                         setSidebarTags(prev => prev.map(t =>
                           t.id === sourceTag.id ? { ...t, parent_id: node.id } : t
                         ))
-
-                        message.info(`已将"${sourceTag.name}"连接到"${node.name}"，点击保存按钮提交`)
                       }}
                       onMouseUp={() => {
                         // 完成从其他节点拖出的连线
@@ -4950,16 +4988,15 @@ export default function TagSystem() {
                             setDraggingLineEnd(null)
                             return
                           }
-                          // 更新连接：将子节点的父节点改为当前节点（仅改父子关系）
-                          setPendingConnections(prev => ({
-                            ...prev,
-                            [draggingLine.childId]: { parentId: node.id }
-                          }))
-                          // 更新本地数据
+                          // 自动保存：将子节点在本项目的父节点改为当前节点
+                          const childId = draggingLine.childId
+                          const childName = draggingLine.childName
                           setAllTags(prev => prev.map(t =>
-                            t.id === draggingLine.childId ? { ...t, parent_id: node.id } : t
+                            t.id === childId ? { ...t, parent_id: node.id } : t
                           ))
-                          message.info(`已将 "${draggingLine.childName}" 连接到 "${node.name}"，点击保存按钮提交`)
+                          tagApi.setNodeProjectParent(childId, currentProject.id, node.id)
+                            .then(() => message.success(`已将 "${childName}" 连接到 "${node.name}"`))
+                            .catch((err: any) => { message.error(err.response?.data?.detail || '连接失败'); loadTagNodes(currentProject?.id) })
                           setDraggingLine(null)
                           setDraggingLineEnd(null)
                         }
@@ -5682,16 +5719,20 @@ export default function TagSystem() {
     // 保存新维度
     const handleSaveDimension = async () => {
       if (!newDimensionName.trim()) return
+      const idField = newDimensionIdField.trim()
+      if (!idField) { message.warning('请输入ID字段（英文，如 user_id）'); return }
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(idField)) { message.warning('ID字段需以字母开头，仅字母/数字/下划线'); return }
       setDimensionSaving(true)
       try {
         await tagApi.createDimension({
-          name: newDimensionName.trim().replace(/维度$/, ''),
+          name: newDimensionName.trim().replace(/(维度|实体)$/, ''),
           display_name: newDimensionName.trim(),
-          id_field: newDimensionName.trim().replace(/维度$/, '') + '_id',
+          id_field: idField,  // 规范英文，如 user_id
         })
         message.success('已创建')
         setDimensionModalVisible(false)
         setNewDimensionName('')
+        setNewDimensionIdField('')
         // 刷新列表
         const dimsRes = await tagApi.listDimensions()
         setDimensions(dimsRes.data || [])
@@ -5842,28 +5883,36 @@ export default function TagSystem() {
                   }}>
                     <PlusOutlined style={{ fontSize: 20, color: '#999' }} />
                   </div>
-                  <Text type="secondary" style={{ fontSize: 13 }}>新建维度</Text>
+                  <Text type="secondary" style={{ fontSize: 13 }}>新建实体</Text>
                 </div>
               </Card>
             </div>
 
-            {/* 新建维度弹窗 */}
+            {/* 新建实体弹窗 */}
             <Modal
-              title="新建维度"
+              title="新建实体"
               open={dimensionModalVisible}
-              onCancel={() => { setDimensionModalVisible(false); setNewDimensionName('') }}
+              onCancel={() => { setDimensionModalVisible(false); setNewDimensionName(''); setNewDimensionIdField('') }}
               onOk={handleSaveDimension}
               okText="创建"
               cancelText="取消"
               confirmLoading={dimensionSaving}
-              okButtonProps={{ disabled: !newDimensionName.trim() }}
+              okButtonProps={{ disabled: !newDimensionName.trim() || !newDimensionIdField.trim() }}
             >
+              <div style={{ marginBottom: 6, fontSize: 12, color: '#999' }}>实体名称</div>
               <Input
-                placeholder="输入维度名称，如：用户维度"
+                placeholder="输入实体名称，如：用户实体"
                 value={newDimensionName}
                 onChange={e => setNewDimensionName(e.target.value)}
-                onPressEnter={handleSaveDimension}
                 autoFocus
+                style={{ marginBottom: 12 }}
+              />
+              <div style={{ marginBottom: 6, fontSize: 12, color: '#999' }}>ID字段（英文，宽表第一列）</div>
+              <Input
+                placeholder="如：user_id"
+                value={newDimensionIdField}
+                onChange={e => setNewDimensionIdField(e.target.value)}
+                onPressEnter={handleSaveDimension}
               />
             </Modal>
           </div>
@@ -5878,11 +5927,32 @@ export default function TagSystem() {
             <Alert
               type="success"
               message={isBatchMode
-                ? `批量创建 ${(dimensionTags as any[]).length} 个类型标签 - 维度：${selectedDimension.display_name}`
-                : `维度：${selectedDimension.display_name} (${selectedDimension.id_field})`
+                ? `批量创建 ${(dimensionTags as any[]).length} 个类型标签 - 实体：${selectedDimension.display_name}`
+                : `实体：${selectedDimension.display_name} (${selectedDimension.id_field})`
               }
               style={{ marginBottom: 16 }}
             />
+
+            {/* 宽表：展示名（=任务名）+ 真实表名。所有类型标签将作为该宽表的列 */}
+            <Form.Item
+              name="wide_table_display"
+              label="宽表展示名（任务名）"
+              rules={[{ required: true, message: '请输入宽表展示名' }]}
+              initialValue="基础信息"
+            >
+              <Input placeholder="如：基础信息" />
+            </Form.Item>
+            <Form.Item
+              name="wide_table_name"
+              label="宽表真实表名（英文）"
+              rules={[
+                { required: true, message: '请输入真实表名' },
+                { pattern: /^[A-Za-z][A-Za-z0-9_]*$/, message: '以字母开头，仅字母/数字/下划线' },
+              ]}
+              initialValue={`tag_${(selectedDimension.id_field || '').replace(/_id$/, '') || 'entity'}_basic_info`}
+            >
+              <Input placeholder="如：tag_user_basic_info" />
+            </Form.Item>
 
             {/* 批量模式下隐藏名称和描述输入 */}
             {!isBatchMode && (
@@ -5925,7 +5995,7 @@ export default function TagSystem() {
               <div style={{ marginTop: 12 }}>
                 <div style={{ marginBottom: 8 }}>
                   <Tag color="orange">{selectedDimension.display_name}</Tag>
-                  <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>(维度)</Text>
+                  <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>(实体)</Text>
                 </div>
                 <div style={{ paddingLeft: 20, borderLeft: '2px solid #fa8c16' }}>
                   {/* 批量模式：显示多个类型标签 */}
@@ -6030,7 +6100,7 @@ export default function TagSystem() {
         <div style={{ height: 450, display: 'flex', flexDirection: 'column' }}>
           <Alert
             type="info"
-            message={`当前维度：${selectedDimension.display_name} (ID字段: ${selectedDimension.id_field})`}
+            message={`当前实体：${selectedDimension.display_name} (ID字段: ${selectedDimension.id_field})`}
             action={
               <Button size="small" onClick={() => {
                 setSelectedDimension(null)
@@ -6038,7 +6108,7 @@ export default function TagSystem() {
                 setDimensionMessages([])
                 setTagSuggestions([])
               }}>
-                更换维度
+                更换实体
               </Button>
             }
             style={{ marginBottom: 16 }}
@@ -6425,7 +6495,7 @@ export default function TagSystem() {
               label: (
                 <span>
                   <TagsOutlined />
-                  智能-值标签
+                  智能-实体标签
                 </span>
               ),
               children: renderDimensionContent(),
@@ -7544,7 +7614,7 @@ export default function TagSystem() {
               background: tagDetailData.color || '#52c41a'
             }} />
             <span>{tagDetailData.name}</span>
-            <Tag color="blue" style={{ marginLeft: 8 }}>{tagDetailData.rule_type || '标签'}</Tag>
+            <Tag color="blue" style={{ marginLeft: 8 }}>{tagDetailData.node_type === 'wide_table' ? '宽表' : (tagDetailData.rule_type || '标签')}</Tag>
           </div>
         }
         open={tagDetailVisible}
@@ -7596,7 +7666,9 @@ export default function TagSystem() {
             <div>
               <Text type="secondary">标签类型：</Text>
               <Text>
-                {tagDetailData.node_type === 'value' || tagDetailData.node_type === 'tag'
+                {tagDetailData.node_type === 'wide_table'
+                  ? '宽表'
+                  : tagDetailData.node_type === 'value' || tagDetailData.node_type === 'tag'
                   ? '值标签'
                   : tagDetailData.rule_type === 'sql' ? '规则引擎' : tagDetailData.rule_type === 'row' ? '行级标签' : '手动标签'}
               </Text>
@@ -7648,11 +7720,11 @@ export default function TagSystem() {
           </div>
         </div>
 
-        {/* 子标签列表 - 仅类型标签显示 */}
-        {tagDetailData.node_type === 'type' && tagDetailChildren.length > 0 && (
+        {/* 子标签列表 - 类型标签显示值标签；宽表显示其下类型标签 */}
+        {(tagDetailData.node_type === 'type' || tagDetailData.node_type === 'wide_table') && tagDetailChildren.length > 0 && (
           <div style={{ marginBottom: 20 }}>
             <div style={{ fontWeight: 600, marginBottom: 12, fontSize: 14 }}>
-              值标签 <span style={{ color: '#999', fontWeight: 400, fontSize: 12 }}>({tagDetailChildren.length}个)</span>
+              {tagDetailData.node_type === 'wide_table' ? '类型标签' : '值标签'} <span style={{ color: '#999', fontWeight: 400, fontSize: 12 }}>({tagDetailChildren.length}个)</span>
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, background: '#fafafa', padding: 16, borderRadius: 8 }}>
               {tagDetailChildren.map((child: any) => (

@@ -372,6 +372,14 @@ export const tagApi = {
     api.post('/api/v1/tags/dimensions', data),
   getDimension: (id: number) => api.get(`/api/v1/tags/dimensions/${id}`),
   deleteDimension: (id: number) => api.delete(`/api/v1/tags/dimensions/${id}`),
+  // 预览实体画像宽表（一个实体一张表）
+  previewDimensionData: (dimId: number, limit = 100) =>
+    api.get(`/api/v1/tags/dimensions/${dimId}/preview`, { params: { limit } }),
+  // 宽表节点：在实体下新建宽表（展示名+真实表名），返回节点。一个实体可多张宽表
+  createWideTable: (dimId: number, data: { display_name: string; table_name: string; parent_id?: number | null }) =>
+    api.post(`/api/v1/tags/dimensions/${dimId}/wide-tables`, data),
+  listWideTables: (dimId: number) =>
+    api.get(`/api/v1/tags/dimensions/${dimId}/wide-tables`),
 
   // 批量创建维度标签
   batchCreateDimensionTags: (data: {
@@ -399,10 +407,14 @@ export const tagApi = {
   deleteNode: (id: number) =>
     api.delete(`/api/v1/tags/nodes/${id}`),
   // 将节点（含子树）加入/移出某个项目（多对多共享，不移动/复制原标签）
-  addNodeToProject: (nodeId: number, projectId: number) =>
-    api.post(`/api/v1/tags/nodes/${nodeId}/projects/${projectId}`),
+  // parentId: 根节点在该项目中的挂载父节点（拖到分类上=该分类；拖到空白=null）
+  addNodeToProject: (nodeId: number, projectId: number, parentId: number | null = null) =>
+    api.post(`/api/v1/tags/nodes/${nodeId}/projects/${projectId}`, { parent_id: parentId }),
   removeNodeFromProject: (nodeId: number, projectId: number) =>
     api.delete(`/api/v1/tags/nodes/${nodeId}/projects/${projectId}`),
+  // 设置节点在某项目中的挂载父节点（每个项目独立位置；画布内连线/断开用）
+  setNodeProjectParent: (nodeId: number, projectId: number, parentId: number | null) =>
+    api.put(`/api/v1/tags/nodes/${nodeId}/projects/${projectId}/parent`, { parent_id: parentId }),
 
   // 标签数据
   listData: (params?: { tag_node_id?: number; datasource_id?: number; table_name?: string }) =>

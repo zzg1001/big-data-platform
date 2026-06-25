@@ -20,6 +20,7 @@ class TagDimension(Base):
     display_name = Column(String(100), nullable=False)  # 显示名: 用户维度
     id_field = Column(String(100), nullable=False)  # ID字段: user_id
     description = Column(String(500))
+    tag_table_name = Column(String(255))  # 该实体的画像宽表名（一个实体一张表，所有类型标签为列）
     is_preset = Column(Boolean, default=False)  # 是否预设
     is_active = Column(Boolean, default=True)
     created_by = Column(BigInteger, ForeignKey("big_users.id"))
@@ -154,6 +155,10 @@ class TagNodeProject(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     node_id = Column(BigInteger, ForeignKey("big_tag_nodes.id", ondelete="CASCADE"), nullable=False)
     project_id = Column(BigInteger, ForeignKey("big_tag_projects.id", ondelete="CASCADE"), nullable=False)
+    # 该节点在本项目中的父节点（每个项目独立的挂载位置）。NULL 表示在本项目中是根节点。
+    # 与 TagNode.parent_id（规范/池子默认结构）区分开。
+    parent_id = Column(BigInteger, ForeignKey("big_tag_nodes.id", ondelete="SET NULL"), nullable=True)
+    sort_order = Column(BigInteger, default=0)  # 本项目内排序
     created_by = Column(BigInteger, ForeignKey("big_users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 

@@ -30,6 +30,7 @@ import {
   SettingOutlined,
   PlayCircleOutlined,
   ThunderboltOutlined,
+  AlignLeftOutlined,
   CodeOutlined,
   PicLeftOutlined,
   PicCenterOutlined,
@@ -44,6 +45,7 @@ import {
 } from '@ant-design/icons'
 import Editor, { Monaco } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
+import { format as formatSql } from 'sql-formatter'
 import { configApi, warehouseApi, aiApi, etlApi, dwLayerApi, taskDependencyApi, sqlScriptApi } from '../services/api'
 
 const { Title, Text } = Typography
@@ -757,6 +759,20 @@ export default function DataExplorer() {
     setExecuting(false)
   }
 
+  // 格式化当前编辑器里的 SQL
+  const handleFormatSql = () => {
+    if (!sql.trim()) {
+      message.warning('请输入SQL')
+      return
+    }
+    try {
+      const formatted = formatSql(sql, { language: 'mysql', keywordCase: 'upper' })
+      setSql(formatted)
+    } catch (error: any) {
+      message.error('格式化失败：' + (error?.message || 'SQL 语法可能有误'))
+    }
+  }
+
   const handleOptimize = async () => {
     if (!sql.trim()) {
       message.warning('请输入SQL')
@@ -1107,6 +1123,17 @@ export default function DataExplorer() {
     // 添加快捷键：Ctrl+S 保存到服务器
     editorInstance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       saveCurrentTab()
+    })
+
+    // 添加快捷键：Shift+Alt+F 格式化SQL（直接读写编辑器，避免闭包陈旧）
+    editorInstance.addCommand(monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF, () => {
+      const val = editorInstance.getValue()
+      if (!val.trim()) return
+      try {
+        editorInstance.setValue(formatSql(val, { language: 'mysql', keywordCase: 'upper' }))
+      } catch {
+        message.error('格式化失败：SQL 语法可能有误')
+      }
     })
   }
 
@@ -1474,6 +1501,14 @@ export default function DataExplorer() {
                       icon={<CaretRightOutlined style={{ fontSize: 14 }} />}
                       onClick={handleExecuteMultiple}
                       loading={executing}
+                      style={{ width: 26, height: 26, padding: 0 }}
+                    />
+                  </Tooltip>
+                  <Tooltip title="格式化SQL (Shift+Alt+F)" placement="right">
+                    <Button
+                      size="small"
+                      icon={<AlignLeftOutlined style={{ fontSize: 14 }} />}
+                      onClick={handleFormatSql}
                       style={{ width: 26, height: 26, padding: 0 }}
                     />
                   </Tooltip>
