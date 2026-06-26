@@ -65,6 +65,8 @@ import {
   DownloadOutlined,
   CodeOutlined,
   LinkOutlined,
+  LoadingOutlined,
+  PauseCircleFilled,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
 import { tagApi, warehouseApi, scheduleApi, aiApi } from '../services/api'
@@ -232,12 +234,11 @@ export default function TagSystem() {
 
   // AI生成SQL模式
   const [generatedSql, setGeneratedSql] = useState('')
-  const [generatingSql, setGeneratingSql] = useState(false)
   const [sqlConfirmed, setSqlConfirmed] = useState(false)
   const [extractedTags, setExtractedTags] = useState<string[]>([])  // AI提取的标签
 
-  // AI打标Tab: 'single' 单表打标, 'chat' AI对话（粒度标签）, 'dimension' 智能-值标签
-  const [aiTabKey, setAiTabKey] = useState<'single' | 'chat' | 'dimension'>('single')
+  // AI打标Tab: 'chat' AI对话（粒度标签）, 'dimension' 智能-实体标签
+  const [aiTabKey, setAiTabKey] = useState<'chat' | 'dimension'>('chat')
 
   // 智能-值标签相关
   interface Dimension {
@@ -259,6 +260,7 @@ export default function TagSystem() {
   const [dimensionTypeDesc, setDimensionTypeDesc] = useState('')
   const [dimensionSql, setDimensionSql] = useState('')
   const dimensionMessagesEndRef = useRef<HTMLDivElement>(null)
+  const dimensionAbortRef = useRef<AbortController | null>(null)
   // 标签建议勾选
   interface TagValue { name: string; description: string; condition?: string; selected: boolean }
   interface TagSuggestion { type_name: string; type_description: string; field?: string; values: TagValue[]; selected: boolean }
@@ -269,6 +271,7 @@ export default function TagSystem() {
   const [newDimensionName, setNewDimensionName] = useState('')
   const [newDimensionIdField, setNewDimensionIdField] = useState('')  // 实体ID字段（英文，如 user_id）
   const [dimensionSaving, setDimensionSaving] = useState(false)
+  const [inferringIdField, setInferringIdField] = useState(false)  // AI推断中
 
   // 调度相关
   const [scheduleModalVisible, setScheduleModalVisible] = useState(false)
@@ -1417,7 +1420,7 @@ export default function TagSystem() {
           setDimensionTypeDesc('')
           setDimensionSql('')
           setSqlConfirmed(false)
-          setAiTabKey('single')
+          setAiTabKey('chat')
           chatForm.resetFields()
           loadTasks()
           loadTagNodes()
@@ -1425,18 +1428,15 @@ export default function TagSystem() {
           return
         }
 
-        // AI生成SQL模式（单表打标 / 粒度标签）
+        // AI对话模式（粒度标签）
         if (!generatedSql) {
           message.error('请先生成并确认SQL')
           return
         }
         // AI对话模式下，source_table 可能为空（全库模式），使用 'multi_table' 标识
-        const isAiChatMode = aiTabKey === 'chat'
-        const sourceTable = values.source_table || (isAiChatMode ? 'multi_table' : '')
-        // chat=粒度标签(detail), single=值标签(tag)
-        const nodeType = aiTabKey === 'chat' ? 'detail' : 'tag'
-        // 区分来源：ai_chat=粒度标签对话, ai=单表打标
-        const sourceType = aiTabKey === 'chat' ? 'ai_chat' : 'ai'
+        const sourceTable = values.source_table || 'multi_table'
+        const nodeType = 'detail'
+        const sourceType = 'ai_chat'
         await tagApi.createRuleTag({
           name: values.name,
           description: values.description || values.sql_prompt,
@@ -1470,7 +1470,7 @@ export default function TagSystem() {
       setSqlConfirmed(false)
       setExtractedTags([])
       setAiStep(0)
-      setAiTabKey('single')
+      setAiTabKey('chat')
       form.resetFields()
       chatForm.resetFields()
       loadTasks()
@@ -2100,12 +2100,20 @@ export default function TagSystem() {
         width: 200,
         ellipsis: true,
         render: (name: string, record: TagTask) => {
-          // 宽表任务行：显示宽表展示名 + "宽表"标记 + 真实表名，不跳转
+          // 宽表任务行：显示宽表展示名 + "宽表"标记 + 真实表名，可跳转
           if (record.node_type === 'wide_table') {
             return (
               <Space>
                 <TagsOutlined style={{ color: '#722ed1' }} />
-                <span style={{ fontWeight: 600 }}>{name}</span>
+                <a
+                  style={{ fontWeight: 600, color: record.id === highlightedTagId ? '#fa8c16' : '#722ed1', cursor: 'pointer' }}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    window.open(`/tags?tagId=${record.id}&view=manage`, '_blank')
+                  }}
+                >
+                  {name}
+                </a>
                 <Tag color="purple" style={{ margin: 0, fontSize: 10, padding: '0 4px' }}>宽表</Tag>
                 {record.tag_table_name && (
                   <span style={{ color: '#999', fontSize: 11 }}>{record.tag_table_name}</span>
@@ -2821,69 +2829,98 @@ export default function TagSystem() {
 
   // 标签管理页面 - 管理所有标签的生命周期
   const renderTagList = () => {
-    // 按维度分组标签
-    const dimensionGroups: { [key: number]: { dimension: Dimension; typeTags: any[]; valueTags: any[] } } = {}
-    const ensureDimGroup = (dimId: number) => {
-      if (!dimensionGroups[dimId]) {
-        const dim = dimensions.find(d => d.id === dimId)
-        dimensionGroups[dimId] = {
-          dimension: dim || { id: dimId, name: `dim_${dimId}`, display_name: `维度#${dimId}`, id_field: 'unknown', is_preset: false } as any,
-          typeTags: [], valueTags: [],
-        }
-      }
-      return dimensionGroups[dimId]
-    }
-    const detailTags: any[] = []
-    const templateTags: any[] = []
-    const unassignedTypeTags: any[] = []
-    const unassignedValueTags: any[] = []
+    // 构建层级结构：按维度分组，维度 > 宽表 > 类型标签 > 值标签
+    const buildHierarchy = () => {
+      const dimensionGroups: { [key: number]: { dimension: Dimension | null; wideTables: any[]; independentTypes: any[] } } = {}
+      const wideTables: any[] = []  // 宽表（顶层）
+      const typeTags: any[] = []     // 类型标签（可能挂在宽表下，也可能独立）
+      const valueTags: any[] = []    // 值标签（挂在类型标签下）
+      const detailTags: any[] = []   // 粒度标签
 
-    // 先找出所有匹配的类型标签ID（用于显示其子标签）
-    const matchedTypeTagIds = new Set<number>()
-    if (tagSearchText) {
-      sidebarTags.forEach(tag => {
-        if (tag.node_type === 'type' && tag.name.toLowerCase().includes(tagSearchText.toLowerCase())) {
-          matchedTypeTagIds.add(tag.id)
+      // 确保维度组存在
+      const ensureDimGroup = (dimId: number | null) => {
+        const key = dimId || 0
+        if (!dimensionGroups[key]) {
+          const dim = dimId ? dimensions.find(d => d.id === dimId) : null
+          dimensionGroups[key] = {
+            dimension: dim || null,
+            wideTables: [],
+            independentTypes: []
+          }
         }
+        return dimensionGroups[key]
+      }
+
+      // 分类标签
+      sidebarTags.forEach(tag => {
+        if (tag.node_type === 'wide_table') {
+          wideTables.push({ ...tag, children: [] })
+        } else if (tag.node_type === 'type') {
+          typeTags.push({ ...tag, children: [] })
+        } else if (tag.node_type === 'tag' || tag.node_type === 'value') {
+          valueTags.push(tag)
+        } else if (tag.node_type === 'detail') {
+          detailTags.push(tag)
+        }
+      })
+
+      // 值标签挂到类型标签下
+      valueTags.forEach(vTag => {
+        const parent = typeTags.find(t => t.id === vTag.parent_id)
+        if (parent) {
+          parent.children.push(vTag)
+        }
+      })
+
+      // 类型标签挂到宽表下（如果有parent_id指向宽表）
+      typeTags.forEach(tTag => {
+        const parentWide = wideTables.find(w => w.id === tTag.parent_id)
+        if (parentWide) {
+          parentWide.children.push(tTag)
+        } else {
+          // 独立类型标签按维度分组
+          ensureDimGroup(tTag.dimension_id).independentTypes.push(tTag)
+        }
+      })
+
+      // 宽表按维度分组
+      wideTables.forEach(wt => {
+        ensureDimGroup(wt.dimension_id).wideTables.push(wt)
+      })
+
+      return { dimensionGroups, detailTags }
+    }
+
+    const { dimensionGroups, detailTags } = buildHierarchy()
+    const sortedDimGroups = Object.values(dimensionGroups).sort((a, b) => {
+      // 有维度的排前面，无维度的排后面
+      if (a.dimension && !b.dimension) return -1
+      if (!a.dimension && b.dimension) return 1
+      return (a.dimension?.display_name || '').localeCompare(b.dimension?.display_name || '')
+    })
+
+    // 搜索过滤
+    const filterBySearch = (items: any[]): any[] => {
+      if (!tagSearchText) return items
+      const searchLower = tagSearchText.toLowerCase()
+      return items.filter(item => {
+        const nameMatch = item.name.toLowerCase().includes(searchLower)
+        const hasMatchingChild = item.children?.some((c: any) =>
+          c.name.toLowerCase().includes(searchLower) ||
+          c.children?.some((gc: any) => gc.name.toLowerCase().includes(searchLower))
+        )
+        return nameMatch || hasMatchingChild
       })
     }
 
-    sidebarTags.forEach(tag => {
-      // 搜索过滤：匹配自己的名字，或者是匹配类型标签的子标签
-      if (tagSearchText) {
-        const nameMatch = tag.name.toLowerCase().includes(tagSearchText.toLowerCase())
-        const isChildOfMatchedType = (tag.node_type === 'tag' || tag.node_type === 'value') && tag.parent_id && matchedTypeTagIds.has(tag.parent_id)
-        if (!nameMatch && !isChildOfMatchedType) return
-      }
-
-      if (tag.node_type === 'detail') {
-        detailTags.push(tag)
-      } else if (tag.node_type === 'template') {
-        templateTags.push(tag)
-      } else if (tag.node_type === 'type' || tag.node_type === 'wide_table') {
-        // 宽表标签归入「类型标签」一起显示（无单独的宽表概念）
-        if (tag.dimension_id) {
-          ensureDimGroup(tag.dimension_id).typeTags.push(tag)
-        } else {
-          unassignedTypeTags.push(tag)
-        }
-      } else if (tag.node_type === 'tag' || tag.node_type === 'value') {
-        // 值标签直接使用自己的 dimension_id
-        if (tag.dimension_id) {
-          ensureDimGroup(tag.dimension_id).valueTags.push(tag)
-        } else {
-          unassignedValueTags.push(tag)
-        }
-      }
-    })
-
-    // 渲染标签项
-    const renderTagItem = (tag: any, color: string) => (
+    // 渲染单个标签节点
+    const renderTagNode = (tag: any, color: string, isLast: boolean = false, level: number = 0) => (
       <Dropdown
         key={tag.id}
         trigger={['contextMenu']}
         menu={{
           items: [
+            { key: 'view', label: '查看详情', onClick: () => handleViewTagDetail(tag) },
             { key: 'edit', label: '编辑', onClick: () => handleEditTag(tag) },
             { key: 'delete', label: '删除', danger: true, onClick: () => handleDeleteTag(tag.id) },
           ]
@@ -2891,148 +2928,359 @@ export default function TagSystem() {
       >
         <div
           style={{
-            padding: '4px 10px',
-            background: '#fff',
-            border: '1px solid #d9d9d9',
-            borderRadius: 4,
-            fontSize: 12,
-            cursor: 'pointer',
-            display: 'flex',
+            display: 'inline-flex',
             alignItems: 'center',
-            gap: 4,
+            padding: '6px 12px',
+            background: '#fff',
+            border: `1px solid ${color}20`,
+            borderLeft: `3px solid ${color}`,
+            borderRadius: 6,
+            fontSize: 13,
+            cursor: 'pointer',
             transition: 'all 0.2s',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.03)',
           }}
           onMouseEnter={(e) => {
-            e.currentTarget.style.borderColor = color
-            e.currentTarget.style.color = color
+            e.currentTarget.style.background = `${color}08`
+            e.currentTarget.style.borderColor = `${color}40`
+            e.currentTarget.style.transform = 'translateX(2px)'
           }}
           onMouseLeave={(e) => {
-            e.currentTarget.style.borderColor = '#d9d9d9'
-            e.currentTarget.style.color = 'inherit'
+            e.currentTarget.style.background = '#fff'
+            e.currentTarget.style.borderColor = `${color}20`
+            e.currentTarget.style.transform = 'none'
           }}
-          onClick={() => (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag') ? handleViewTagDetail(tag) : handleEditTag(tag)}
+          onClick={() => handleViewTagDetail(tag)}
         >
-          <div style={{ width: 6, height: 6, borderRadius: 2, background: tag.color || color }} />
-          {tag.name}
+          <div style={{
+            width: 8,
+            height: 8,
+            borderRadius: '50%',
+            background: tag.color || color,
+            marginRight: 8,
+            boxShadow: `0 0 0 2px ${color}20`
+          }} />
+          <span style={{ fontWeight: 500 }}>{tag.name}</span>
+          {tag.node_type === 'wide_table' && (
+            <Tag color="purple" style={{ marginLeft: 8, fontSize: 10, padding: '0 4px', lineHeight: '16px' }}>宽表</Tag>
+          )}
+          {tag.node_type === 'type' && (
+            <Tag color="blue" style={{ marginLeft: 8, fontSize: 10, padding: '0 4px', lineHeight: '16px' }}>类型</Tag>
+          )}
+          {(tag.node_type === 'value' || tag.node_type === 'tag') && (
+            <Tag color="green" style={{ marginLeft: 8, fontSize: 10, padding: '0 4px', lineHeight: '16px' }}>值</Tag>
+          )}
+          {tag.children?.length > 0 && (
+            <span style={{ marginLeft: 8, fontSize: 11, color: '#999' }}>({tag.children.length})</span>
+          )}
         </div>
       </Dropdown>
     )
 
-    return (
-      <div style={{ padding: 24, height: '100%', overflow: 'auto' }}>
-        {/* 顶部操作栏 */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <Input.Search
-            placeholder="搜索标签"
-            allowClear
-            style={{ width: 280 }}
-            value={tagSearchText}
-            onChange={(e) => setTagSearchText(e.target.value)}
-          />
-        </div>
+    // 渲染树形节点（带连线）
+    const renderTreeNode = (tag: any, color: string, isLast: boolean = false, parentColor?: string) => {
+      const hasChildren = tag.children && tag.children.length > 0
+      const nodeColor = tag.node_type === 'wide_table' ? '#722ed1' :
+                       tag.node_type === 'type' ? '#1890ff' : '#52c41a'
 
-        {/* 维度标签 */}
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: '#1890ff', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <TagsOutlined />
-            维度标签
+      return (
+        <div key={tag.id} style={{ position: 'relative' }}>
+          {/* 当前节点 */}
+          <div style={{ display: 'flex', alignItems: 'flex-start', marginBottom: hasChildren ? 0 : 12 }}>
+            {renderTagNode(tag, nodeColor, isLast)}
           </div>
 
-          {Object.values(dimensionGroups).length > 0 ? (
-            Object.values(dimensionGroups).map(group => (
-              <div key={group.dimension.id} style={{ marginBottom: 20, marginLeft: 16 }}>
-                {/* 维度名称 */}
-                <div style={{ fontSize: 13, fontWeight: 500, color: '#fa8c16', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <div style={{ width: 3, height: 14, background: '#fa8c16', borderRadius: 2 }} />
-                  {group.dimension.display_name}
-                  <span style={{ fontSize: 11, color: '#999', fontWeight: 400 }}>({group.dimension.id_field})</span>
-                </div>
+          {/* 子节点 */}
+          {hasChildren && (
+            <div style={{
+              marginLeft: 20,
+              marginTop: 8,
+              paddingLeft: 20,
+              borderLeft: `2px dashed ${nodeColor}30`,
+              position: 'relative'
+            }}>
+              {tag.children.map((child: any, idx: number) => {
+                const isLastChild = idx === tag.children.length - 1
+                const childColor = child.node_type === 'type' ? '#1890ff' : '#52c41a'
+                const childHasChildren = child.children && child.children.length > 0
 
-                {/* 类型标签（含宽表标签） */}
-                {group.typeTags.length > 0 && (
-                  <div style={{ marginLeft: 16, marginBottom: 8 }}>
-                    <div style={{ fontSize: 12, color: '#722ed1', marginBottom: 6 }}>
-                      类型标签 ({group.typeTags.length})
-                    </div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                      {group.typeTags.map(tag => renderTagItem(tag, '#722ed1'))}
-                    </div>
-                  </div>
-                )}
+                return (
+                  <div key={child.id} style={{ position: 'relative', marginBottom: childHasChildren ? 0 : 8 }}>
+                    {/* 横向连线 */}
+                    <div style={{
+                      position: 'absolute',
+                      left: -20,
+                      top: 14,
+                      width: 16,
+                      height: 2,
+                      background: `${nodeColor}30`,
+                    }} />
+                    {/* 连接点 */}
+                    <div style={{
+                      position: 'absolute',
+                      left: -24,
+                      top: 10,
+                      width: 8,
+                      height: 8,
+                      borderRadius: '50%',
+                      background: '#fff',
+                      border: `2px solid ${nodeColor}50`,
+                    }} />
 
-                {/* 值标签 */}
-                {group.valueTags.length > 0 && (
-                  <div style={{ marginLeft: 16 }}>
-                    <div style={{ fontSize: 12, color: '#52c41a', marginBottom: 6 }}>
-                      值标签 ({group.valueTags.length})
+                    {/* 子节点内容 */}
+                    <div style={{ display: 'flex', alignItems: 'flex-start' }}>
+                      {renderTagNode(child, childColor, isLastChild)}
                     </div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                      {group.valueTags.map(tag => renderTagItem(tag, '#52c41a'))}
-                    </div>
-                  </div>
-                )}
 
-                {group.typeTags.length === 0 && group.valueTags.length === 0 && (
-                  <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无标签</div>
-                )}
-              </div>
-            ))
-          ) : (
-            <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无维度标签，请先在"AI打标"中创建</div>
-          )}
-
-          {/* 未分配维度的标签 */}
-          {(unassignedTypeTags.length > 0 || unassignedValueTags.length > 0) && (
-            <div style={{ marginBottom: 20, marginLeft: 16 }}>
-              <div style={{ fontSize: 13, fontWeight: 500, color: '#999', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={{ width: 3, height: 14, background: '#999', borderRadius: 2 }} />
-                未分配维度
-              </div>
-              {unassignedTypeTags.length > 0 && (
-                <div style={{ marginLeft: 16, marginBottom: 8 }}>
-                  <div style={{ fontSize: 12, color: '#722ed1', marginBottom: 6 }}>类型标签 ({unassignedTypeTags.length})</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                    {unassignedTypeTags.map(tag => renderTagItem(tag, '#722ed1'))}
+                    {/* 孙节点（值标签） */}
+                    {childHasChildren && (
+                      <div style={{
+                        marginLeft: 20,
+                        marginTop: 8,
+                        paddingLeft: 20,
+                        borderLeft: `2px dashed ${childColor}30`,
+                      }}>
+                        {child.children.map((grandChild: any, gIdx: number) => (
+                          <div key={grandChild.id} style={{ position: 'relative', marginBottom: 8 }}>
+                            {/* 横向连线 */}
+                            <div style={{
+                              position: 'absolute',
+                              left: -20,
+                              top: 14,
+                              width: 16,
+                              height: 2,
+                              background: `${childColor}30`,
+                            }} />
+                            {/* 连接点 */}
+                            <div style={{
+                              position: 'absolute',
+                              left: -24,
+                              top: 10,
+                              width: 8,
+                              height: 8,
+                              borderRadius: '50%',
+                              background: '#fff',
+                              border: `2px solid ${childColor}50`,
+                            }} />
+                            {renderTagNode(grandChild, '#52c41a', gIdx === child.children.length - 1)}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                </div>
-              )}
-              {unassignedValueTags.length > 0 && (
-                <div style={{ marginLeft: 16 }}>
-                  <div style={{ fontSize: 12, color: '#52c41a', marginBottom: 6 }}>值标签 ({unassignedValueTags.length})</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                    {unassignedValueTags.map(tag => renderTagItem(tag, '#52c41a'))}
-                  </div>
-                </div>
-              )}
+                )
+              })}
             </div>
+          )}
+        </div>
+      )
+    }
+
+    // 计算统计数据
+    const totalParentTags = sortedDimGroups.reduce((acc, g) => acc + g.wideTables.length + g.independentTypes.length, 0)
+    const totalChildTags = sortedDimGroups.reduce((acc, g) => {
+      const wideChildren = g.wideTables.reduce((a, w) => a + (w.children?.length || 0), 0)
+      const typeChildren = g.independentTypes.reduce((a, t) => a + (t.children?.length || 0), 0)
+      return acc + wideChildren + typeChildren
+    }, 0)
+
+    const filteredDetailTags = tagSearchText
+      ? detailTags.filter(t => t.name.toLowerCase().includes(tagSearchText.toLowerCase()))
+      : detailTags
+
+    // 过滤维度组
+    const getFilteredDimGroups = () => {
+      if (!tagSearchText) return sortedDimGroups
+      return sortedDimGroups.map(group => ({
+        ...group,
+        wideTables: filterBySearch(group.wideTables),
+        independentTypes: filterBySearch(group.independentTypes)
+      })).filter(g => g.wideTables.length > 0 || g.independentTypes.length > 0)
+    }
+    const filteredDimGroups = getFilteredDimGroups()
+
+    return (
+      <div style={{ padding: 24, height: '100%', overflow: 'auto', background: '#fafafa' }}>
+        {/* 顶部操作栏 */}
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 24,
+          padding: '16px 20px',
+          background: '#fff',
+          borderRadius: 8,
+          boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+            <Input.Search
+              placeholder="搜索标签名称..."
+              allowClear
+              style={{ width: 300 }}
+              value={tagSearchText}
+              onChange={(e) => setTagSearchText(e.target.value)}
+            />
+            <div style={{ fontSize: 13, color: '#999' }}>
+              共 {totalParentTags} 个父标签，{totalChildTags} 个子标签
+            </div>
+          </div>
+        </div>
+
+        {/* 实体标签树 - 按实体分组 */}
+        <div style={{
+          marginBottom: 24,
+          padding: 20,
+          background: '#fff',
+          borderRadius: 8,
+          boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+        }}>
+          <div style={{
+            fontSize: 15,
+            fontWeight: 600,
+            color: '#1890ff',
+            marginBottom: 20,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            paddingBottom: 12,
+            borderBottom: '1px solid #f0f0f0'
+          }}>
+            <TagsOutlined style={{ fontSize: 18 }} />
+            实体标签层级
+            <span style={{ fontSize: 12, color: '#999', fontWeight: 400, marginLeft: 8 }}>
+              实体 → 宽表 → 类型标签 → 值标签
+            </span>
+          </div>
+
+          {filteredDimGroups.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+              {filteredDimGroups.map((group, gIdx) => (
+                <div key={group.dimension?.id || 'unassigned'} style={{
+                  padding: 16,
+                  background: group.dimension ? '#fafafa' : '#fff8f0',
+                  borderRadius: 8,
+                  border: `1px solid ${group.dimension ? '#f0f0f0' : '#ffe7ba'}`
+                }}>
+                  {/* 维度标题 */}
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    marginBottom: 16,
+                    paddingBottom: 12,
+                    borderBottom: `1px dashed ${group.dimension ? '#e8e8e8' : '#ffd591'}`
+                  }}>
+                    <div style={{
+                      width: 4,
+                      height: 20,
+                      borderRadius: 2,
+                      background: group.dimension ? '#fa8c16' : '#999'
+                    }} />
+                    <span style={{
+                      fontSize: 14,
+                      fontWeight: 600,
+                      color: group.dimension ? '#fa8c16' : '#999'
+                    }}>
+                      {group.dimension ? group.dimension.display_name : '未分配实体'}
+                    </span>
+                    {group.dimension && (
+                      <span style={{ fontSize: 11, color: '#999' }}>({group.dimension.id_field})</span>
+                    )}
+                    <span style={{ fontSize: 12, color: '#999', marginLeft: 'auto' }}>
+                      {group.wideTables.length + group.independentTypes.length} 个标签组
+                    </span>
+                  </div>
+
+                  {/* 该维度下的宽表和独立类型标签 */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    {/* 宽表 */}
+                    {group.wideTables.map((wideTable, idx) => (
+                      <div key={wideTable.id} style={{
+                        padding: 12,
+                        background: '#fff',
+                        borderRadius: 6,
+                        border: '1px solid #f0f0f0'
+                      }}>
+                        {renderTreeNode(wideTable, '#722ed1', idx === group.wideTables.length - 1)}
+                      </div>
+                    ))}
+
+                    {/* 独立类型标签 */}
+                    {group.independentTypes.map((typeTag, idx) => (
+                      <div key={typeTag.id} style={{
+                        padding: 12,
+                        background: '#f6f9ff',
+                        borderRadius: 6,
+                        border: '1px solid #e6f0ff'
+                      }}>
+                        {renderTreeNode(typeTag, '#1890ff', idx === group.independentTypes.length - 1)}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Empty description="暂无实体标签" image={Empty.PRESENTED_IMAGE_SIMPLE} />
           )}
         </div>
 
         {/* 粒度标签 */}
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: '#eb2f96', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <TagOutlined />
+        <div style={{
+          marginBottom: 24,
+          padding: 20,
+          background: '#fff',
+          borderRadius: 8,
+          boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+        }}>
+          <div style={{
+            fontSize: 15,
+            fontWeight: 600,
+            color: '#eb2f96',
+            marginBottom: 20,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            paddingBottom: 12,
+            borderBottom: '1px solid #f0f0f0'
+          }}>
+            <TagOutlined style={{ fontSize: 18 }} />
             粒度标签
-            <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>({detailTags.length})</span>
+            <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>({filteredDetailTags.length})</span>
           </div>
-          {detailTags.length > 0 ? (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginLeft: 16 }}>
-              {detailTags.map(tag => renderTagItem(tag, '#eb2f96'))}
+          {filteredDetailTags.length > 0 ? (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+              {filteredDetailTags.map(tag => renderTagNode(tag, '#eb2f96'))}
             </div>
           ) : (
-            <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无粒度标签</div>
+            <Empty description="暂无粒度标签" image={Empty.PRESENTED_IMAGE_SIMPLE} />
           )}
         </div>
 
-        {/* 模版标签（只展示收藏的分类标签，不展示子级） */}
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: '#13c2c2', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <FileTextOutlined />
+        {/* 模版标签（收藏） */}
+        <div style={{
+          padding: 20,
+          background: '#fff',
+          borderRadius: 8,
+          boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+        }}>
+          <div style={{
+            fontSize: 15,
+            fontWeight: 600,
+            color: '#13c2c2',
+            marginBottom: 20,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            paddingBottom: 12,
+            borderBottom: '1px solid #f0f0f0'
+          }}>
+            <FileTextOutlined style={{ fontSize: 18 }} />
             模版标签
             <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>({templateFavorites.length})</span>
           </div>
           {templateFavorites.length > 0 ? (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginLeft: 16 }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
               {templateFavorites.map(fav => (
                 <Dropdown
                   key={fav.favorite_id}
@@ -3058,37 +3306,44 @@ export default function TagSystem() {
                 >
                   <div
                     style={{
-                      padding: '4px 10px',
-                      background: '#fff',
-                      border: '1px solid #d9d9d9',
-                      borderRadius: 4,
-                      fontSize: 12,
-                      cursor: 'pointer',
-                      display: 'flex',
+                      display: 'inline-flex',
                       alignItems: 'center',
-                      gap: 4,
+                      padding: '6px 12px',
+                      background: '#fff',
+                      border: '1px solid #13c2c220',
+                      borderLeft: '3px solid #13c2c2',
+                      borderRadius: 6,
+                      fontSize: 13,
+                      cursor: 'pointer',
                       transition: 'all 0.2s',
+                      boxShadow: '0 1px 2px rgba(0,0,0,0.03)',
                     }}
                     onMouseEnter={(e) => {
-                      e.currentTarget.style.borderColor = '#13c2c2'
-                      e.currentTarget.style.color = '#13c2c2'
+                      e.currentTarget.style.background = '#13c2c208'
+                      e.currentTarget.style.transform = 'translateX(2px)'
                     }}
                     onMouseLeave={(e) => {
-                      e.currentTarget.style.borderColor = '#d9d9d9'
-                      e.currentTarget.style.color = 'inherit'
+                      e.currentTarget.style.background = '#fff'
+                      e.currentTarget.style.transform = 'none'
                     }}
                   >
-                    <div style={{ width: 6, height: 6, borderRadius: 2, background: fav.color || '#13c2c2' }} />
-                    {fav.name}
+                    <div style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: '50%',
+                      background: fav.color || '#13c2c2',
+                      marginRight: 8
+                    }} />
+                    <span style={{ fontWeight: 500 }}>{fav.name}</span>
                     {fav.children_count > 0 && (
-                      <span style={{ fontSize: 10, color: '#999', marginLeft: 4 }}>+{fav.children_count}</span>
+                      <span style={{ fontSize: 11, color: '#999', marginLeft: 8 }}>+{fav.children_count}</span>
                     )}
                   </div>
                 </Dropdown>
               ))}
             </div>
           ) : (
-            <div style={{ marginLeft: 16, color: '#999', fontSize: 12 }}>暂无模版标签</div>
+            <Empty description="暂无模版标签" image={Empty.PRESENTED_IMAGE_SIMPLE} />
           )}
         </div>
       </div>
@@ -4483,7 +4738,7 @@ export default function TagSystem() {
                             e.currentTarget.style.borderColor = '#d3adf7'
                             e.currentTarget.style.background = '#fff'
                           }}
-                          onClick={() => (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag') ? handleViewTagDetail(tag) : handleEditTag(tag)}
+                          onClick={() => (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag' || tag.node_type === 'wide_table') ? handleViewTagDetail(tag) : handleEditTag(tag)}
                         >
                           <div style={{
                             width: 6,
@@ -5382,37 +5637,6 @@ export default function TagSystem() {
 
   // 渲染AI打标弹框
   const renderAIModal = () => {
-    const sqlModeSteps = [
-      { title: '选择数据表' },
-      { title: '生成SQL' },
-      { title: '保存任务' },
-    ]
-
-    // 生成SQL并提取标签
-    const handleGenerateSql = async () => {
-      const prompt = form.getFieldValue('sql_prompt')
-      const table = form.getFieldValue('source_table')
-      if (!table) {
-        message.error('请先选择数据表')
-        return
-      }
-      if (!prompt?.trim()) {
-        message.error('请先输入打标逻辑描述')
-        return
-      }
-      setGeneratingSql(true)
-      try {
-        const res = await tagApi.previewRuleSql(table, prompt)
-        setGeneratedSql(res.data?.sql || '')
-        setExtractedTags(res.data?.tags || [])
-        message.success('SQL已生成，请确认')
-      } catch (error: any) {
-        message.error(error.response?.data?.detail || '生成失败')
-      } finally {
-        setGeneratingSql(false)
-      }
-    }
-
     // 处理AI对话确认SQL
     const handleChatSqlConfirmed = (sql: string, tags: string[], taskInfo?: { name: string; description: string; tables: string[]; tagTableName?: string }) => {
       setGeneratedSql(sql)
@@ -5435,7 +5659,7 @@ export default function TagSystem() {
 
     // Tab切换时重置状态
     const handleTabChange = async (key: string) => {
-      setAiTabKey(key as 'single' | 'chat' | 'dimension')
+      setAiTabKey(key as 'chat' | 'dimension')
       setAiStep(0)
       setGeneratedSql('')
       setSqlConfirmed(false)
@@ -5465,199 +5689,6 @@ export default function TagSystem() {
         setNewDimensionName('')
       }
     }
-
-    // 渲染单表打标内容
-    const renderSingleTableContent = () => (
-      <>
-        <Steps current={aiStep} items={sqlModeSteps} style={{ marginBottom: 24 }} size="small" />
-
-        <Form form={form} layout="vertical" autoComplete="off">
-          {/* 步骤1: 选择表 + 描述逻辑 */}
-          <div style={{ display: aiStep === 0 ? 'block' : 'none' }}>
-            <Form.Item
-              name="source_table"
-              label="选择数据表"
-              rules={[{ required: true, message: '请选择源表' }]}
-            >
-              <Select
-                placeholder="请选择数据表"
-                loading={loadingTables}
-                showSearch
-                options={tables.map((t) => ({ value: t, label: t }))}
-                style={{ width: 300 }}
-              />
-            </Form.Item>
-
-            <Form.Item
-              name="sql_prompt"
-              label="打标逻辑描述"
-              rules={[{ required: true, message: '请描述打标逻辑' }]}
-              extra="用自然语言描述，AI会读取表样本数据后生成SQL"
-            >
-              <TextArea
-                rows={5}
-                placeholder={`例如：
-• 订单金额大于1000的标记为"高消费"，500-1000为"中等"，其他为"普通"
-• 最近30天有登录记录的为"活跃用户"，否则为"沉默用户"
-• 评分大于4.5的商品标记为"好评"，3-4.5为"一般"，其他为"差评"`}
-              />
-            </Form.Item>
-          </div>
-
-          {/* 步骤2: 生成并确认SQL */}
-          <div style={{ display: aiStep === 1 ? 'block' : 'none' }}>
-            {!generatedSql ? (
-              <div style={{ textAlign: 'center', padding: 40 }}>
-                <Button
-                  type="primary"
-                  size="large"
-                  icon={<RobotOutlined />}
-                  loading={generatingSql}
-                  onClick={handleGenerateSql}
-                >
-                  {generatingSql ? 'AI正在分析数据...' : '生成SQL'}
-                </Button>
-                <div style={{ marginTop: 16, color: '#666' }}>
-                  AI将读取表的样本数据，根据您的描述生成SQL
-                </div>
-              </div>
-            ) : (
-              <>
-                {/* SQL编辑器 */}
-                <div style={{ marginBottom: 16 }}>
-                  <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Text strong>
-                      生成的SQL
-                      {sqlConfirmed && <Tag color="success" style={{ marginLeft: 8 }}>已确认</Tag>}
-                    </Text>
-                    <Space>
-                      <Button
-                        size="small"
-                        onClick={() => {
-                          setGeneratedSql('')
-                          setSqlConfirmed(false)
-                          setExtractedTags([])
-                        }}
-                      >
-                        重新生成
-                      </Button>
-                      {!sqlConfirmed && (
-                        <Button
-                          type="primary"
-                          size="small"
-                          onClick={() => {
-                            setSqlConfirmed(true)
-                            message.success('SQL已确认')
-                          }}
-                        >
-                          确认SQL
-                        </Button>
-                      )}
-                    </Space>
-                  </div>
-                  <div style={{ border: '1px solid #d9d9d9', borderRadius: 6, overflow: 'hidden' }}>
-                    <Editor
-                      height={180}
-                      language="sql"
-                      theme="vs-dark"
-                      value={generatedSql}
-                      onChange={(v) => {
-                        setGeneratedSql(v || '')
-                        if (sqlConfirmed) setSqlConfirmed(false)
-                      }}
-                      options={{
-                        minimap: { enabled: false },
-                        fontSize: 13,
-                        lineNumbers: 'on',
-                        readOnly: sqlConfirmed,
-                      }}
-                    />
-                  </div>
-                </div>
-
-                {/* 提取的标签 */}
-                <div style={{ marginBottom: 16, padding: 12, background: '#f6ffed', borderRadius: 6, border: '1px solid #b7eb8f' }}>
-                  <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Text strong>提取的标签</Text>
-                    <Button
-                      type="link"
-                      size="small"
-                      icon={<PlusOutlined />}
-                      onClick={() => setExtractedTags([...extractedTags, '新标签'])}
-                    >
-                      添加
-                    </Button>
-                  </div>
-                  <Space wrap>
-                    {extractedTags.map((tag, idx) => (
-                      <Tag
-                        key={idx}
-                        closable
-                        color="green"
-                        onClose={() => setExtractedTags(extractedTags.filter((_, i) => i !== idx))}
-                      >
-                        <Input
-                          size="small"
-                          value={tag}
-                          onChange={(e) => {
-                            const updated = [...extractedTags]
-                            updated[idx] = e.target.value
-                            setExtractedTags(updated)
-                          }}
-                          style={{ width: 80, border: 'none', background: 'transparent', padding: 0 }}
-                        />
-                      </Tag>
-                    ))}
-                    {extractedTags.length === 0 && (
-                      <Text type="secondary">未提取到标签，请检查SQL中的CASE WHEN语句</Text>
-                    )}
-                  </Space>
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* 步骤3: 保存任务 */}
-          <div style={{ display: aiStep === 2 ? 'block' : 'none' }}>
-            <Form.Item
-              name="name"
-              label="任务名称"
-              rules={[{ required: true, message: '请输入任务名称' }]}
-            >
-              <Input placeholder="例如：用户分层打标任务" autoComplete="off" />
-            </Form.Item>
-
-            <Form.Item name="description" label="任务描述">
-              <TextArea rows={2} placeholder="可选，补充说明" />
-            </Form.Item>
-
-            <Form.Item name="target_table" label="结果保存到">
-              <Input placeholder="可选，留空则自动生成表名" autoComplete="off" />
-            </Form.Item>
-
-            <Form.Item name="parent_id" label="所属层级">
-              <TreeSelect
-                allowClear
-                placeholder="可选，选择标签所属的分类/类型"
-                treeData={hierarchyNodes}
-                fieldNames={{ label: 'name', value: 'id', children: 'children' }}
-                treeDefaultExpandAll
-                style={{ width: '100%' }}
-              />
-            </Form.Item>
-
-            <div style={{ padding: 16, background: '#fafafa', borderRadius: 8 }}>
-              <Text strong>任务信息预览</Text>
-              <div style={{ marginTop: 8, fontSize: 13, color: '#666' }}>
-                <div>源表：{form.getFieldValue('source_table') || '(全库模式)'}</div>
-                <div>标签：{extractedTags.join('、') || '无'}</div>
-                <div>SQL已确认：{sqlConfirmed ? '是' : '否'}</div>
-              </div>
-            </div>
-          </div>
-        </Form>
-      </>
-    )
 
     // 渲染AI对话内容（粒度标签模式）
     const renderChatContent = () => {
@@ -5711,23 +5742,39 @@ export default function TagSystem() {
       return (
         <AIChatPanel
           onSqlConfirmed={handleChatSqlConfirmed}
-          onCancel={() => setAiTabKey('single')}
+          onCancel={() => setAiTabKey('chat')}
         />
       )
+    }
+
+    // AI推断实体ID字段
+    const handleInferIdField = async (entityName: string) => {
+      if (!entityName.trim()) return
+      setInferringIdField(true)
+      try {
+        const res = await tagApi.inferDimensionIdField(entityName.trim())
+        if (res.data?.id_field) {
+          setNewDimensionIdField(res.data.id_field)
+        }
+      } catch (e: any) {
+        console.error('AI推断失败:', e)
+      } finally {
+        setInferringIdField(false)
+      }
     }
 
     // 保存新维度
     const handleSaveDimension = async () => {
       if (!newDimensionName.trim()) return
       const idField = newDimensionIdField.trim()
-      if (!idField) { message.warning('请输入ID字段（英文，如 user_id）'); return }
+      if (!idField) { message.warning('请等待AI推断ID字段或手动输入'); return }
       if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(idField)) { message.warning('ID字段需以字母开头，仅字母/数字/下划线'); return }
       setDimensionSaving(true)
       try {
         await tagApi.createDimension({
           name: newDimensionName.trim().replace(/(维度|实体)$/, ''),
           display_name: newDimensionName.trim(),
-          id_field: idField,  // 规范英文，如 user_id
+          id_field: idField,
         })
         message.success('已创建')
         setDimensionModalVisible(false)
@@ -5759,6 +5806,10 @@ export default function TagSystem() {
       setDimensionMessages(prev => [...prev, { role: 'user', content: userMsg }])
       setDimensionSending(true)
 
+      // 创建取消控制器
+      const abortController = new AbortController()
+      dimensionAbortRef.current = abortController
+
       try {
         // 首次发送时创建会话
         let sessionId = dimensionSessionId
@@ -5767,7 +5818,7 @@ export default function TagSystem() {
           sessionId = createRes.data.session_id
           setDimensionSessionId(sessionId)
         }
-        const res = await tagApi.sendDimensionChatMessage(sessionId!, userMsg)
+        const res = await tagApi.sendDimensionChatMessage(sessionId!, userMsg, abortController.signal)
         const reply = res.data.reply
 
         // 检查是否返回了 tag_suggestions JSON
@@ -5808,8 +5859,14 @@ export default function TagSystem() {
           })
         }
       } catch (e: any) {
-        message.error('发送失败: ' + (e.response?.data?.detail || e.message))
+        // 忽略取消错误
+        if (e.name === 'CanceledError' || e.code === 'ERR_CANCELED') {
+          setDimensionMessages(prev => [...prev, { role: 'assistant', content: '已停止生成' }])
+        } else {
+          message.error('发送失败: ' + (e.response?.data?.detail || e.message))
+        }
       } finally {
+        dimensionAbortRef.current = null
         setDimensionSending(false)
         setTimeout(() => {
           dimensionMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -5896,24 +5953,24 @@ export default function TagSystem() {
               onOk={handleSaveDimension}
               okText="创建"
               cancelText="取消"
-              confirmLoading={dimensionSaving}
-              okButtonProps={{ disabled: !newDimensionName.trim() || !newDimensionIdField.trim() }}
+              confirmLoading={dimensionSaving || inferringIdField}
+              okButtonProps={{ disabled: !newDimensionName.trim() || inferringIdField }}
             >
               <div style={{ marginBottom: 6, fontSize: 12, color: '#999' }}>实体名称</div>
               <Input
-                placeholder="输入实体名称，如：用户实体"
+                placeholder="输入实体名称，如：用户、商品、订单"
                 value={newDimensionName}
                 onChange={e => setNewDimensionName(e.target.value)}
-                autoFocus
-                style={{ marginBottom: 12 }}
-              />
-              <div style={{ marginBottom: 6, fontSize: 12, color: '#999' }}>ID字段（英文，宽表第一列）</div>
-              <Input
-                placeholder="如：user_id"
-                value={newDimensionIdField}
-                onChange={e => setNewDimensionIdField(e.target.value)}
+                onBlur={e => handleInferIdField(e.target.value)}
                 onPressEnter={handleSaveDimension}
+                autoFocus
               />
+              {inferringIdField && (
+                <div style={{ marginTop: 8, color: '#1890ff', fontSize: 12 }}>AI推断ID字段中...</div>
+              )}
+              {newDimensionIdField && !inferringIdField && (
+                <div style={{ marginTop: 8, color: '#52c41a', fontSize: 12 }}>ID字段：{newDimensionIdField}</div>
+              )}
             </Modal>
           </div>
         )
@@ -5938,20 +5995,38 @@ export default function TagSystem() {
               name="wide_table_display"
               label="宽表展示名（任务名）"
               rules={[{ required: true, message: '请输入宽表展示名' }]}
-              initialValue="基础信息"
             >
-              <Input placeholder="如：基础信息" />
+              <Input
+                placeholder="可修改，如：基础信息、行为数据、消费画像"
+                onBlur={async (e) => {
+                  const displayName = e.target.value.trim()
+                  if (!displayName) return
+                  const entityName = (selectedDimension?.id_field || '').replace(/_id$/, '') || 'entity'
+                  try {
+                    // 调用 AI 推断表名
+                    const res = await tagApi.inferTableName(displayName, entityName)
+                    if (res.data?.table_name) {
+                      chatForm.setFieldsValue({ wide_table_name: res.data.table_name })
+                    }
+                  } catch (err) {
+                    // 失败时使用简单的 fallback
+                    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+                    const tableName = `tag_${entityName}_data_${dateStr}`
+                    chatForm.setFieldsValue({ wide_table_name: tableName })
+                  }
+                }}
+              />
             </Form.Item>
             <Form.Item
               name="wide_table_name"
               label="宽表真实表名（英文）"
               rules={[
                 { required: true, message: '请输入真实表名' },
-                { pattern: /^[A-Za-z][A-Za-z0-9_]*$/, message: '以字母开头，仅字母/数字/下划线' },
+                { pattern: /^[a-z][a-z0-9_]*$/, message: '小写字母开头，仅小写字母/数字/下划线' },
               ]}
-              initialValue={`tag_${(selectedDimension.id_field || '').replace(/_id$/, '') || 'entity'}_basic_info`}
+              extra="根据展示名 AI 自动推断，也可手动修改"
             >
-              <Input placeholder="如：tag_user_basic_info" />
+              <Input placeholder="如：tag_user_behavior_20260626" />
             </Form.Item>
 
             {/* 批量模式下隐藏名称和描述输入 */}
@@ -6246,11 +6321,15 @@ export default function TagSystem() {
                       // 发送确认消息，包含完整条件信息
                       const confirmMsg = `请为以下标签生成SQL：${JSON.stringify(selected, null, 0)}`
                       setTagSuggestions([])
-                      setDimensionMessages(prev => [...prev, { role: 'user', content: '已选择标签，请生成SQL' }])
+                      setDimensionMessages(prev => [...prev, { role: 'user', content: '已选择标签，请生成逻辑' }])
                       setDimensionSending(true)
 
+                      // 创建取消控制器
+                      const abortController = new AbortController()
+                      dimensionAbortRef.current = abortController
+
                       try {
-                        const res = await tagApi.sendDimensionChatMessage(dimensionSessionId!, confirmMsg)
+                        const res = await tagApi.sendDimensionChatMessage(dimensionSessionId!, confirmMsg, abortController.signal)
                         setDimensionMessages(prev => [...prev, { role: 'assistant', content: res.data.reply }])
 
                         // 处理多个类型标签的情况
@@ -6267,9 +6346,20 @@ export default function TagSystem() {
                           setDimensionTypeDesc(tagsList.map((t: any) => t.type_name).join('、'))
                           setDimensionSql('batch')  // 标记为批量模式
                           setSqlConfirmed(true)
+                          // 使用 AI 推断的宽表名称
+                          const wideTableDisplay = res.data.wide_table_display || '标签数据'
+                          const entityName = (selectedDimension?.id_field || '').replace(/_id$/, '') || 'entity'
+                          const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+                          // 确保表名以 tag_ 开头，格式：tag_{entity}_{theme}_{date}
+                          let wideTableName = res.data.wide_table_name || `tag_${entityName}_data_${dateStr}`
+                          if (!wideTableName.startsWith('tag_')) {
+                            wideTableName = `tag_${wideTableName}`
+                          }
                           chatForm.setFieldsValue({
                             name: tagsList[0].type_name || '',
                             description: `批量创建: ${tagsList.map((t: any) => t.type_name).join('、')}`,
+                            wide_table_display: wideTableDisplay,
+                            wide_table_name: wideTableName,
                           })
                           message.success(`已生成 ${tagsList.length} 个类型标签，请选择分类后保存`)
                         } else if (res.data.is_final && res.data.tags && res.data.tags.length > 0 && res.data.sql) {
@@ -6279,17 +6369,34 @@ export default function TagSystem() {
                           setDimensionTypeDesc(res.data.type_description || '')
                           setDimensionSql(res.data.sql)
                           setSqlConfirmed(true)
+                          // 使用 AI 推断的宽表名称
+                          const typeName = res.data.type_name || '标签'
+                          const entityName = (selectedDimension?.id_field || '').replace(/_id$/, '') || 'entity'
+                          const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+                          const wideTableDisplay = res.data.wide_table_display || typeName
+                          // 确保表名以 tag_ 开头，格式：tag_{entity}_{theme}_{date}
+                          let wideTableName = res.data.wide_table_name || `tag_${entityName}_data_${dateStr}`
+                          if (!wideTableName.startsWith('tag_')) {
+                            wideTableName = `tag_${wideTableName}`
+                          }
                           chatForm.setFieldsValue({
                             name: res.data.type_name || '',
                             description: res.data.type_description || '',
+                            wide_table_display: wideTableDisplay,
+                            wide_table_name: wideTableName,
                           })
                           message.success('SQL已生成，请填写信息后保存')
                         } else if (res.data.is_final && (!res.data.tags && !res.data.dimension_tags_list)) {
                           message.warning('AI未返回完整数据，请重试')
                         }
                       } catch (e: any) {
-                        message.error('确认失败: ' + (e.response?.data?.detail || e.message))
+                        if (e.name === 'CanceledError' || e.code === 'ERR_CANCELED') {
+                          setDimensionMessages(prev => [...prev, { role: 'assistant', content: '已停止生成' }])
+                        } else {
+                          message.error('确认失败: ' + (e.response?.data?.detail || e.message))
+                        }
                       } finally {
+                        dimensionAbortRef.current = null
                         setDimensionSending(false)
                       }
                     }}
@@ -6304,9 +6411,21 @@ export default function TagSystem() {
             )}
 
             {dimensionSending && (
-              <div style={{ textAlign: 'center', padding: 8 }}>
-                <Spin size="small" />
-                <Text type="secondary" style={{ marginLeft: 8 }}>AI思考中...</Text>
+              <div style={{ textAlign: 'center', padding: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+                <span
+                  onClick={() => dimensionAbortRef.current?.abort()}
+                  style={{ cursor: 'pointer', fontSize: 18, color: '#1890ff', position: 'relative' }}
+                  className="stop-loading-btn"
+                  title="点击停止"
+                >
+                  <LoadingOutlined className="loading-icon" spin />
+                  <PauseCircleFilled className="pause-icon" style={{ position: 'absolute', left: 0, top: 0, opacity: 0 }} />
+                </span>
+                <Text type="secondary">AI思考中...</Text>
+                <style>{`
+                  .stop-loading-btn:hover .loading-icon { opacity: 0; }
+                  .stop-loading-btn:hover .pause-icon { opacity: 1 !important; color: #ff4d4f; }
+                `}</style>
               </div>
             )}
             <div ref={dimensionMessagesEndRef} />
@@ -6448,7 +6567,7 @@ export default function TagSystem() {
           setSqlConfirmed(false)
           setExtractedTags([])
           setAiStep(0)
-          setAiTabKey('single')
+          setAiTabKey('chat')
           // 重置维度相关状态
           setSelectedDimension(null)
           setDimensionSessionId(null)
@@ -6470,16 +6589,6 @@ export default function TagSystem() {
           onChange={handleTabChange}
           destroyInactiveTabPane={false}
           items={[
-            {
-              key: 'single',
-              label: (
-                <span>
-                  <TableOutlined />
-                  单表打标
-                </span>
-              ),
-              children: renderSingleTableContent(),
-            },
             {
               key: 'chat',
               label: (

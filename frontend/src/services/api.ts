@@ -368,6 +368,8 @@ export const tagApi = {
 
   // 标签维度
   listDimensions: () => api.get('/api/v1/tags/dimensions'),
+  inferDimensionIdField: (entityName: string) =>
+    api.post('/api/v1/tags/dimensions/infer-id-field', null, { params: { entity_name: entityName } }),
   createDimension: (data: { name: string; display_name: string; id_field: string; description?: string }) =>
     api.post('/api/v1/tags/dimensions', data),
   getDimension: (id: number) => api.get(`/api/v1/tags/dimensions/${id}`),
@@ -536,14 +538,21 @@ export const tagApi = {
     api.post('/api/v1/tags/chat/dimension/create', null, {
       params: { dimension_id: dimensionId, first_message: firstMessage || undefined }
     }),
-  sendDimensionChatMessage: (sessionId: string, message: string) =>
+  sendDimensionChatMessage: (sessionId: string, message: string, signal?: AbortSignal) =>
     api.post('/api/v1/tags/chat/dimension/send', null, {
-      params: { session_id: sessionId, message }
+      params: { session_id: sessionId, message },
+      signal
     }),
   getDimensionChatSession: (sessionId: string) =>
     api.get(`/api/v1/tags/chat/dimension/${sessionId}`),
   deleteDimensionChatSession: (sessionId: string) =>
     api.delete(`/api/v1/tags/chat/dimension/${sessionId}`),
+
+  // AI 推断表名
+  inferTableName: (displayName: string, entityName: string) =>
+    api.post('/api/v1/tags/infer-table-name', null, {
+      params: { display_name: displayName, entity_name: entityName }
+    }),
 
   // AI 维度定义对话
   createDimensionDefineSession: (firstMessage?: string) =>

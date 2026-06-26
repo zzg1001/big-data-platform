@@ -314,6 +314,17 @@ async def list_tag_dimensions(
     return [TagDimensionResponse.model_validate(d) for d in dimensions]
 
 
+@router.post("/dimensions/infer-id-field")
+async def infer_dimension_id_field(
+    entity_name: str,
+    current_user: User = Depends(get_current_user)
+):
+    """根据实体名称，AI推断ID字段（英文）"""
+    ai = AIAssistant()
+    result = ai.infer_entity_id_field(entity_name)
+    return result
+
+
 @router.post("/dimensions", response_model=TagDimensionResponse)
 async def create_tag_dimension(
     data: TagDimensionCreate,
@@ -345,7 +356,7 @@ async def get_tag_dimension(
     result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
     dimension = result.scalars().first()
     if not dimension:
-        raise HTTPException(status_code=404, detail="维度不存在")
+        raise HTTPException(status_code=404, detail="实体不存在")
     return TagDimensionResponse.model_validate(dimension)
 
 
@@ -364,7 +375,7 @@ async def create_wide_table(
     dim_result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
     dim = dim_result.scalars().first()
     if not dim:
-        raise HTTPException(status_code=404, detail="实体(维度)不存在")
+        raise HTTPException(status_code=404, detail="实体不存在")
 
     display_name = (payload.get("display_name") or "").strip()
     table_name = (payload.get("table_name") or "").strip()
@@ -457,7 +468,7 @@ async def preview_dimension_data(
     result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
     dimension = result.scalars().first()
     if not dimension:
-        raise HTTPException(status_code=404, detail="实体(维度)不存在")
+        raise HTTPException(status_code=404, detail="实体不存在")
     if not dimension.tag_table_name:
         return {"columns": [], "rows": [], "total": 0}
 
@@ -476,19 +487,22 @@ async def delete_tag_dimension(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """删除标签维度"""
+    """删除实体"""
     result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
     dimension = result.scalars().first()
     if not dimension:
-        raise HTTPException(status_code=404, detail="维度不存在")
+        raise HTTPException(status_code=404, detail="实体不存在")
 
-    # 检查是否有标签使用此维度
+    # 检查是否有活跃标签使用此实体
     tag_count_result = await db.execute(
-        select(func.count(TagNode.id)).filter(TagNode.dimension_id == dimension_id)
+        select(func.count(TagNode.id)).filter(
+            TagNode.dimension_id == dimension_id,
+            TagNode.is_active == True
+        )
     )
     tag_count = tag_count_result.scalar() or 0
     if tag_count > 0:
-        raise HTTPException(status_code=400, detail=f"该维度下有 {tag_count} 个标签，无法删除")
+        raise HTTPException(status_code=400, detail=f"该实体下有 {tag_count} 个标签，无法删除")
 
     await db.delete(dimension)
     await db.commit()
@@ -542,7 +556,7 @@ async def batch_create_dimension_tags(
     dimension_result = await db.execute(select(TagDimension).filter(TagDimension.id == data.dimension_id))
     dimension = dimension_result.scalars().first()
     if not dimension:
-        raise HTTPException(status_code=404, detail="维度不存在")
+        raise HTTPException(status_code=404, detail="实体不存在")
 
     # 1. 创建类型标签（包含SQL规则和所有子标签名称）
     tag_names = [tag.name for tag in data.tags]
@@ -1809,7 +1823,7 @@ async def execute_rule_tag(
         dim_result = await db.execute(select(TagDimension).filter(TagDimension.id == node.dimension_id))
         dim = dim_result.scalars().first()
         if not dim:
-            raise HTTPException(status_code=404, detail="实体(维度)不存在")
+            raise HTTPException(status_code=404, detail="实体不存在")
         id_field = dim.id_field
 
         # 宽表真实表名：优先取父节点（wide_table）的 tag_table_name（一个实体可多张宽表）
@@ -3329,7 +3343,7 @@ async def create_dimension_chat_session(
     dimension_result = await db.execute(select(TagDimension).filter(TagDimension.id == dimension_id))
     dimension = dimension_result.scalars().first()
     if not dimension:
-        raise HTTPException(status_code=404, detail="维度不存在")
+        raise HTTPException(status_code=404, detail="实体不存在")
 
     # 获取仓库连接
     engine, config = await get_warehouse_engine(db)
@@ -3507,6 +3521,27 @@ async def delete_dimension_chat_session(
     return {"message": "会话已删除"}
 
 
+@router.post("/infer-table-name")
+async def infer_table_name(
+    display_name: str,
+    entity_name: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    根据中文展示名推断英文表名
+
+    Args:
+        display_name: 中文展示名，如"行为数据"、"基础信息"
+        entity_name: 实体名称，如"user"、"order"
+
+    Returns:
+        {"theme": "behavior", "table_name": "tag_user_behavior_20260626"}
+    """
+    ai = AIAssistant()
+    result = ai.infer_table_name(display_name, entity_name)
+    return result
+
+
 # ==================== AI 维度定义对话 ====================
 
 # 维度定义会话存储
@@ -3562,7 +3597,7 @@ async def create_dimension_define_session(
     session_id = str(uuid.uuid4())
     now = datetime.now()
 
-    initial_prompt = first_message or "你好，我想定义一个新的维度"
+    initial_prompt = first_message or "你好，我想定义一个新的实体"
 
     # AI 初始分析
     ai_assistant = AIAssistant()
@@ -3646,7 +3681,7 @@ async def confirm_dimension_definition(
 
     dimension_data = session.get("defined_dimension")
     if not dimension_data:
-        raise HTTPException(status_code=400, detail="还没有确定的维度定义")
+        raise HTTPException(status_code=400, detail="还没有确定的实体定义")
 
     # 创建维度
     dimension = TagDimension(
@@ -3666,7 +3701,7 @@ async def confirm_dimension_definition(
     del _dimension_define_sessions[session_id]
 
     return {
-        "message": "维度创建成功",
+        "message": "实体创建成功",
         "dimension": TagDimensionResponse.model_validate(dimension)
     }
 
