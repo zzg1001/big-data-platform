@@ -751,9 +751,9 @@ async def list_tag_nodes(
             source_datasource_id=node.source_datasource_id,
             source_table=node.source_table,
             source_node_id=node.source_node_id,
-            ai_generated=node.ai_generated,
+            ai_generated=node.ai_generated or False,
             ai_confidence=node.ai_confidence,
-            usage_count=node.usage_count,
+            usage_count=node.usage_count or 0,
             is_active=node.is_active,
             created_at=node.created_at,
             updated_at=node.updated_at,
@@ -883,12 +883,25 @@ async def create_tag_node(
         path = f"{parent.path or ''}/{parent.id}"
         parent_name = parent.name
 
-    # 检查画布内同名（标签名在当前画布内唯一）
-    check_query = select(TagNode).filter(
-        TagNode.name == data.name,
-        TagNode.project_id == data.project_id,
-        TagNode.is_active == True
-    )
+    # 检查画布内同名（以"当前画布成员"为准，而非节点归属 project_id）
+    # 仅删成员关系移出画布的节点（仍 is_active）不应再占用画布内的名字
+    if data.project_id:
+        check_query = (
+            select(TagNode.id)
+            .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+            .filter(
+                TagNode.name == data.name,
+                TagNode.is_active == True,
+                TagNodeProject.project_id == data.project_id,
+            )
+        )
+    else:
+        # 无项目（独立创建）：在同样无项目归属的节点中检查同名
+        check_query = select(TagNode.id).filter(
+            TagNode.name == data.name,
+            TagNode.is_active == True,
+            TagNode.project_id.is_(None),
+        )
     result = await db.execute(check_query)
     if result.scalars().first():
         raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
@@ -936,9 +949,9 @@ async def create_tag_node(
         tag_table_name=node.tag_table_name,
         source_datasource_id=node.source_datasource_id,
         source_table=node.source_table,
-        ai_generated=node.ai_generated,
+        ai_generated=node.ai_generated or False,
         ai_confidence=node.ai_confidence,
-        usage_count=node.usage_count,
+        usage_count=node.usage_count or 0,
         is_active=node.is_active,
         created_at=node.created_at,
         updated_at=node.updated_at,
@@ -983,7 +996,7 @@ async def get_tag_node(
         source_datasource_id=node.source_datasource_id,
         source_table=node.source_table,
         is_active=node.is_active,
-        usage_count=node.usage_count,
+        usage_count=node.usage_count or 0,
         created_at=node.created_at,
         updated_at=node.updated_at,
         parent_name=parent_name,
@@ -1004,14 +1017,26 @@ async def update_tag_node(
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
 
-    # 如果修改了名字，检查画布内唯一性
+    # 如果修改了名字，检查画布内唯一性（以画布成员为准，而非节点归属 project_id）
     if data.name is not None and data.name != node.name:
-        check_query = select(TagNode).filter(
-            TagNode.name == data.name,
-            TagNode.id != node_id,
-            TagNode.project_id == node.project_id,
-            TagNode.is_active == True
-        )
+        if node.project_id:
+            check_query = (
+                select(TagNode.id)
+                .join(TagNodeProject, TagNodeProject.node_id == TagNode.id)
+                .filter(
+                    TagNode.name == data.name,
+                    TagNode.id != node_id,
+                    TagNode.is_active == True,
+                    TagNodeProject.project_id == node.project_id,
+                )
+            )
+        else:
+            check_query = select(TagNode.id).filter(
+                TagNode.name == data.name,
+                TagNode.id != node_id,
+                TagNode.is_active == True,
+                TagNode.project_id.is_(None),
+            )
         check_result = await db.execute(check_query)
         if check_result.scalars().first():
             raise HTTPException(status_code=400, detail="当前画布中已存在同名标签")
@@ -1069,9 +1094,9 @@ async def update_tag_node(
         tag_table_name=node.tag_table_name,
         source_datasource_id=node.source_datasource_id,
         source_table=node.source_table,
-        ai_generated=node.ai_generated,
+        ai_generated=node.ai_generated or False,
         ai_confidence=node.ai_confidence,
-        usage_count=node.usage_count,
+        usage_count=node.usage_count or 0,
         is_active=node.is_active,
         created_at=node.created_at,
         updated_at=node.updated_at,
@@ -1093,6 +1118,44 @@ async def delete_tag_node(
     node = result.scalars().first()
     if not node:
         raise HTTPException(status_code=404, detail="节点不存在")
+
+    # 删除值标签时：同步从父类型标签的逻辑里去掉该值（tag_names + full_sql 的 CASE WHEN 分支）
+    if node.node_type in ("value", "tag") and node.parent_id:
+        parent_res = await db.execute(select(TagNode).filter(TagNode.id == node.parent_id))
+        parent = parent_res.scalars().first()
+        if parent and parent.node_type == "type" and parent.rule_config:
+            try:
+                cfg = json.loads(parent.rule_config)
+            except Exception:
+                cfg = None
+            if isinstance(cfg, dict):
+                names = cfg.get("tag_names")
+                if isinstance(names, list):
+                    cfg["tag_names"] = [n for n in names if n != node.name]
+                fsql = cfg.get("full_sql")
+                if isinstance(fsql, str) and fsql and not fsql.startswith("-- AI_PROMPT:"):
+                    # 去掉一个 `WHEN <条件> THEN '该值'` 分支（限定不跨越其它 WHEN/THEN，避免误删别的分支）
+                    val = re.escape(node.name)
+                    pattern = re.compile(
+                        r"\s*WHEN(?:(?!\bWHEN\b|\bTHEN\b)[\s\S])*?\bTHEN\s*(['\"])" + val + r"\1",
+                        re.IGNORECASE,
+                    )
+                    new_sql, n = pattern.subn("", fsql, count=1)
+                    if n:
+                        cfg["full_sql"] = new_sql
+                parent.rule_config = json.dumps(cfg, ensure_ascii=False)
+                await db.flush()
+
+    # 删除宽表节点时：同时删除数仓里对应的画像宽表（真实表）
+    if node.node_type == "wide_table" and node.tag_table_name:
+        try:
+            engine, _ = await get_warehouse_engine(db)
+            with engine.connect() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS `{node.tag_table_name}`"))
+                conn.commit()
+        except Exception:
+            # 删表失败不阻断节点删除（表可能不存在或暂时不可达）
+            pass
 
     # 收集所有要删除的节点ID（包括子节点）
     all_node_ids = [node_id]
@@ -1265,6 +1328,19 @@ async def save_to_template(
     )
     if existing.scalars().first():
         raise HTTPException(status_code=400, detail="该分类已收藏到模版")
+
+    # 模版是全局有效的：同名模版不能重复（即使来自不同项目/画布）
+    dup_template = await db.execute(
+        select(TagTemplateFavorite.id)
+        .join(TagNode, TagNode.id == TagTemplateFavorite.node_id)
+        .filter(
+            TagNode.name == source_node.name,
+            TagNode.is_active == True,
+            TagTemplateFavorite.node_id != node_id,
+        )
+    )
+    if dup_template.scalars().first():
+        raise HTTPException(status_code=400, detail=f"已存在同名模版「{source_node.name}」，模版需全局唯一")
 
     # 创建收藏记录
     favorite = TagTemplateFavorite(
@@ -1580,9 +1656,9 @@ async def create_rule_tag(
         tag_table_name=node.tag_table_name,
         source_datasource_id=node.source_datasource_id,
         source_table=node.source_table,
-        ai_generated=node.ai_generated,
+        ai_generated=node.ai_generated or False,
         ai_confidence=node.ai_confidence,
-        usage_count=node.usage_count,
+        usage_count=node.usage_count or 0,
         is_active=node.is_active,
         created_at=node.created_at,
         updated_at=node.updated_at,
@@ -1876,15 +1952,39 @@ async def execute_rule_tag(
                 conn.execute(text(upsert_sql))
                 conn.commit()
 
-                count = conn.execute(text(f"SELECT COUNT(*) FROM `{entity_table}`")).scalar() or 0
+                # 宽表整体行数
+                total = conn.execute(text(f"SELECT COUNT(*) FROM `{entity_table}`")).scalar() or 0
+                # 类型标签：本列被打上值（非空）的行数 = 加了该类型条件的数量
+                type_count = conn.execute(text(
+                    f"SELECT COUNT(*) FROM `{entity_table}` WHERE `{column}` IS NOT NULL"
+                )).scalar() or 0
+                # 值标签：本列 = 该值 的行数 = 加了该值条件的数量
+                val_children = (await db.execute(select(TagNode).filter(
+                    TagNode.parent_id == node.id,
+                    TagNode.node_type.in_(("value", "tag")),
+                    TagNode.is_active == True,
+                ))).scalars().all()
+                for vc in val_children:
+                    vc.usage_count = conn.execute(text(
+                        f"SELECT COUNT(*) FROM `{entity_table}` WHERE `{column}` = :v"
+                    ), {"v": vc.name}).scalar() or 0
+                    vc.tag_table_name = entity_table
 
             node.tag_table_name = entity_table  # 类型/值标签预览复用该宽表
-            node.usage_count = count
+            node.usage_count = type_count       # 类型标签显示加条件后的数量
+            # 宽表（父节点）显示整体数量
+            if node.parent_id:
+                wt2 = (await db.execute(
+                    select(TagNode).filter(TagNode.id == node.parent_id)
+                )).scalars().first()
+                if wt2 and wt2.node_type == "wide_table":
+                    wt2.usage_count = total
+                    wt2.tag_table_name = entity_table
             await db.flush()
             return {
                 "message": "SQL规则执行成功",
                 "target_table": entity_table,
-                "row_count": count
+                "row_count": total
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"执行失败: {str(e)}")
@@ -2378,9 +2478,9 @@ async def create_row_tag_task(
         tag_table_name=node.tag_table_name,
         source_datasource_id=node.source_datasource_id,
         source_table=node.source_table,
-        ai_generated=node.ai_generated,
+        ai_generated=node.ai_generated or False,
         ai_confidence=node.ai_confidence,
-        usage_count=node.usage_count,
+        usage_count=node.usage_count or 0,
         is_active=node.is_active,
         created_at=node.created_at,
         updated_at=node.updated_at,
@@ -2708,9 +2808,9 @@ async def create_dataset_tag(
         tag_table_name=node.tag_table_name,
         source_datasource_id=node.source_datasource_id,
         source_table=node.source_table,
-        ai_generated=node.ai_generated,
+        ai_generated=node.ai_generated or False,
         ai_confidence=node.ai_confidence,
-        usage_count=node.usage_count,
+        usage_count=node.usage_count or 0,
         is_active=node.is_active,
         created_at=node.created_at,
         updated_at=node.updated_at,
@@ -2883,6 +2983,100 @@ async def create_tag_schedule(
     node = result.scalars().first()
     if not node:
         raise HTTPException(status_code=404, detail="标签节点不存在")
+
+    # 宽表（实体级）调度：把其下所有类型标签按共享实体ID JOIN 成一条大SQL，整张宽表用一个DAG
+    if node.node_type == "wide_table":
+        if not node.tag_table_name:
+            raise HTTPException(status_code=400, detail="宽表缺少真实表名，无法调度")
+        if not node.dimension_id:
+            raise HTTPException(status_code=400, detail="宽表未关联实体，无法调度")
+        dim_res = await db.execute(select(TagDimension).filter(TagDimension.id == node.dimension_id))
+        dim = dim_res.scalars().first()
+        if not dim or not dim.id_field:
+            raise HTTPException(status_code=400, detail="实体缺少ID字段，无法调度")
+        id_field = dim.id_field
+        entity_table = node.tag_table_name
+
+        # 收集子类型标签（已确认SQL的）
+        ch_res = await db.execute(select(TagNode).filter(
+            TagNode.parent_id == node.id,
+            TagNode.node_type == "type",
+            TagNode.is_active == True,
+        ))
+        sql_children = []
+        for c in ch_res.scalars().all():
+            cfg = json.loads(c.rule_config) if c.rule_config else {}
+            fsql = (cfg.get("full_sql", "") or "").strip().rstrip(";").strip()
+            if fsql and not fsql.startswith("-- AI_PROMPT:"):
+                sql_children.append((c, fsql))
+        if not sql_children:
+            raise HTTPException(status_code=400, detail="该宽表下没有可调度的类型标签（请先为类型标签生成并确认SQL）")
+
+        # 探测每个子SQL的 id 列与值列，按实体ID拼 JOIN 大SQL（每列一个子标签）
+        engine, _ = await get_warehouse_engine(db)
+        base_parts, join_parts, select_parts, seen_cols = [], [], [], set()
+        try:
+            with engine.connect() as conn:
+                for i, (c, fsql) in enumerate(sql_children):
+                    cols = list(conn.execute(text(f"SELECT * FROM ({fsql}) AS sub LIMIT 0")).keys())
+                    if not cols:
+                        continue
+                    id_col = next((x for x in cols if x != "tag_name"), cols[0])
+                    val_col = "tag_name" if "tag_name" in cols else cols[-1]
+                    col_name = c.name if c.name not in seen_cols else f"{c.name}_{c.id}"
+                    seen_cols.add(col_name)
+                    alias = f"t{i}"
+                    base_parts.append(f"SELECT `{id_col}` AS id FROM ({fsql}) AS b{i}")
+                    join_parts.append(
+                        f"LEFT JOIN (SELECT `{id_col}` AS id, MAX(`{val_col}`) AS v "
+                        f"FROM ({fsql}) AS s{i} GROUP BY `{id_col}`) AS {alias} ON {alias}.id = base.id"
+                    )
+                    select_parts.append(f"`{alias}`.`v` AS `{col_name}`")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"解析宽表子标签SQL失败: {str(e)}")
+        if not select_parts:
+            raise HTTPException(status_code=400, detail="宽表子标签SQL未输出有效列，无法调度")
+
+        big_select = (
+            f"SELECT base.id AS `{id_field}`,\n       " + ",\n       ".join(select_parts) + "\n"
+            "FROM (\n  " + "\n  UNION\n  ".join(base_parts) + "\n) AS base\n"
+            + "\n".join(join_parts)
+        )
+        sql_content = (
+            f"-- 宽表实体级调度：{node.name}（真实表 {entity_table}）\n"
+            f"-- 由 {len(select_parts)} 个类型标签按实体ID({id_field})合并为一张宽表\n"
+            f"DROP TABLE IF EXISTS `{entity_table}`;\n"
+            f"CREATE TABLE `{entity_table}` AS\n{big_select};\n"
+        )
+        description = f"宽表实体级自动调度: {node.description or node.name}"
+
+        dag_generator = DAGGenerator()
+        dag_id = f"tag_task_{node.id}"
+        existing = await db.execute(select(Schedule).filter(Schedule.dag_id == dag_id))
+        if existing.scalars().first():
+            raise HTTPException(status_code=400, detail="该任务已存在调度")
+        dag_code = dag_generator.generate_sql_dag(
+            name=dag_id, description=description, sql_content=sql_content,
+            conn_id="warehouse_default", schedule_interval=cron_expression,
+        )
+        schedule = Schedule(
+            name=f"宽表任务-{node.name}", description=description, dag_id=dag_id,
+            cron_expression=cron_expression, sql_content=sql_content, dag_code=dag_code,
+            datasource_id=node.source_datasource_id, status=ScheduleStatus.DRAFT,
+            created_by=current_user.id,
+        )
+        db.add(schedule)
+        await db.flush()
+        await db.refresh(schedule)
+        return {
+            "message": "宽表调度创建成功",
+            "schedule_id": schedule.id,
+            "dag_id": dag_id,
+            "cron_expression": cron_expression,
+            "rule_type": "wide_table",
+            "execute_endpoint": None,
+        }
+
     if node.rule_type not in ("row", "sql"):
         raise HTTPException(status_code=400, detail="该标签类型不支持调度")
 

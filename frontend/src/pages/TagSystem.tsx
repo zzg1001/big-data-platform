@@ -205,6 +205,15 @@ export default function TagSystem() {
   const toggleDimensionCollapsed = (dimId: number) => {
     setCollapsedDimensions(prev => ({ ...prev, [dimId]: !prev[dimId] }))
   }
+  // 标签页层级树：按节点 key（dim-xx / node-xx）记录收起状态，支持每个节点单独伸缩
+  const [collapsedTreeNodes, setCollapsedTreeNodes] = useState<Set<string>>(new Set())
+  const toggleTreeNode = (key: string) => {
+    setCollapsedTreeNodes(prev => {
+      const next = new Set(prev)
+      next.has(key) ? next.delete(key) : next.add(key)
+      return next
+    })
+  }
   const [detailGroupCollapsed, setDetailGroupCollapsed] = useState(false)
   const [templateGroupCollapsed, setTemplateGroupCollapsed] = useState(false)
 
@@ -1486,41 +1495,6 @@ export default function TagSystem() {
     }
   }
 
-  const handleExecute = async (task: TagTask) => {
-    setExecuting(task.id)
-    try {
-      if (task.rule_type === 'row') {
-        // 智能标签
-        const res = await tagApi.executeRowTag(task.id, {})
-        message.success(res.data?.message || '智能标签已启动，后台执行中...')
-        setTimeout(() => {
-          message.info('执行完成后可点击"预览"查看打标结果')
-        }, 2000)
-      } else if (task.rule_type === 'sql') {
-        // 规则引擎标签：先检查是否需要生成SQL
-        const ruleConfig = task.rule_config ? JSON.parse(task.rule_config) : {}
-        if (ruleConfig.full_sql?.startsWith('-- AI_PROMPT:')) {
-          // 需要先生成SQL
-          message.loading('正在生成SQL...', 0)
-          const genRes = await tagApi.generateRuleSql(task.id)
-          message.destroy()
-          if (genRes.data?.generated) {
-            message.success('SQL已生成，正在执行...')
-          }
-        }
-        // 执行规则引擎
-        const res = await tagApi.executeRuleTag(task.id)
-        message.success(`执行成功！已生成 ${res.data?.row_count || 0} 条数据`)
-      }
-      loadTasks()
-    } catch (error: any) {
-      message.destroy()
-      message.error(error.response?.data?.detail || '执行失败')
-    } finally {
-      setExecuting(null)
-    }
-  }
-
   const handlePreview = async (task: TagTask) => {
     setPreviewLoading(true)
     setPreviewVisible(true)
@@ -2142,27 +2116,16 @@ export default function TagSystem() {
       },
       {
         title: '类型',
-        dataIndex: 'rule_type',
-        key: 'rule_type',
-        width: 80,
-        render: (type: string, record: TagTask) => {
-          // 宽表行
-          if (record.node_type === 'wide_table') {
-            return <Tag color="purple" style={{ margin: 0 }}>宽表</Tag>
-          }
-          // 值标签显示"值标签"
-          if (record.node_type === 'value' || record.node_type === 'tag') {
-            return <Tag color="green" style={{ margin: 0 }}>值标签</Tag>
-          }
-          // 类型标签显示"类型标签"
-          if (record.node_type === 'type') {
-            return <Tag color="blue" style={{ margin: 0 }}>类型标签</Tag>
-          }
-          return (
-            <Tag color="default" style={{ margin: 0 }}>
-              {type || '-'}
-            </Tag>
-          )
+        dataIndex: 'dimension_id',
+        key: 'dimension_id',
+        width: 120,
+        ellipsis: true,
+        render: (_dimId: number, record: TagTask) => {
+          // 显示该任务所属实体的名称
+          const dim = dimensions.find(d => d.id === record.dimension_id)
+          return dim
+            ? <Tag color="orange" style={{ margin: 0 }}>{dim.display_name}</Tag>
+            : <span style={{ color: '#999' }}>-</span>
         },
       },
       {
@@ -2179,7 +2142,7 @@ export default function TagSystem() {
         key: 'usage_count',
         width: 70,
         align: 'center' as const,
-        render: (count: number, record: TagTask) => record.node_type === 'wide_table' ? '-' : count,
+        render: (count: number) => (count ?? 0),
       },
       {
         title: '创建时间',
@@ -2195,7 +2158,8 @@ export default function TagSystem() {
         width: 80,
         align: 'center' as const,
         render: (isScheduled: boolean, record: TagTask) => (
-          record.node_type === 'wide_table' ? '-' : isScheduled ? (
+          // 只有宽表任务有上线状态，子节点（类型/值标签）不显示状态
+          record.node_type !== 'wide_table' ? '-' : isScheduled ? (
             <Tag color="success" style={{ margin: 0 }}>已上线</Tag>
           ) : (
             <Tag color="default" style={{ margin: 0 }}>未上线</Tag>
@@ -2208,10 +2172,16 @@ export default function TagSystem() {
         width: 160,
         fixed: 'right' as const,
         render: (_: any, record: TagTask) => {
-          // 宽表行：执行=跑全部类型标签进真实表；预览=看宽表；删除=删整张宽表（无调度）
-          if (record.node_type === 'wide_table') {
-            return (
-              <Space size={4}>
+          const isWide = record.node_type === 'wide_table'
+          const canSchedule = currentView === 'ai' || currentView === 'sql' || currentView === 'composite'
+          // 每个动作占一个固定宽度的槽位，缺失的动作用空槽占位，保证各行图标对齐
+          const slot = (node: React.ReactNode) => (
+            <span style={{ display: 'inline-flex', width: 28, justifyContent: 'center' }}>{node}</span>
+          )
+          return (
+            <Space size={0} style={{ display: 'flex', justifyContent: 'center' }}>
+              {/* 执行（仅宽表） */}
+              {slot(isWide ? (
                 <Tooltip title="执行（生成该实体所有标签到画像宽表）">
                   <Button
                     type="link"
@@ -2219,18 +2189,48 @@ export default function TagSystem() {
                     icon={<PlayCircleOutlined />}
                     loading={executing === record.id}
                     onClick={() => handleExecuteEntity(record)}
-                    style={{ padding: '0 4px' }}
+                    style={{ padding: 0 }}
                   />
                 </Tooltip>
-                <Tooltip title="预览画像宽表">
+              ) : null)}
+              {/* 预览 / 查看 */}
+              {slot(
+                <Tooltip title={isWide ? '预览画像宽表' : '查看'}>
                   <Button
                     type="link"
                     size="small"
                     icon={<EyeOutlined />}
-                    onClick={() => handlePreviewEntity(record)}
-                    style={{ padding: '0 4px' }}
+                    onClick={() => isWide ? handlePreviewEntity(record) : handlePreview(record)}
+                    style={{ padding: 0 }}
                   />
                 </Tooltip>
+              )}
+              {/* 上线 / 下线（仅宽表） */}
+              {slot(isWide && canSchedule ? (
+                record.is_scheduled ? (
+                  <Tooltip title="前往调度管理下线">
+                    <Button
+                      type="link"
+                      size="small"
+                      icon={<ScheduleOutlined />}
+                      onClick={() => navigate('/scheduler')}
+                      style={{ color: '#52c41a', padding: 0 }}
+                    />
+                  </Tooltip>
+                ) : (
+                  <Tooltip title="上线">
+                    <Button
+                      type="link"
+                      size="small"
+                      icon={<ScheduleOutlined />}
+                      onClick={() => handleOpenSchedule(record)}
+                      style={{ padding: 0 }}
+                    />
+                  </Tooltip>
+                )
+              ) : null)}
+              {/* 删除（仅宽表） */}
+              {slot(isWide ? (
                 <Tooltip title="删除该实体的标签任务">
                   <Button
                     type="link"
@@ -2238,75 +2238,10 @@ export default function TagSystem() {
                     danger
                     icon={<DeleteOutlined />}
                     onClick={() => handleDeleteEntity(record)}
-                    style={{ padding: '0 4px' }}
+                    style={{ padding: 0 }}
                   />
                 </Tooltip>
-              </Space>
-            )
-          }
-          // 值标签禁用执行和调度按钮（只有没有独立SQL规则的值标签才禁用）
-          // node_type === 'value' 是AI打标生成的子标签，没有独立SQL
-          // node_type === 'tag' 且 rule_type === 'sql' 是规则引擎创建的，有独立SQL，可以执行
-          const isValueTag = record.node_type === 'value' || (record.node_type === 'tag' && record.rule_type !== 'sql')
-          return (
-            <Space size={4}>
-              {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
-                <Tooltip title={isValueTag ? '值标签不支持执行' : '执行'}>
-                  <Button
-                    type="link"
-                    size="small"
-                    icon={<PlayCircleOutlined />}
-                    loading={executing === record.id}
-                    disabled={isValueTag}
-                    onClick={() => handleExecute(record)}
-                    style={{ padding: '0 4px' }}
-                  />
-                </Tooltip>
-              )}
-              <Tooltip title="预览">
-                <Button
-                  type="link"
-                  size="small"
-                  icon={<EyeOutlined />}
-                  onClick={() => handlePreview(record)}
-                  style={{ padding: '0 4px' }}
-                />
-              </Tooltip>
-              {(currentView === 'ai' || currentView === 'sql' || currentView === 'composite') && (
-                record.is_scheduled ? (
-                  <Tooltip title="前往调度管理下线">
-                    <Button
-                      type="link"
-                      size="small"
-                      icon={<ScheduleOutlined />}
-                      disabled={isValueTag}
-                      onClick={() => navigate('/scheduler')}
-                      style={{ color: isValueTag ? undefined : '#52c41a', padding: '0 4px' }}
-                    />
-                  </Tooltip>
-                ) : (
-                  <Tooltip title={isValueTag ? '值标签不支持调度' : '上线'}>
-                    <Button
-                      type="link"
-                      size="small"
-                      icon={<ScheduleOutlined />}
-                      disabled={isValueTag}
-                      onClick={() => handleOpenSchedule(record)}
-                      style={{ padding: '0 4px' }}
-                    />
-                  </Tooltip>
-                )
-              )}
-              <Tooltip title="删除">
-                <Button
-                  type="link"
-                  size="small"
-                  danger
-                  icon={<DeleteOutlined />}
-                  onClick={() => handleDeleteTask(record.id, record.name)}
-                  style={{ padding: '0 4px' }}
-                />
-              </Tooltip>
+              ) : null)}
             </Space>
           )
         },
@@ -2914,7 +2849,10 @@ export default function TagSystem() {
     }
 
     // 渲染单个标签节点
-    const renderTagNode = (tag: any, color: string, isLast: boolean = false, level: number = 0) => (
+    const renderTagNode = (tag: any, color: string) => {
+      // 填充色：优先用标签自身颜色，否则用类型默认色
+      const fill = tag.color || color
+      return (
       <Dropdown
         key={tag.id}
         trigger={['contextMenu']}
@@ -2931,9 +2869,9 @@ export default function TagSystem() {
             display: 'inline-flex',
             alignItems: 'center',
             padding: '6px 12px',
-            background: '#fff',
-            border: `1px solid ${color}20`,
-            borderLeft: `3px solid ${color}`,
+            background: `${fill}1f`,
+            border: `1px solid ${fill}40`,
+            borderLeft: `3px solid ${fill}`,
             borderRadius: 6,
             fontSize: 13,
             cursor: 'pointer',
@@ -2941,13 +2879,13 @@ export default function TagSystem() {
             boxShadow: '0 1px 2px rgba(0,0,0,0.03)',
           }}
           onMouseEnter={(e) => {
-            e.currentTarget.style.background = `${color}08`
-            e.currentTarget.style.borderColor = `${color}40`
+            e.currentTarget.style.background = `${fill}33`
+            e.currentTarget.style.borderColor = `${fill}66`
             e.currentTarget.style.transform = 'translateX(2px)'
           }}
           onMouseLeave={(e) => {
-            e.currentTarget.style.background = '#fff'
-            e.currentTarget.style.borderColor = `${color}20`
+            e.currentTarget.style.background = `${fill}1f`
+            e.currentTarget.style.borderColor = `${fill}40`
             e.currentTarget.style.transform = 'none'
           }}
           onClick={() => handleViewTagDetail(tag)}
@@ -2956,9 +2894,9 @@ export default function TagSystem() {
             width: 8,
             height: 8,
             borderRadius: '50%',
-            background: tag.color || color,
+            background: fill,
             marginRight: 8,
-            boxShadow: `0 0 0 2px ${color}20`
+            boxShadow: `0 0 0 2px ${fill}33`
           }} />
           <span style={{ fontWeight: 500 }}>{tag.name}</span>
           {tag.node_type === 'wide_table' && (
@@ -2975,101 +2913,142 @@ export default function TagSystem() {
           )}
         </div>
       </Dropdown>
-    )
+      )
+    }
 
-    // 渲染树形节点（带连线）
-    const renderTreeNode = (tag: any, color: string, isLast: boolean = false, parentColor?: string) => {
-      const hasChildren = tag.children && tag.children.length > 0
-      const nodeColor = tag.node_type === 'wide_table' ? '#722ed1' :
-                       tag.node_type === 'type' ? '#1890ff' : '#52c41a'
+    // 递归渲染层级树节点（带连线 + 每个节点可单独伸缩）
+    const renderTreeBranch = (node: any) => {
+      const children = node.children || []
+      const hasChildren = children.length > 0
+      const nodeColor = node.node_type === 'wide_table' ? '#722ed1' :
+                        node.node_type === 'type' ? '#1890ff' : '#52c41a'
+      const key = `node-${node.id}`
+      const collapsed = collapsedTreeNodes.has(key)
 
       return (
-        <div key={tag.id} style={{ position: 'relative' }}>
-          {/* 当前节点 */}
-          <div style={{ display: 'flex', alignItems: 'flex-start', marginBottom: hasChildren ? 0 : 12 }}>
-            {renderTagNode(tag, nodeColor, isLast)}
+        <div key={key} style={{ position: 'relative' }}>
+          {/* 当前节点：伸缩按钮 + 标签 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            {hasChildren ? (
+              <CaretRightOutlined
+                style={{
+                  fontSize: 10,
+                  color: nodeColor,
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                  transition: 'transform 0.2s',
+                  transform: collapsed ? 'rotate(0deg)' : 'rotate(90deg)',
+                }}
+                onClick={(e) => { e.stopPropagation(); toggleTreeNode(key) }}
+              />
+            ) : (
+              <span style={{ width: 10, flexShrink: 0 }} />
+            )}
+            {renderTagNode(node, nodeColor)}
           </div>
 
           {/* 子节点 */}
-          {hasChildren && (
+          {hasChildren && !collapsed && (
             <div style={{
-              marginLeft: 20,
+              marginLeft: 14,
               marginTop: 8,
-              paddingLeft: 20,
-              borderLeft: `2px dashed ${nodeColor}30`,
-              position: 'relative'
+              paddingLeft: 16,
+              borderLeft: `2px solid ${nodeColor}25`,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
             }}>
-              {tag.children.map((child: any, idx: number) => {
-                const isLastChild = idx === tag.children.length - 1
-                const childColor = child.node_type === 'type' ? '#1890ff' : '#52c41a'
-                const childHasChildren = child.children && child.children.length > 0
+              {children.map((child: any) => (
+                <div key={child.id} style={{ position: 'relative' }}>
+                  {/* 横向连线 */}
+                  <div style={{
+                    position: 'absolute',
+                    left: -16,
+                    top: 13,
+                    width: 14,
+                    height: 2,
+                    background: `${nodeColor}25`,
+                  }} />
+                  {renderTreeBranch(child)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )
+    }
 
-                return (
-                  <div key={child.id} style={{ position: 'relative', marginBottom: childHasChildren ? 0 : 8 }}>
-                    {/* 横向连线 */}
-                    <div style={{
-                      position: 'absolute',
-                      left: -20,
-                      top: 14,
-                      width: 16,
-                      height: 2,
-                      background: `${nodeColor}30`,
-                    }} />
-                    {/* 连接点 */}
-                    <div style={{
-                      position: 'absolute',
-                      left: -24,
-                      top: 10,
-                      width: 8,
-                      height: 8,
-                      borderRadius: '50%',
-                      background: '#fff',
-                      border: `2px solid ${nodeColor}50`,
-                    }} />
+    // 渲染一个实体列（实体为根节点，向下分支宽表/类型/值，整体可伸缩）
+    const renderEntityColumn = (group: any) => {
+      const dimKey = `dim-${group.dimension?.id ?? 'none'}`
+      const collapsed = collapsedTreeNodes.has(dimKey)
+      const rootNodes = [...group.wideTables, ...group.independentTypes]
+      const entityColor = group.dimension ? '#722ed1' : '#fa8c16'
 
-                    {/* 子节点内容 */}
-                    <div style={{ display: 'flex', alignItems: 'flex-start' }}>
-                      {renderTagNode(child, childColor, isLastChild)}
-                    </div>
+      return (
+        <div
+          key={group.dimension?.id || 'unassigned'}
+          style={{
+            flex: '0 0 auto',
+            minWidth: 280,
+            padding: 16,
+            background: group.dimension ? '#fafafa' : '#fff8f0',
+            borderRadius: 8,
+            border: `1px solid ${group.dimension ? '#f0f0f0' : '#ffe7ba'}`,
+            alignSelf: 'flex-start',
+          }}
+        >
+          {/* 实体根节点 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {rootNodes.length > 0 ? (
+              <CaretRightOutlined
+                style={{
+                  fontSize: 11,
+                  color: entityColor,
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                  transition: 'transform 0.2s',
+                  transform: collapsed ? 'rotate(0deg)' : 'rotate(90deg)',
+                }}
+                onClick={() => toggleTreeNode(dimKey)}
+              />
+            ) : (
+              <span style={{ width: 11, flexShrink: 0 }} />
+            )}
+            <span style={{ width: 9, height: 9, borderRadius: '50%', background: entityColor, flexShrink: 0 }} />
+            <span style={{ fontSize: 14, fontWeight: 600, color: entityColor }}>
+              {group.dimension ? group.dimension.display_name : '未分配实体'}
+            </span>
+            <Tag color={group.dimension ? 'purple' : 'orange'} style={{ margin: 0, fontSize: 10, padding: '0 4px', lineHeight: '16px' }}>
+              实体
+            </Tag>
+            <span style={{ fontSize: 11, color: '#999' }}>({rootNodes.length})</span>
+          </div>
 
-                    {/* 孙节点（值标签） */}
-                    {childHasChildren && (
-                      <div style={{
-                        marginLeft: 20,
-                        marginTop: 8,
-                        paddingLeft: 20,
-                        borderLeft: `2px dashed ${childColor}30`,
-                      }}>
-                        {child.children.map((grandChild: any, gIdx: number) => (
-                          <div key={grandChild.id} style={{ position: 'relative', marginBottom: 8 }}>
-                            {/* 横向连线 */}
-                            <div style={{
-                              position: 'absolute',
-                              left: -20,
-                              top: 14,
-                              width: 16,
-                              height: 2,
-                              background: `${childColor}30`,
-                            }} />
-                            {/* 连接点 */}
-                            <div style={{
-                              position: 'absolute',
-                              left: -24,
-                              top: 10,
-                              width: 8,
-                              height: 8,
-                              borderRadius: '50%',
-                              background: '#fff',
-                              border: `2px solid ${childColor}50`,
-                            }} />
-                            {renderTagNode(grandChild, '#52c41a', gIdx === child.children.length - 1)}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
+          {/* 实体下：每个宽表/独立类型各占一列，横向排列 */}
+          {!collapsed && rootNodes.length > 0 && (
+            <div style={{
+              marginTop: 12,
+              display: 'flex',
+              flexWrap: 'nowrap',
+              alignItems: 'flex-start',
+              gap: 12,
+            }}>
+              {rootNodes.map((node: any) => (
+                <div
+                  key={node.id}
+                  style={{
+                    flex: '0 0 auto',
+                    minWidth: 200,
+                    padding: 12,
+                    background: node.node_type === 'wide_table' ? '#faf5ff' : '#f6f9ff',
+                    borderRadius: 6,
+                    border: `1px solid ${node.node_type === 'wide_table' ? '#efdbff' : '#e6f0ff'}`,
+                  }}
+                >
+                  {renderTreeBranch(node)}
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -3153,72 +3132,8 @@ export default function TagSystem() {
           </div>
 
           {filteredDimGroups.length > 0 ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-              {filteredDimGroups.map((group, gIdx) => (
-                <div key={group.dimension?.id || 'unassigned'} style={{
-                  padding: 16,
-                  background: group.dimension ? '#fafafa' : '#fff8f0',
-                  borderRadius: 8,
-                  border: `1px solid ${group.dimension ? '#f0f0f0' : '#ffe7ba'}`
-                }}>
-                  {/* 维度标题 */}
-                  <div style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    marginBottom: 16,
-                    paddingBottom: 12,
-                    borderBottom: `1px dashed ${group.dimension ? '#e8e8e8' : '#ffd591'}`
-                  }}>
-                    <div style={{
-                      width: 4,
-                      height: 20,
-                      borderRadius: 2,
-                      background: group.dimension ? '#fa8c16' : '#999'
-                    }} />
-                    <span style={{
-                      fontSize: 14,
-                      fontWeight: 600,
-                      color: group.dimension ? '#fa8c16' : '#999'
-                    }}>
-                      {group.dimension ? group.dimension.display_name : '未分配实体'}
-                    </span>
-                    {group.dimension && (
-                      <span style={{ fontSize: 11, color: '#999' }}>({group.dimension.id_field})</span>
-                    )}
-                    <span style={{ fontSize: 12, color: '#999', marginLeft: 'auto' }}>
-                      {group.wideTables.length + group.independentTypes.length} 个标签组
-                    </span>
-                  </div>
-
-                  {/* 该维度下的宽表和独立类型标签 */}
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                    {/* 宽表 */}
-                    {group.wideTables.map((wideTable, idx) => (
-                      <div key={wideTable.id} style={{
-                        padding: 12,
-                        background: '#fff',
-                        borderRadius: 6,
-                        border: '1px solid #f0f0f0'
-                      }}>
-                        {renderTreeNode(wideTable, '#722ed1', idx === group.wideTables.length - 1)}
-                      </div>
-                    ))}
-
-                    {/* 独立类型标签 */}
-                    {group.independentTypes.map((typeTag, idx) => (
-                      <div key={typeTag.id} style={{
-                        padding: 12,
-                        background: '#f6f9ff',
-                        borderRadius: 6,
-                        border: '1px solid #e6f0ff'
-                      }}>
-                        {renderTreeNode(typeTag, '#1890ff', idx === group.independentTypes.length - 1)}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
+            <div style={{ display: 'flex', flexWrap: 'nowrap', gap: 20, alignItems: 'flex-start', overflowX: 'auto', paddingBottom: 8 }}>
+              {filteredDimGroups.map((group) => renderEntityColumn(group))}
             </div>
           ) : (
             <Empty description="暂无实体标签" image={Empty.PRESENTED_IMAGE_SIMPLE} />
@@ -4261,24 +4176,24 @@ export default function TagSystem() {
                         onClick={() => handleViewTagDetail(tag)}
                         style={{
                           padding: '6px 10px',
-                          background: '#fff',
+                          background: `${tag.color || '#1890ff'}1f`,
                           borderRadius: 6,
                           fontSize: 12,
                           cursor: 'pointer',
                           display: 'flex',
                           alignItems: 'center',
                           gap: 6,
-                          border: '1px solid #d9d9d9',
+                          border: `1px solid ${tag.color || '#1890ff'}40`,
                           transition: 'all 0.2s',
                         }}
                         onMouseEnter={(e) => {
-                          e.currentTarget.style.background = '#e6f4ff'
-                          e.currentTarget.style.borderColor = '#1890ff'
+                          e.currentTarget.style.background = `${tag.color || '#1890ff'}33`
+                          e.currentTarget.style.borderColor = `${tag.color || '#1890ff'}66`
                           e.currentTarget.style.boxShadow = '0 2px 4px rgba(24,144,255,0.2)'
                         }}
                         onMouseLeave={(e) => {
-                          e.currentTarget.style.background = '#fff'
-                          e.currentTarget.style.borderColor = '#d9d9d9'
+                          e.currentTarget.style.background = `${tag.color || '#1890ff'}1f`
+                          e.currentTarget.style.borderColor = `${tag.color || '#1890ff'}40`
                           e.currentTarget.style.boxShadow = 'none'
                         }}
                       >
@@ -4720,23 +4635,23 @@ export default function TagSystem() {
                           }}
                           style={{
                             padding: '6px 10px',
-                            background: '#fff',
+                            background: `${tag.color || '#722ed1'}1f`,
                             borderRadius: 4,
                             fontSize: 11,
                             cursor: 'grab',
                             display: 'flex',
                             alignItems: 'center',
                             gap: 6,
-                            border: '1px solid #d3adf7',
+                            border: `1px solid ${tag.color || '#722ed1'}40`,
                             transition: 'all 0.2s',
                           }}
                           onMouseEnter={(e) => {
-                            e.currentTarget.style.borderColor = '#722ed1'
-                            e.currentTarget.style.background = '#f9f0ff'
+                            e.currentTarget.style.borderColor = `${tag.color || '#722ed1'}66`
+                            e.currentTarget.style.background = `${tag.color || '#722ed1'}33`
                           }}
                           onMouseLeave={(e) => {
-                            e.currentTarget.style.borderColor = '#d3adf7'
-                            e.currentTarget.style.background = '#fff'
+                            e.currentTarget.style.borderColor = `${tag.color || '#722ed1'}40`
+                            e.currentTarget.style.background = `${tag.color || '#722ed1'}1f`
                           }}
                           onClick={() => (tag.rule_type || tag.node_type === 'value' || tag.node_type === 'tag' || tag.node_type === 'wide_table') ? handleViewTagDetail(tag) : handleEditTag(tag)}
                         >
@@ -4839,23 +4754,23 @@ export default function TagSystem() {
                           }}
                           style={{
                             padding: '6px 10px',
-                            background: '#fff',
+                            background: `${fav.color || '#13c2c2'}1f`,
                             borderRadius: 4,
                             fontSize: 11,
                             cursor: 'grab',
                             display: 'flex',
                             alignItems: 'center',
                             gap: 6,
-                            border: '1px solid #87e8de',
+                            border: `1px solid ${fav.color || '#13c2c2'}40`,
                             transition: 'all 0.2s',
                           }}
                           onMouseEnter={(e) => {
-                            e.currentTarget.style.borderColor = '#13c2c2'
-                            e.currentTarget.style.background = '#e6fffb'
+                            e.currentTarget.style.borderColor = `${fav.color || '#13c2c2'}66`
+                            e.currentTarget.style.background = `${fav.color || '#13c2c2'}33`
                           }}
                           onMouseLeave={(e) => {
-                            e.currentTarget.style.borderColor = '#87e8de'
-                            e.currentTarget.style.background = '#fff'
+                            e.currentTarget.style.borderColor = `${fav.color || '#13c2c2'}40`
+                            e.currentTarget.style.background = `${fav.color || '#13c2c2'}1f`
                           }}
                         >
                           <div style={{
@@ -8378,8 +8293,8 @@ export default function TagSystem() {
               <div><Text type="secondary">任务名称：</Text>{schedulingTask?.name}</div>
               <div><Text type="secondary">源表：</Text>{schedulingTask?.source_table || '-'}</div>
               <div><Text type="secondary">类型：</Text>
-                <Tag color={schedulingTask?.rule_type === 'sql' ? 'green' : 'blue'} style={{ marginLeft: 4 }}>
-                  {schedulingTask?.rule_type === 'sql' ? '规则引擎' : schedulingTask?.rule_type === 'row' ? 'AI打标' : schedulingTask?.rule_type}
+                <Tag color={schedulingTask?.node_type === 'wide_table' ? 'purple' : schedulingTask?.rule_type === 'sql' ? 'green' : 'blue'} style={{ marginLeft: 4 }}>
+                  {schedulingTask?.node_type === 'wide_table' ? '宽表' : schedulingTask?.rule_type === 'sql' ? '规则引擎' : schedulingTask?.rule_type === 'row' ? 'AI打标' : schedulingTask?.rule_type}
                 </Tag>
               </div>
             </div>
