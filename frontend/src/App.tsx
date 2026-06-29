@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate } from 'react-router-dom'
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useAuthStore } from './stores/authStore'
 import MainLayout from './layouts/MainLayout'
 import Login from './pages/Login'
@@ -19,7 +19,13 @@ import DataService from './pages/DataService'
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuthStore()
-  return isAuthenticated ? <>{children}</> : <Navigate to="/login" />
+  const location = useLocation()
+  if (isAuthenticated) {
+    return <>{children}</>
+  }
+  // 未登录时记录当前页面，登录成功后回到该页面
+  const redirect = encodeURIComponent(location.pathname + location.search + location.hash)
+  return <Navigate to={`/login?redirect=${redirect}`} replace />
 }
 
 function App() {

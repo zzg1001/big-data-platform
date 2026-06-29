@@ -8,6 +8,16 @@ const api = axios.create({
   },
 })
 
+// 构造带 redirect 参数的登录地址：登录成功后可回到当前页面
+// 已经在登录页则不附加 redirect，避免登录后回到登录页
+function buildLoginUrl(): string {
+  const current = window.location.pathname + window.location.search + window.location.hash
+  if (window.location.pathname === '/login') {
+    return '/login'
+  }
+  return `/login?redirect=${encodeURIComponent(current)}`
+}
+
 // Request interceptor to add auth token
 api.interceptors.request.use(
   async (config) => {
@@ -45,7 +55,7 @@ api.interceptors.response.use(
           refreshToken: null,
           isAuthenticated: false,
         })
-        window.location.href = '/login'
+        window.location.href = buildLoginUrl()
         return Promise.reject(error)
       }
 
@@ -67,7 +77,7 @@ api.interceptors.response.use(
           refreshToken: null,
           isAuthenticated: false,
         })
-        window.location.href = '/login'
+        window.location.href = buildLoginUrl()
       }
     }
 

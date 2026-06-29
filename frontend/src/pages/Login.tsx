@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Form, Input, Button, Card, message, Typography } from 'antd'
 import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
@@ -9,6 +9,7 @@ const { Title } = Typography
 export default function Login() {
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { login } = useAuthStore()
 
   const onFinish = async (values: { username: string; password: string }) => {
@@ -16,7 +17,9 @@ export default function Login() {
     try {
       await login(values.username, values.password)
       message.success('登录成功')
-      navigate('/')
+      // 登录成功后回到超时前的页面（若无则回首页）
+      const redirect = searchParams.get('redirect')
+      navigate(redirect || '/', { replace: true })
     } catch (error: any) {
       message.error(error.response?.data?.detail || '登录失败')
     } finally {
