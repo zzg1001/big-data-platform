@@ -3,7 +3,6 @@ import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { Layout, Menu, Avatar, Dropdown, Button, theme } from 'antd'
 import {
   DatabaseOutlined,
-  FileOutlined,
   ScheduleOutlined,
   SettingOutlined,
   UserOutlined,
@@ -42,7 +41,6 @@ const menuItems = [
       { key: '/bigdata/etl-tasks', icon: <SyncOutlined />, label: 'ETL任务' },
     ],
   },
-  { key: '/bigdata/files', icon: <FileOutlined />, label: '文件管理' },
   { key: '/bigdata/scheduler', icon: <ScheduleOutlined />, label: '调度管理' },
   { key: '/bigdata/dw-layers', icon: <AppstoreOutlined />, label: '平台数据库层级' },
   { key: '/bigdata/admin', icon: <SettingOutlined />, label: '系统管理' },

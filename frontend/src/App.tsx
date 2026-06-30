@@ -8,7 +8,6 @@ import TagLayouts from './pages/TagLayouts'
 import Scheduler from './pages/Scheduler'
 import Dashboard from './pages/Dashboard'
 import DataSources from './pages/DataSources'
-import FileManager from './pages/FileManager'
 import DataSync from './pages/DataSync'
 import FieldTemplates from './pages/FieldTemplates'
 import DataExplorer from './pages/DataExplorer'
@@ -82,7 +81,6 @@ function App() {
       >
         <Route index element={<Dashboard />} />
         <Route path="datasources" element={<DataSources />} />
-        <Route path="files" element={<FileManager />} />
         <Route path="data-sync" element={<DataSync />} />
         <Route path="field-templates" element={<FieldTemplates />} />
         <Route path="data-explorer" element={<DataExplorer />} />

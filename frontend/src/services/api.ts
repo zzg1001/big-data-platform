@@ -124,21 +124,6 @@ export const queryApi = {
   getHistory: (limit?: number) => api.get('/api/v1/queries/history', { params: { limit } }),
 }
 
-export const fileApi = {
-  upload: (file: File) => {
-    const formData = new FormData()
-    formData.append('file', file)
-    return api.post('/api/v1/files/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
-  },
-  list: () => api.get('/api/v1/files/'),
-  preview: (id: number, rows?: number) =>
-    api.get(`/api/v1/files/${id}/preview`, { params: { rows } }),
-  delete: (id: number) => api.delete(`/api/v1/files/${id}`),
-  import: (id: number, data: any) => api.post(`/api/v1/files/${id}/import`, data),
-}
-
 export const scheduleApi = {
   list: () => api.get('/api/v1/schedules/'),
   get: (id: number) => api.get(`/api/v1/schedules/${id}`),
