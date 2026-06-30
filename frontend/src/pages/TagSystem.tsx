@@ -268,8 +268,30 @@ export default function TagSystem() {
   const [dimensionTypeName, setDimensionTypeName] = useState('')
   const [dimensionTypeDesc, setDimensionTypeDesc] = useState('')
   const [dimensionSql, setDimensionSql] = useState('')
+  // 编辑模式：从标签树点击已有「类型标签(type)」进入维度对话修改打标逻辑时，记录被编辑的节点
+  const [editingTypeNode, setEditingTypeNode] = useState<{
+    id: number
+    name: string
+    description?: string
+    fullSql: string
+    ruleConfig: any  // 原 rule_config 解析结果，回写时合并而非覆盖
+    valueTags: { id: number; name: string; description?: string }[]  // 现有 value 子标签
+    dimensionId?: number
+  } | null>(null)
+  // 宽表编辑字段模式：从宽表节点点「AI 编辑字段」进入，保存时删除原有全部类型标签并按 AI 全集重建
+  const [editingWideTable, setEditingWideTable] = useState<{
+    id: number
+    name: string
+    dimensionId?: number
+    typeChildIds: number[]  // 现有类型标签节点 id，保存时删除（后端级联删其值标签）
+    typeCount: number       // 现有字段数，用于防误删校验
+  } | null>(null)
+  // AI 对话弹窗尺寸（可拖拽右下角缩放）
+  const [aiModalSize, setAiModalSize] = useState<{ width: number; height: number }>({ width: 950, height: 480 })
   const dimensionMessagesEndRef = useRef<HTMLDivElement>(null)
   const dimensionAbortRef = useRef<AbortController | null>(null)
+  // 宽表编辑字段时，缓存进入对话前的现有字段全集，用于首次发送注入上下文
+  const wideTableFieldsCtxRef = useRef<{ name: string; description?: string; fullSql: string; values: { name: string; description?: string }[] }[]>([])
   // 标签建议勾选
   interface TagValue { name: string; description: string; condition?: string; selected: boolean }
   interface TagSuggestion { type_name: string; type_description: string; field?: string; values: TagValue[]; selected: boolean }
@@ -1374,6 +1396,145 @@ export default function TagSystem() {
             return
           }
 
+          // 编辑模式：更新已有 type 节点的打标逻辑 + 同步 value 子标签，而非新建宽表
+          if (editingTypeNode) {
+            if (!dimensionSql || dimensionSql === 'batch') {
+              message.error('请先在对话中点「确认修改」生成修改后的SQL，再保存')
+              return
+            }
+            // 1. 更新父 type 节点：合并原 rule_config，仅替换 full_sql
+            await tagApi.updateNode(editingTypeNode.id, {
+              name: values.name || editingTypeNode.name,
+              description: values.description ?? editingTypeNode.description,
+              rule_config: JSON.stringify({
+                ...editingTypeNode.ruleConfig,
+                full_sql: dimensionSql,
+              }),
+            })
+
+            // 2. 同步 value 子标签（按 name 作为匹配键做增/删/改）
+            const newTags = dimensionTags as { name: string; description?: string }[]
+            const oldByName = new Map(editingTypeNode.valueTags.map(t => [t.name, t]))
+            const newNames = new Set(newTags.map(t => t.name))
+            let added = 0, removed = 0
+            // 新增 / 更新
+            for (const nt of newTags) {
+              const old = oldByName.get(nt.name)
+              if (!old) {
+                await tagApi.createNode({
+                  name: nt.name,
+                  description: nt.description,
+                  node_type: 'tag',  // 类型(type)节点下的子节点必须是 'tag'（后端层级校验）
+                  parent_id: editingTypeNode.id,
+                })
+                added++
+              } else if ((nt.description || '') !== (old.description || '')) {
+                await tagApi.updateNode(old.id, { description: nt.description })
+              }
+            }
+            // 删除：旧的不在新列表里的（容忍已删的 404）
+            for (const old of editingTypeNode.valueTags) {
+              if (!newNames.has(old.name)) {
+                try {
+                  await tagApi.deleteNode(old.id)
+                  removed++
+                } catch (e: any) {
+                  if (e.response?.status !== 404) throw e
+                }
+              }
+            }
+
+            message.success(`已更新类型标签「${values.name || editingTypeNode.name}」（新增 ${added}、删除 ${removed} 个值标签）`)
+            setModalVisible(false)
+            setEditingTypeNode(null)
+            // 重置维度相关状态
+            setSelectedDimension(null)
+            setDimensionSessionId(null)
+            setDimensionMessages([])
+            setDimensionTags([])
+            setDimensionTypeName('')
+            setDimensionTypeDesc('')
+            setDimensionSql('')
+            setSqlConfirmed(false)
+            setAiTabKey('chat')
+            chatForm.resetFields()
+            loadTasks()
+            loadTagNodes()
+            loadStatistics()
+            return
+          }
+
+          // 宽表编辑字段模式：删除原有全部类型标签（级联删值），再按 AI 返回的完整全集重建
+          if (editingWideTable) {
+            // 归一化为字段全集：[{ type_name, type_description, tags, sql }]
+            let newTypes: any[] = []
+            if (dimensionSql === 'batch' && Array.isArray(dimensionTags) && (dimensionTags as any)[0]?.type_name) {
+              newTypes = dimensionTags as any[]
+            } else if (dimensionSql && dimensionSql !== 'batch' && dimensionTags.length) {
+              newTypes = [{
+                type_name: values.name || dimensionTypeName,
+                type_description: values.description || dimensionTypeDesc,
+                tags: dimensionTags,
+                sql: dimensionSql,
+              }]
+            }
+            if (!newTypes.length) {
+              message.error('请先通过对话生成字段后再保存')
+              return
+            }
+            // 防误删校验：返回的字段数不应少于原有字段数（全量重建要求 AI 保留原字段）
+            if (newTypes.length < editingWideTable.typeCount) {
+              message.error(`AI 返回的字段数(${newTypes.length})少于宽表现有字段数(${editingWideTable.typeCount})，为避免误删已取消保存。请让 AI 保留原有字段后重试。`)
+              return
+            }
+            // 1. 删除原有类型标签（后端会级联删除其下值标签），保留宽表节点本身
+            //    保存时重新拉取宽表当前的类型标签，避免用打开对话时缓存的过期 id 触发"节点不存在"
+            let curTypeIds: number[] = editingWideTable.typeChildIds
+            try {
+              const curRes = await tagApi.listNodes({ parent_id: editingWideTable.id })
+              curTypeIds = (curRes.data || []).filter((c: any) => c.node_type === 'type').map((c: any) => c.id)
+            } catch { /* 拉取失败则回退用缓存 id */ }
+            for (const id of curTypeIds) {
+              try {
+                await tagApi.deleteNode(id)
+              } catch (e: any) {
+                // 节点已不存在则跳过，其它错误抛出
+                if (e.response?.status !== 404) throw e
+              }
+            }
+            // 2. 按全集重建，parent 仍是该宽表
+            for (const t of newTypes) {
+              await tagApi.batchCreateDimensionTags({
+                type_name: t.type_name,
+                type_description: t.type_description || '',
+                parent_id: editingWideTable.id,
+                dimension_id: editingWideTable.dimensionId!,
+                tags: t.tags || [],
+                rule_config: { full_sql: t.sql || '', source_table: 'multi_table', source: 'ai_dimension' },
+              })
+            }
+
+            message.success(`宽表「${editingWideTable.name}」字段已重建（共 ${newTypes.length} 个字段）。请重新执行/调度该宽表以生成数据列。`)
+            setModalVisible(false)
+            setEditingWideTable(null)
+            wideTableFieldsCtxRef.current = []
+            // 重置维度相关状态
+            setSelectedDimension(null)
+            setDimensionSessionId(null)
+            setDimensionMessages([])
+            setDimensionTags([])
+            setDimensionTypeName('')
+            setDimensionTypeDesc('')
+            setDimensionSql('')
+            setSqlConfirmed(false)
+            setAiTabKey('chat')
+            chatForm.resetFields()
+            loadTasks()
+            loadTagNodes()
+            loadStatistics()
+            return
+          }
+
           // 批量模式：dimensionTags 是完整的 dimension_tags_list
           // 先建「宽表节点」（展示名=任务名，真实表名），类型标签将作为其列挂在它下面
           const wtRes = await tagApi.createWideTable(selectedDimension.id, {
@@ -1669,6 +1830,189 @@ export default function TagSystem() {
         console.error('Failed to load child tags:', error)
       }
     }
+  }
+
+  // 点击「类型标签」用 AI 对话修改打标逻辑：带入现有节点 + 子标签 + SQL 进入维度对话
+  const handleEditTypeWithAI = async (tag: any) => {
+    try {
+      // 1. 加载现有 value 子标签
+      const childRes = await tagApi.listNodes({ parent_id: tag.id })
+      const valueTags: { id: number; name: string; description?: string }[] = (childRes.data || []).map((c: any) => ({
+        id: c.id,
+        name: c.name,
+        description: c.description,
+      }))
+
+      // 2. 解析现有 rule_config，取 full_sql（rule_config 为 JSON 字符串）
+      let ruleConfig: any = {}
+      try {
+        ruleConfig = tag.rule_config ? JSON.parse(tag.rule_config) : {}
+      } catch {
+        ruleConfig = {}
+      }
+
+      // 3. 定位所属维度（确保维度列表已加载）
+      let dims = dimensions
+      if (!dims.length) {
+        try {
+          const dimsRes = await tagApi.listDimensions()
+          dims = dimsRes.data || []
+          setDimensions(dims)
+        } catch {
+          dims = []
+        }
+      }
+      const dim = tag.dimension_id ? dims.find(d => d.id === tag.dimension_id) || null : null
+      if (!dim) {
+        message.warning('该类型标签未绑定实体（维度），暂不支持用 AI 对话修改逻辑')
+        return
+      }
+
+      // 4. 置编辑态
+      setEditingTypeNode({
+        id: tag.id,
+        name: tag.name,
+        description: tag.description,
+        fullSql: ruleConfig.full_sql || '',
+        ruleConfig,
+        valueTags,
+        dimensionId: tag.dimension_id,
+      })
+
+      // 5. 重置维度对话状态，并把现有「类型标签 + 值标签」预填到勾选区，方便直接增删/改逻辑
+      setSelectedDimension(dim)
+      setDimensionSessionId(null)
+      setDimensionInput('')
+      setTagSuggestions([
+        {
+          type_name: tag.name,
+          type_description: tag.description || '',
+          values: valueTags.map(v => ({
+            name: v.name,
+            description: v.description || '',
+            selected: true,
+          })),
+          selected: true,
+        },
+      ])
+      setDimensionTags([])
+      setDimensionTypeName('')
+      setDimensionTypeDesc('')
+      setDimensionSql('')
+      setSqlConfirmed(false)
+      setDimensionMessages([])
+
+      // 6. 打开 AI 维度对话弹窗
+      setTagDetailVisible(false)
+      setCurrentView('ai')
+      setAiTabKey('dimension')
+      setModalVisible(true)
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '加载标签信息失败')
+    }
+  }
+
+  // 点击「宽表」用 AI 对话编辑字段：带入宽表下所有现有字段，保存时全量重建
+  const handleEditWideTableFields = async (tag: any) => {
+    try {
+      // 1. 加载宽表下所有类型标签（字段）
+      const childRes = await tagApi.listNodes({ parent_id: tag.id })
+      const typeNodes = (childRes.data || []).filter((c: any) => c.node_type === 'type')
+
+      // 2. 逐个加载每个类型标签的值标签 + 现有 full_sql，拼成展示与上下文
+      const fields: { name: string; description?: string; fullSql: string; values: { name: string; description?: string }[] }[] = []
+      for (const t of typeNodes) {
+        let cfg: any = {}
+        try {
+          cfg = t.rule_config ? JSON.parse(t.rule_config) : {}
+        } catch {
+          cfg = {}
+        }
+        const vRes = await tagApi.listNodes({ parent_id: t.id })
+        fields.push({
+          name: t.name,
+          description: t.description,
+          fullSql: cfg.full_sql || '',
+          values: (vRes.data || []).map((v: any) => ({ name: v.name, description: v.description })),
+        })
+      }
+
+      // 3. 定位所属维度
+      let dims = dimensions
+      if (!dims.length) {
+        try {
+          const dimsRes = await tagApi.listDimensions()
+          dims = dimsRes.data || []
+          setDimensions(dims)
+        } catch {
+          dims = []
+        }
+      }
+      const dim = tag.dimension_id ? dims.find(d => d.id === tag.dimension_id) || null : null
+      if (!dim) {
+        message.warning('该宽表未绑定实体（维度），暂不支持用 AI 对话编辑字段')
+        return
+      }
+
+      // 4. 置宽表编辑态
+      setEditingWideTable({
+        id: tag.id,
+        name: tag.name,
+        dimensionId: tag.dimension_id,
+        typeChildIds: typeNodes.map((t: any) => t.id),
+        typeCount: typeNodes.length,
+      })
+      // 把当前字段全集存到上下文，供首次对话注入
+      wideTableFieldsCtxRef.current = fields
+
+      // 5. 重置维度对话状态，并把现有「所有字段 + 值」预填到展示区
+      setSelectedDimension(dim)
+      setDimensionSessionId(null)
+      setDimensionInput('')
+      setTagSuggestions(
+        fields.map(f => ({
+          type_name: f.name,
+          type_description: f.description || '',
+          values: f.values.map(v => ({ name: v.name, description: v.description || '', selected: true })),
+          selected: true,
+        }))
+      )
+      setDimensionTags([])
+      setDimensionTypeName('')
+      setDimensionTypeDesc('')
+      setDimensionSql('')
+      setSqlConfirmed(false)
+      setDimensionMessages([])
+
+      // 6. 打开 AI 维度对话弹窗
+      setTagDetailVisible(false)
+      setCurrentView('ai')
+      setAiTabKey('dimension')
+      setModalVisible(true)
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '加载宽表字段失败')
+    }
+  }
+
+  // 拖拽 AI 对话弹窗右下角进行缩放
+  const handleAiModalResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startY = e.clientY
+    const startW = aiModalSize.width
+    const startH = aiModalSize.height
+    const onMove = (ev: MouseEvent) => {
+      setAiModalSize({
+        width: Math.min(Math.max(560, startW + (ev.clientX - startX)), window.innerWidth - 40),
+        height: Math.min(Math.max(320, startH + (ev.clientY - startY)), window.innerHeight - 160),
+      })
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
   }
 
   // 加载标签预览数据
@@ -2860,6 +3204,12 @@ export default function TagSystem() {
           items: [
             { key: 'view', label: '查看详情', onClick: () => handleViewTagDetail(tag) },
             { key: 'edit', label: '编辑', onClick: () => handleEditTag(tag) },
+            ...(tag.node_type === 'type'
+              ? [{ key: 'ai-edit', label: 'AI 修改逻辑', onClick: () => handleEditTypeWithAI(tag) }]
+              : []),
+            ...(tag.node_type === 'wide_table'
+              ? [{ key: 'ai-fields', label: 'AI 编辑字段', onClick: () => handleEditWideTableFields(tag) }]
+              : []),
             { key: 'delete', label: '删除', danger: true, onClick: () => handleDeleteTag(tag.id) },
           ]
         }}
@@ -5582,6 +5932,10 @@ export default function TagSystem() {
       form.resetFields()
       chatForm.resetFields()
 
+      // 切换 Tab 时退出"编辑已有类型标签/宽表字段"模式，避免污染新建流程
+      setEditingTypeNode(null)
+      setEditingWideTable(null)
+
       // 切换到值标签时加载维度列表
       if (key === 'dimension') {
         try {
@@ -5728,50 +6082,177 @@ export default function TagSystem() {
       try {
         // 首次发送时创建会话
         let sessionId = dimensionSessionId
+        const isFirstSend = !sessionId
         if (!sessionId) {
           const createRes = await tagApi.createDimensionChatSession(selectedDimension.id)
           sessionId = createRes.data.session_id
           setDimensionSessionId(sessionId)
         }
-        const res = await tagApi.sendDimensionChatMessage(sessionId!, userMsg, abortController.signal)
-        const reply = res.data.reply
-
-        // 检查是否返回了 tag_suggestions JSON
-        try {
-          const jsonMatch = reply.match(/\{[\s\S]*"type"\s*:\s*"tag_suggestions"[\s\S]*\}/)
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0])
-            if (parsed.type === 'tag_suggestions' && parsed.suggestions) {
-              // 转换为带 selected 状态
-              const suggestions = parsed.suggestions.map((s: any) => ({
-                ...s,
-                selected: true,
-                values: s.values.map((v: any) => ({ ...v, selected: true }))
-              }))
-              setTagSuggestions(suggestions)
-              setDimensionMessages(prev => [...prev, { role: 'assistant', content: parsed.message || '请选择要创建的标签：' }])
-            } else {
-              setDimensionMessages(prev => [...prev, { role: 'assistant', content: reply }])
-            }
-          } else {
-            setDimensionMessages(prev => [...prev, { role: 'assistant', content: reply }])
-          }
-        } catch {
-          setDimensionMessages(prev => [...prev, { role: 'assistant', content: reply }])
+        // 编辑模式首次发送：把现有逻辑作为上下文注入（后端为两步协议，仍会先回 tag_suggestions）
+        let sendContent = userMsg
+        if (isFirstSend && editingTypeNode) {
+          const existingValues = editingTypeNode.valueTags.map(t => t.name).join('、') || '（无）'
+          sendContent =
+            `【正在修改已有类型标签】\n` +
+            `名称：${editingTypeNode.name}\n` +
+            `现有值标签：${existingValues}\n` +
+            `现有打标 SQL：\n${editingTypeNode.fullSql || '（无）'}\n` +
+            `———\n` +
+            `用户的修改要求：${userMsg}\n` +
+            `请基于以上现有逻辑给出修改后的完整标签建议（保留未改动的值，按要求增删改）。`
+        }
+        if (isFirstSend && editingWideTable) {
+          const fieldsCtx = wideTableFieldsCtxRef.current
+            .map(f => `· ${f.name}（值：${f.values.map(v => v.name).join('、') || '无'}）\n  SQL：${f.fullSql || '（无）'}`)
+            .join('\n')
+          sendContent =
+            `【正在编辑宽表「${editingWideTable.name}」的字段，每个字段是一个类型标签】\n` +
+            `现有字段（共 ${editingWideTable.typeCount} 个）：\n${fieldsCtx || '（无）'}\n` +
+            `———\n` +
+            `用户的要求：${userMsg}\n` +
+            `请给出包含全部字段的完整标签建议（保留以上现有字段，再按要求增删改），不要遗漏原有字段。`
         }
 
-        // 检查是否有最终结果
-        if (res.data.is_final && res.data.tags && res.data.tags.length > 0) {
-          setDimensionTags(res.data.tags)
-          setDimensionTypeName(res.data.type_name || '')
-          setDimensionTypeDesc(res.data.type_description || '')
-          setDimensionSql(res.data.sql || '')
-          setSqlConfirmed(true)
-          // 预填表单
-          chatForm.setFieldsValue({
-            name: res.data.type_name || '',
-            description: res.data.type_description || '',
-          })
+        // 从回复文本里抽取 JSON（对象或数组）
+        const extractJson = (txt: string): any => {
+          const tryParse = (s: string) => { try { return JSON.parse(s) } catch { return undefined } }
+          const oi = txt.indexOf('{')
+          const ai = txt.indexOf('[')
+          const cands: string[] = []
+          if (oi >= 0) cands.push(txt.slice(oi, txt.lastIndexOf('}') + 1))
+          if (ai >= 0) cands.push(txt.slice(ai, txt.lastIndexOf(']') + 1))
+          for (const c of cands) { const v = tryParse(c); if (v !== undefined) return v }
+          return undefined
+        }
+        // 把 AI 回复归一化为字段列表；hasSql=true 表示是可直接保存的最终结果（每个字段都带 sql）
+        const parseReply = (txt: string): { list: any[]; hasSql: boolean } | null => {
+          // 1) 优先：完整 JSON 解析 + 递归找"带 values/tags 数组的类型对象"（兼容 updated_tag 等包装键）
+          const j = extractJson(txt)
+          if (j) {
+            const objs: any[] = []
+            const walk = (node: any) => {
+              if (!node || typeof node !== 'object') return
+              if (Array.isArray(node)) { node.forEach(walk); return }
+              const vt = node.values || node.tags
+              if (Array.isArray(vt) && vt.some((v: any) => v && typeof v === 'object' && 'name' in v)) {
+                objs.push(node)
+                return
+              }
+              Object.keys(node).forEach(k => walk(node[k]))
+            }
+            walk(j)
+            const list = objs.map((t: any) => ({
+              type_name: t.type_name || '',
+              type_description: t.type_description || '',
+              field: t.field,
+              tags: (t.tags || t.values || []).map((v: any) => ({ name: v.name, description: v.description || '', condition: v.condition })),
+              sql: t.sql || '',
+            })).filter((t: any) => t.tags.length > 0)
+            if (list.length) return { list, hasSql: list.every((t: any) => !!t.sql) }
+          }
+          // 2) 兜底：外层 JSON 可能因 message 里有未转义引号而无法解析，用正则单独抽取 values/tags + sql
+          const valuesM = txt.match(/"(?:values|tags)"\s*:\s*(\[[\s\S]*?\}\s*\])/)
+          if (valuesM) {
+            try {
+              const vals = JSON.parse(valuesM[1])
+              if (Array.isArray(vals) && vals.length) {
+                const sqlM = txt.match(/"sql"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+                const typeM = txt.match(/"type_name"\s*:\s*"([^"]*)"/)
+                const tags = vals.map((v: any) => ({ name: v.name, description: v.description || '', condition: v.condition })).filter((v: any) => v.name)
+                if (tags.length) {
+                  const sql = sqlM ? sqlM[1].replace(/\\"/g, '"').replace(/\\n/g, '\n') : ''
+                  return { list: [{ type_name: typeM ? typeM[1] : '', type_description: '', tags, sql }], hasSql: !!sql }
+                }
+              }
+            } catch { /* ignore */ }
+          }
+          return null
+        }
+        // 后端已结构化标记 is_final 时，归一化为字段列表
+        const finalListFromData = (d: any): any[] => {
+          if (d.dimension_tags_list?.length > 0) return d.dimension_tags_list
+          if (d.sql && d.tags?.length) return [{ type_name: d.type_name, type_description: d.type_description, tags: d.tags, sql: d.sql }]
+          return []
+        }
+        // 把最终字段列表写入状态（按当前编辑模式），返回是否成功
+        const applyFinal = (list: any[]): boolean => {
+          if (!list?.length) return false
+          if (editingWideTable) {
+            setDimensionTags(list)
+            setDimensionSql('batch')
+            setDimensionTypeName(`${list.length}个字段`)
+            setDimensionTypeDesc(list.map((t: any) => t.type_name).join('、'))
+            setSqlConfirmed(true)
+            return true
+          }
+          if (editingTypeNode) {
+            const single = list[0]
+            if (single?.sql && single.tags?.length) {
+              setDimensionTags(single.tags)
+              setDimensionSql(single.sql)
+              setDimensionTypeName(editingTypeNode.name)
+              setSqlConfirmed(true)
+              chatForm.setFieldsValue({ name: editingTypeNode.name, description: editingTypeNode.description })
+              return true
+            }
+          }
+          return false
+        }
+
+        let res = await tagApi.sendDimensionChatMessage(sessionId!, sendContent, abortController.signal)
+
+        if (editingTypeNode || editingWideTable) {
+          // —— 编辑模式：容错地从结构化结果或回复文本中提取可保存结果 ——
+          setDimensionMessages(prev => [...prev, { role: 'assistant', content: res.data.reply }])
+          let done = res.data.is_final && applyFinal(finalListFromData(res.data))
+          if (!done) {
+            const parsed = parseReply(res.data.reply)
+            if (parsed?.hasSql) {
+              // 回复里已含 SQL，直接用
+              done = applyFinal(parsed.list)
+            } else if (parsed) {
+              // 只有建议（无 SQL）→ 顶部同步展示 + 自动补一轮"生成SQL"
+              setTagSuggestions(parsed.list.map((t: any) => ({
+                type_name: t.type_name,
+                type_description: t.type_description,
+                field: t.field,
+                values: t.tags.map((v: any) => ({ ...v, selected: true })),
+                selected: true,
+              })))
+              const payload = parsed.list.map((t: any) => ({ type_name: t.type_name, type_description: t.type_description, field: t.field, values: t.tags }))
+              const res2 = await tagApi.sendDimensionChatMessage(sessionId!, `请为以下标签生成SQL：${JSON.stringify(payload, null, 0)}`, abortController.signal)
+              setDimensionMessages(prev => [...prev, { role: 'assistant', content: res2.data.reply }])
+              done = (res2.data.is_final && applyFinal(finalListFromData(res2.data)))
+                || applyFinal(parseReply(res2.data.reply)?.list || [])
+            }
+          }
+          if (!done) {
+            message.info('AI 暂未生成可保存的结果，请在对话里进一步明确修改要求后重试')
+          }
+        } else {
+          // —— 新建模式：保持原有"建议勾选 → 确认选择"的两步交互 ——
+          const reply = res.data.reply
+          let shown = false
+          try {
+            const m = reply.match(/\{[\s\S]*"type"\s*:\s*"tag_suggestions"[\s\S]*\}/)
+            if (m) {
+              const parsed = JSON.parse(m[0])
+              if (parsed.type === 'tag_suggestions' && parsed.suggestions) {
+                setTagSuggestions(parsed.suggestions.map((s: any) => ({ ...s, selected: true, values: s.values.map((v: any) => ({ ...v, selected: true })) })))
+                setDimensionMessages(prev => [...prev, { role: 'assistant', content: parsed.message || '请选择要创建的标签：' }])
+                shown = true
+              }
+            }
+          } catch { /* ignore */ }
+          if (!shown) setDimensionMessages(prev => [...prev, { role: 'assistant', content: reply }])
+          if (res.data.is_final && res.data.tags && res.data.tags.length > 0) {
+            setDimensionTags(res.data.tags)
+            setDimensionTypeName(res.data.type_name || '')
+            setDimensionTypeDesc(res.data.type_description || '')
+            setDimensionSql(res.data.sql || '')
+            setSqlConfirmed(true)
+            chatForm.setFieldsValue({ name: res.data.type_name || '', description: res.data.type_description || '' })
+          }
         }
       } catch (e: any) {
         // 忽略取消错误
@@ -5897,15 +6378,21 @@ export default function TagSystem() {
         return (
           <Form form={chatForm} layout="vertical" autoComplete="off">
             <Alert
-              type="success"
-              message={isBatchMode
+              type={(editingTypeNode || editingWideTable) ? 'warning' : 'success'}
+              message={editingWideTable
+                ? `重建宽表「${editingWideTable.name}」字段（共 ${(dimensionTags as any[]).length} 个）- 实体：${selectedDimension.display_name}。保存将删除原字段后重建，并需重新调度生成数据`
+                : editingTypeNode
+                ? `修改类型标签「${editingTypeNode.name}」的打标逻辑 - 实体：${selectedDimension.display_name}`
+                : isBatchMode
                 ? `批量创建 ${(dimensionTags as any[]).length} 个类型标签 - 实体：${selectedDimension.display_name}`
                 : `实体：${selectedDimension.display_name} (${selectedDimension.id_field})`
               }
               style={{ marginBottom: 16 }}
             />
 
-            {/* 宽表：展示名（=任务名）+ 真实表名。所有类型标签将作为该宽表的列 */}
+            {/* 宽表：展示名（=任务名）+ 真实表名。编辑已有类型标签/宽表字段时无需新建宽表，隐藏这两项 */}
+            {!editingTypeNode && !editingWideTable && (
+            <>
             <Form.Item
               name="wide_table_display"
               label="宽表展示名（任务名）"
@@ -5943,6 +6430,8 @@ export default function TagSystem() {
             >
               <Input placeholder="如：tag_user_behavior_20260626" />
             </Form.Item>
+            </>
+            )}
 
             {/* 批量模式下隐藏名称和描述输入 */}
             {!isBatchMode && (
@@ -5961,6 +6450,8 @@ export default function TagSystem() {
               </>
             )}
 
+            {/* 编辑已有类型标签/宽表字段时不改变挂载位置，隐藏所属分类选择 */}
+            {!editingTypeNode && !editingWideTable && (
             <Form.Item name="parent_id" label="所属分类（可选）">
               <TreeSelect
                 allowClear
@@ -5971,7 +6462,8 @@ export default function TagSystem() {
                 style={{ width: '100%' }}
               />
             </Form.Item>
-            {hierarchyNodes.length === 0 && (
+            )}
+            {!editingTypeNode && !editingWideTable && hierarchyNodes.length === 0 && (
               <Alert
                 type="info"
                 message="提示：暂无分类节点，标签将创建在根目录下。您可以稍后在「标签管理」中创建分类并整理标签层级。"
@@ -6085,9 +6577,9 @@ export default function TagSystem() {
         )
       }
 
-      // 步骤2：AI对话
+      // 步骤2：AI对话（高度随弹窗缩放）
       return (
-        <div style={{ height: 450, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ height: aiModalSize.height, display: 'flex', flexDirection: 'column' }}>
           <Alert
             type="info"
             message={`当前实体：${selectedDimension.display_name} (ID字段: ${selectedDimension.id_field})`}
@@ -6104,8 +6596,8 @@ export default function TagSystem() {
             style={{ marginBottom: 16 }}
           />
 
-          {/* 消息区域 */}
-          <div style={{ flex: 1, overflow: 'auto', padding: '0 4px', marginBottom: 16 }}>
+          {/* 消息区域（编辑模式下用 flex order 把"当前字段"展示块固定到最上方，对话在其下方） */}
+          <div style={{ flex: 1, overflow: 'auto', padding: '0 4px', marginBottom: 16, display: 'flex', flexDirection: 'column' }}>
             {dimensionMessages.map((msg, i) => (
               <div
                 key={i}
@@ -6130,17 +6622,21 @@ export default function TagSystem() {
               </div>
             ))}
 
-            {/* 标签建议勾选区域 */}
+            {/* 标签建议勾选区域（编辑模式作为"当前字段"参考面板置顶） */}
             {tagSuggestions.length > 0 && (
               <div style={{
                 background: '#fafafa',
                 borderRadius: 8,
                 padding: 16,
                 marginTop: 8,
-                border: '1px solid #e8e8e8'
+                border: '1px solid #e8e8e8',
+                order: (editingTypeNode || editingWideTable) ? -1 : 0,
+                flexShrink: 0,
               }}>
                 <div style={{ marginBottom: 12 }}>
-                  <span style={{ fontWeight: 500 }}>请勾选要创建的标签：</span>
+                  <span style={{ fontWeight: 500 }}>{editingWideTable ? '宽表当前字段（在下方对话框说明要怎么改/加字段）：' : editingTypeNode ? '当前打标逻辑（在下方对话框说明要怎么修改）：' : '请勾选要创建的标签：'}</span>
+                  {!editingTypeNode && !editingWideTable && (
+                  <>
                   <Button
                     type="link"
                     size="small"
@@ -6167,11 +6663,14 @@ export default function TagSystem() {
                   >
                     清空
                   </Button>
+                  </>
+                  )}
                 </div>
                 {tagSuggestions.map((suggestion, sIdx) => (
                   <div key={sIdx} style={{ marginBottom: 16 }}>
                     <Checkbox
                       checked={suggestion.selected}
+                      disabled={!!editingTypeNode || !!editingWideTable}
                       onChange={e => {
                         const newSuggestions = [...tagSuggestions]
                         newSuggestions[sIdx].selected = e.target.checked
@@ -6192,6 +6691,7 @@ export default function TagSystem() {
                         <div key={vIdx} style={{ marginBottom: 4 }}>
                           <Checkbox
                             checked={value.selected}
+                            disabled={!!editingTypeNode || !!editingWideTable}
                             onChange={e => {
                               const newSuggestions = [...tagSuggestions]
                               newSuggestions[sIdx].values[vIdx].selected = e.target.checked
@@ -6209,6 +6709,7 @@ export default function TagSystem() {
                     </div>
                   </div>
                 ))}
+                {!editingTypeNode && !editingWideTable && (
                 <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
                   <Button
                     type="primary"
@@ -6316,12 +6817,13 @@ export default function TagSystem() {
                       }
                     }}
                   >
-                    确认选择
+                    {editingTypeNode ? '确认修改' : '确认选择'}
                   </Button>
                   <Button onClick={() => setTagSuggestions([])}>
                     清除重选
                   </Button>
                 </div>
+                )}
               </div>
             )}
 
@@ -6380,11 +6882,7 @@ export default function TagSystem() {
       if (aiTabKey === 'dimension') {
         if (!selectedDimension) {
           // 未选择维度
-          return (
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <Button onClick={() => setModalVisible(false)}>取消</Button>
-            </div>
-          )
+          return null
         }
         if (sqlConfirmed) {
           // SQL已确认，显示保存
@@ -6399,21 +6897,14 @@ export default function TagSystem() {
               }}>
                 返回对话
               </Button>
-              <Space>
-                <Button onClick={() => setModalVisible(false)}>取消</Button>
-                <Button type="primary" onClick={handleSubmit}>
-                  保存标签
-                </Button>
-              </Space>
+              <Button type="primary" onClick={handleSubmit}>
+                保存标签
+              </Button>
             </div>
           )
         }
         // 对话中
-        return (
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <Button onClick={() => setModalVisible(false)}>取消</Button>
-          </div>
-        )
+        return null
       }
 
       // AI对话模式（粒度标签）
@@ -6424,25 +6915,18 @@ export default function TagSystem() {
               <Button onClick={() => { setAiStep(0); setSqlConfirmed(false) }}>
                 返回对话
               </Button>
-              <Space>
-                <Button onClick={() => setModalVisible(false)}>取消</Button>
-                <Button type="primary" onClick={handleSubmit}>
-                  保存任务
-                </Button>
-              </Space>
+              <Button type="primary" onClick={handleSubmit}>
+                保存任务
+              </Button>
             </div>
           )
         }
+        if (!sqlConfirmed) return null
         return (
           <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <Space>
-              <Button onClick={() => setModalVisible(false)}>取消</Button>
-              {sqlConfirmed && (
-                <Button type="primary" onClick={() => setAiStep(2)}>
-                  下一步：保存任务
-                </Button>
-              )}
-            </Space>
+            <Button type="primary" onClick={() => setAiStep(2)}>
+              下一步：保存任务
+            </Button>
           </div>
         )
       }
@@ -6456,18 +6940,15 @@ export default function TagSystem() {
           >
             上一步
           </Button>
-          <Space>
-            <Button onClick={() => setModalVisible(false)}>取消</Button>
-            {aiStep < 2 ? (
-              <Button type="primary" onClick={handleAiNext}>
-                下一步
-              </Button>
-            ) : (
-              <Button type="primary" onClick={handleSubmit}>
-                保存任务
-              </Button>
-            )}
-          </Space>
+          {aiStep < 2 ? (
+            <Button type="primary" onClick={handleAiNext}>
+              下一步
+            </Button>
+          ) : (
+            <Button type="primary" onClick={handleSubmit}>
+              保存任务
+            </Button>
+          )}
         </div>
       )
     }
@@ -6483,6 +6964,8 @@ export default function TagSystem() {
           setExtractedTags([])
           setAiStep(0)
           setAiTabKey('chat')
+          setEditingTypeNode(null)
+          setEditingWideTable(null)
           // 重置维度相关状态
           setSelectedDimension(null)
           setDimensionSessionId(null)
@@ -6496,8 +6979,39 @@ export default function TagSystem() {
           setDimensionModalVisible(false)
           setNewDimensionName('')
         }}
-        width={950}
+        width={aiModalSize.width}
         footer={getFooter()}
+        modalRender={(node) => (
+          <div style={{ position: 'relative' }}>
+            {node}
+            {/* 右下角缩放手柄：可拉大/缩小对话框 */}
+            <div
+              onMouseDown={handleAiModalResizeStart}
+              title="拖拽缩放窗口"
+              style={{
+                position: 'absolute',
+                right: 0,
+                bottom: 0,
+                width: 28,
+                height: 28,
+                cursor: 'nwse-resize',
+                zIndex: 1000,
+                pointerEvents: 'auto',  // .ant-modal 默认 pointer-events:none，手柄需显式开启才能接收拖拽
+                userSelect: 'none',
+                touchAction: 'none',
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'flex-end',
+                padding: 3,
+                color: '#8c8c8c',
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" style={{ pointerEvents: 'none' }}>
+                <path d="M13 5 L5 13 M13 9 L9 13 M13 1 L1 13" stroke="currentColor" strokeWidth="1.4" fill="none" />
+              </svg>
+            </div>
+          </div>
+        )}
       >
         <Tabs
           activeKey={aiTabKey}
@@ -7653,6 +8167,26 @@ export default function TagSystem() {
               }}>
                 编辑标签
               </Button>
+              {tagDetailData?.node_type === 'type' && (
+                <Button
+                  type="primary"
+                  ghost
+                  icon={<RobotOutlined />}
+                  onClick={() => handleEditTypeWithAI(tagDetailData)}
+                >
+                  AI 修改逻辑
+                </Button>
+              )}
+              {tagDetailData?.node_type === 'wide_table' && (
+                <Button
+                  type="primary"
+                  ghost
+                  icon={<RobotOutlined />}
+                  onClick={() => handleEditWideTableFields(tagDetailData)}
+                >
+                  AI 编辑字段
+                </Button>
+              )}
               <Button
                 type="primary"
                 ghost

@@ -12,6 +12,7 @@ import {
   Empty,
   Modal,
   Tooltip,
+  Popover,
   Input,
   Table,
   Alert,
@@ -131,6 +132,8 @@ export default function DataSync() {
   const [creating, setCreating] = useState(false)
   const [tasksCreated, setTasksCreated] = useState(false)
   const [selectedLayerId, setSelectedLayerId] = useState<number | null>(null)
+  const [layerSelectOpen, setLayerSelectOpen] = useState(false)   // 控制目标层级下拉展开
+  const [layerHintVisible, setLayerHintVisible] = useState(false) // 未选层级时在层级旁高亮提示
   const [syncing, setSyncing] = useState(false)
   const [, setCreatedCount] = useState(0) // 已创建的表数量
   const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([])
@@ -342,8 +345,10 @@ export default function DataSync() {
     if (leftSelected.length === 0 || !sourceDsId) return
 
     // 必须先选择目标层级，否则目标表名无法正确生成（会错误地默认成 ods 前缀）
+    // 不弹全局提示，而是在层级选择器旁高亮提示并自动展开下拉，引导用户就地选择
     if (!selectedLayerId) {
-      message.warning('请先选择目标层级')
+      setLayerHintVisible(true)
+      setLayerSelectOpen(true)
       return
     }
 
@@ -2272,30 +2277,39 @@ export default function DataSync() {
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
             <Text type="secondary" style={{ fontSize: 12 }}>层级:</Text>
-            <Tooltip title={
-              selectedLayerId && layers.find(l => l.id === selectedLayerId)?.name !== 'ODS'
-                ? '非 ODS 层级将根据源表自动添加上游依赖'
-                : 'ODS 层级无需配置依赖'
-            }>
-              <Select
-                size="small"
-                style={{ width: 120 }}
-                placeholder="选择层级"
-                allowClear
-                value={selectedLayerId}
-                onChange={setSelectedLayerId}
-                options={layers.map((l) => ({
-                  value: l.id,
-                  label: (
-                    <Space size={4}>
-                      <Tag color={l.color || 'default'} style={{ marginRight: 0, fontSize: 11 }}>
-                        {l.name}
-                      </Tag>
-                    </Space>
-                  ),
-                }))}
-              />
-            </Tooltip>
+            <Popover
+              open={layerHintVisible && !selectedLayerId}
+              placement="top"
+              content={<span style={{ color: '#ff4d4f' }}>请先选择目标层级</span>}
+            >
+              <Tooltip title={
+                selectedLayerId && layers.find(l => l.id === selectedLayerId)?.name !== 'ODS'
+                  ? '非 ODS 层级将根据源表自动添加上游依赖'
+                  : 'ODS 层级无需配置依赖'
+              }>
+                <Select
+                  size="small"
+                  style={{ width: 120 }}
+                  placeholder="选择层级"
+                  allowClear
+                  status={layerHintVisible && !selectedLayerId ? 'error' : undefined}
+                  open={layerSelectOpen}
+                  onDropdownVisibleChange={setLayerSelectOpen}
+                  value={selectedLayerId}
+                  onChange={(v) => { setSelectedLayerId(v); if (v) setLayerHintVisible(false) }}
+                  options={layers.map((l) => ({
+                    value: l.id,
+                    label: (
+                      <Space size={4}>
+                        <Tag color={l.color || 'default'} style={{ marginRight: 0, fontSize: 11 }}>
+                          {l.name}
+                        </Tag>
+                      </Space>
+                    ),
+                  }))}
+                />
+              </Tooltip>
+            </Popover>
           </div>
         </div>
 
@@ -2407,7 +2421,7 @@ export default function DataSync() {
             gap: 8,
             padding: '0 4px',
           }}>
-            <Tooltip title={!selectedLayerId ? '请先选择目标层级' : '添加到待同步'}>
+            <Tooltip title="移动按钮">
               <Button
                 type="primary"
                 size="small"

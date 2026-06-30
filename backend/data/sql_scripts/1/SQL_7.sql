@@ -1,1 +1,0 @@
-SELECT * FROM ods_mysql_ai_agent_agent_memories LIMIT 100;

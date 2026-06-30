@@ -33,15 +33,15 @@ export const useAuthStore = create<AuthState>()(
         const response = await api.post('/api/v1/auth/login', { username, password })
         const { access_token, refresh_token } = response.data
 
-        // Set tokens in api instance
+        // 先把新 token 写入 store，确保后续请求（请求拦截器从 store 读 token）用的是新 token，
+        // 而不是上一次残留的旧 token（否则 /users/me 会带旧 token 报 Invalid or expired token）
+        set({ accessToken: access_token, refreshToken: refresh_token })
         api.defaults.headers.common['Authorization'] = `Bearer ${access_token}`
 
         // Fetch user info
         const userResponse = await api.get('/api/v1/users/me')
 
         set({
-          accessToken: access_token,
-          refreshToken: refresh_token,
           user: {
             id: userResponse.data.id,
             username: userResponse.data.username,
