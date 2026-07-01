@@ -124,6 +124,38 @@ export const queryApi = {
   getHistory: (limit?: number) => api.get('/api/v1/queries/history', { params: { limit } }),
 }
 
+// 脚本同步 API（上传 Python 程序，提交到 Airflow）
+export const scriptSyncApi = {
+  list: () => api.get('/api/v1/script-sync/'),
+  get: (id: number) => api.get(`/api/v1/script-sync/${id}`),
+  upload: (formData: FormData) =>
+    api.post('/api/v1/script-sync/upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    }),
+  update: (id: number, data: { name?: string; description?: string; entrypoint?: string; cron_expression?: string; env_id?: number | null }) =>
+    api.put(`/api/v1/script-sync/${id}`, data),
+  delete: (id: number) => api.delete(`/api/v1/script-sync/${id}`),
+  deploy: (id: number) => api.post(`/api/v1/script-sync/${id}/deploy`),
+  // 手动执行是同步跑脚本、可能较久，放开超时
+  run: (id: number) => api.post(`/api/v1/script-sync/${id}/run`, null, { timeout: 0 }),
+  disable: (id: number) => api.post(`/api/v1/script-sync/${id}/disable`),
+  unschedule: (id: number) => api.post(`/api/v1/script-sync/${id}/unschedule`),
+}
+
+// Python 运行环境 API
+export const pyEnvApi = {
+  list: () => api.get('/api/v1/py-envs/'),
+  discover: () => api.get('/api/v1/py-envs/discover'),
+  register: (data: { name: string; python_path: string; description?: string }) =>
+    api.post('/api/v1/py-envs/register', data),
+  createVenv: (data: { name: string; description?: string; base_python?: string }) =>
+    api.post('/api/v1/py-envs/create-venv', data, { timeout: 0 }),
+  install: (id: number, data: { packages?: string; requirements?: string }) =>
+    api.post(`/api/v1/py-envs/${id}/install`, data, { timeout: 0 }),
+  packages: (id: number) => api.get(`/api/v1/py-envs/${id}/packages`, { timeout: 0 }),
+  delete: (id: number) => api.delete(`/api/v1/py-envs/${id}`),
+}
+
 export const scheduleApi = {
   list: () => api.get('/api/v1/schedules/'),
   get: (id: number) => api.get(`/api/v1/schedules/${id}`),

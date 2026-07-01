@@ -40,6 +40,14 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # 轻量迁移：给已存在的 big_script_tasks 加 env_id 列（MySQL 无 IF NOT EXISTS，靠 try/except 幂等）
+    from sqlalchemy import text
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE big_script_tasks ADD COLUMN env_id BIGINT NULL"))
+    except Exception:
+        pass  # 列已存在则忽略
+
     # Create default admin user
     await create_default_admin()
 

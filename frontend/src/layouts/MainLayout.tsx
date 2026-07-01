@@ -95,7 +95,10 @@ export default function MainLayout() {
         <Menu
           theme="dark"
           mode="inline"
-          selectedKeys={[location.pathname]}
+          selectedKeys={[
+            // data-sync 的子页面（/db、/script、/datax）都高亮"同步任务"菜单
+            location.pathname.startsWith('/bigdata/data-sync') ? '/bigdata/data-sync' : location.pathname,
+          ]}
           defaultOpenKeys={['sync-group', 'explorer-group']}
           items={menuItems}
           onClick={handleMenuClick}

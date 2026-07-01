@@ -40,7 +40,7 @@ import {
   LogoutOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../stores/authStore'
-import { syncScheduleApi, etlApi, scheduleApi } from '../services/api'
+import { syncScheduleApi, etlApi, scheduleApi, scriptSyncApi } from '../services/api'
 import CronExpressionInput from '../components/CronExpressionInput'
 
 const { Title, Text } = Typography
@@ -74,7 +74,7 @@ interface SyncScheduleItem {
 // 统一的调度项（包括同步、ETL和标签任务）
 interface ScheduleItem {
   id: number
-  type: 'sync' | 'etl' | 'tag'
+  type: 'sync' | 'etl' | 'tag' | 'script'
   name: string
   description?: string
   taskId: number  // 实际任务的id（同步任务id、ETL任务id 或 标签任务调度id）
@@ -120,6 +120,12 @@ export default function Scheduler() {
   const [etlDisabling, setEtlDisabling] = useState<number | null>(null)
   const [etlDeleting, setEtlDeleting] = useState<number | null>(null)
   const [etlEnabling, setEtlEnabling] = useState<number | null>(null)
+  const [scriptDisabling, setScriptDisabling] = useState<number | null>(null)
+  const [scriptEnabling, setScriptEnabling] = useState<number | null>(null)
+  const [scriptDeleting, setScriptDeleting] = useState<number | null>(null)
+  const [scriptCronModalVisible, setScriptCronModalVisible] = useState(false)
+  const [scriptCronTask, setScriptCronTask] = useState<ScheduleItem | null>(null)
+  const [scriptCron, setScriptCron] = useState('0 2 * * *')
 
   // ETL view/edit modal
   const [etlViewModalVisible, setEtlViewModalVisible] = useState(false)
@@ -241,6 +247,7 @@ export default function Scheduler() {
     const etlId = searchParams.get('etl_id')
     const etlIds = searchParams.get('etl_ids')
     const syncIds = searchParams.get('sync_ids')
+    const scriptIds = searchParams.get('script_ids')
     const addModal = searchParams.get('add')
     const addSyncIds = searchParams.get('syncIds')
     const addEtlIds = searchParams.get('etlIds')
@@ -268,6 +275,11 @@ export default function Scheduler() {
       // 搜索过滤显示指定的同步任务
       setSearchKeyword(`sync_ids:${syncIds}`)
       setSearchParams({})
+    } else if (scriptIds) {
+      urlParamsProcessedRef.current = true
+      // 搜索过滤显示指定的脚本任务
+      setSearchKeyword(`script_ids:${scriptIds}`)
+      setSearchParams({})
     }
   }, [searchParams])
 
@@ -277,10 +289,11 @@ export default function Scheduler() {
     setLoading(true)
     try {
       // 同时加载同步调度、ETL任务、通用调度（含标签任务）和可调度任务
-      const [syncRes, etlRes, availableSyncRes] = await Promise.all([
+      const [syncRes, etlRes, availableSyncRes, scriptRes] = await Promise.all([
         syncScheduleApi.list(statusFilter),
         etlApi.list(),
         syncScheduleApi.getAvailableTasks(),
+        scriptSyncApi.list().catch(() => ({ data: [] })),
       ])
 
       // 单独加载通用调度，避免影响其他数据
@@ -366,8 +379,29 @@ export default function Scheduler() {
 
       console.log('标签任务调度:', tagItems)
 
+      // 脚本同步任务（曾经上过线：有 dag_id / cron / is_scheduled）
+      const scriptItems: ScheduleItem[] = (scriptRes.data || [])
+        .filter((e: any) => e.is_scheduled || e.dag_id || e.cron_expression)
+        .map((e: any) => ({
+          id: e.id,
+          type: 'script' as const,
+          name: e.name,
+          description: e.description,
+          taskId: e.id,
+          taskName: e.name,
+          taskDetail: `脚本：${e.entrypoint || e.original_filename || ''}`,
+          cron_expression: e.cron_expression || '',
+          is_enabled: e.is_scheduled,
+          dag_id: e.dag_id,
+          airflow_status: e.airflow_status,
+          next_run_time: undefined,
+          last_run_at: e.last_run_at,
+          last_run_rows: undefined,
+          created_at: e.created_at,
+        }))
+
       // 根据筛选条件过滤
-      let combined = [...syncItems, ...etlItems, ...tagItems]
+      let combined = [...syncItems, ...etlItems, ...tagItems, ...scriptItems]
       if (statusFilter === 'enabled') {
         combined = combined.filter(s => s.is_enabled)
       } else if (statusFilter === 'disabled') {
@@ -477,6 +511,61 @@ export default function Scheduler() {
       message.error(error.response?.data?.detail || '删除失败')
     } finally {
       setEtlDeleting(null)
+    }
+  }
+
+  const handleScriptDisable = async (task: ScheduleItem) => {
+    if (scriptDisabling) return
+    setScriptDisabling(task.id)
+    try {
+      await scriptSyncApi.disable(task.id)
+      message.success('脚本任务下线成功')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '下线失败')
+    } finally {
+      setScriptDisabling(null)
+    }
+  }
+
+  // 打开"上线/编辑"调度弹框（配置 cron 后 update + deploy）
+  const handleScriptOpenCronModal = (task: ScheduleItem) => {
+    setScriptCronTask(task)
+    setScriptCron(task.cron_expression || '0 2 * * *')
+    setScriptCronModalVisible(true)
+  }
+
+  const handleScriptSaveCron = async () => {
+    if (!scriptCronTask) return
+    if (scriptEnabling) return
+    setScriptEnabling(scriptCronTask.id)
+    try {
+      await scriptSyncApi.update(scriptCronTask.id, { cron_expression: scriptCron })
+      await scriptSyncApi.deploy(scriptCronTask.id)
+      message.success('已保存并上线')
+      setScriptCronModalVisible(false)
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '操作失败')
+    } finally {
+      setScriptEnabling(null)
+    }
+  }
+
+  const handleScriptUnschedule = async (task: ScheduleItem) => {
+    if (task.is_enabled) {
+      message.warning('请先下线后再删除')
+      return
+    }
+    setScriptDeleting(task.id)
+    try {
+      await scriptSyncApi.unschedule(task.id)
+      message.success('调度已删除')
+      loadSchedules()
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '删除失败')
+    } finally {
+      setScriptDeleting(null)
     }
   }
 
@@ -920,7 +1009,7 @@ export default function Scheduler() {
   const parseSelectedKeys = () => {
     return selectedKeys.map(key => {
       const [type, id] = key.split('-')
-      return { type: type as 'sync' | 'etl' | 'tag', id: parseInt(id, 10) }
+      return { type: type as 'sync' | 'etl' | 'tag' | 'script', id: parseInt(id, 10) }
     })
   }
 
@@ -942,6 +1031,9 @@ export default function Scheduler() {
       try {
         if (type === 'sync') {
           await syncScheduleApi.delete(id)
+        } else if (type === 'script') {
+          // 脚本任务无独立调度实体，"移出调度" = 下线
+          await scriptSyncApi.disable(id)
         } else {
           // ETL任务只取消调度，不删除任务本身
           await etlApi.unschedule(id)
@@ -983,6 +1075,8 @@ export default function Scheduler() {
       try {
         if (item.type === 'sync') {
           await syncScheduleApi.enable(item.id)
+        } else if (item.type === 'script') {
+          await scriptSyncApi.deploy(item.id)
         } else {
           // ETL任务需要cron表达式，使用已有的或默认值
           await etlApi.enable(item.id, item.cron_expression || '0 2 * * *')
@@ -1024,6 +1118,8 @@ export default function Scheduler() {
       try {
         if (item.type === 'sync') {
           await syncScheduleApi.disable(item.id, true)  // force=true for batch
+        } else if (item.type === 'script') {
+          await scriptSyncApi.disable(item.id)
         } else {
           await etlApi.disable(item.id, true)  // force=true for batch
         }
@@ -1055,6 +1151,8 @@ export default function Scheduler() {
           return <Tag color="blue"><SyncOutlined /> 同步</Tag>
         } else if (record.type === 'tag') {
           return <Tag color="green">标签</Tag>
+        } else if (record.type === 'script') {
+          return <Tag color="geekblue"><CodeOutlined /> 脚本</Tag>
         } else {
           return <Tag color="purple"><CodeOutlined /> ETL</Tag>
         }
@@ -1064,6 +1162,7 @@ export default function Scheduler() {
       title: '调度名称',
       dataIndex: 'name',
       key: 'name',
+      width: 180,
       ellipsis: { showTitle: false },
       render: (name: string, record: ScheduleItem) => {
         // 标签任务可点击跳转到标签页面
@@ -1306,6 +1405,62 @@ export default function Scheduler() {
                 />
               </Tooltip>
             </>
+          ) : record.type === 'script' ? (
+            // 脚本任务的操作：查看 / 编辑 / 下线·上线 / 删除（与同步、ETL 一致）
+            <>
+              <Tooltip title="查看脚本">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={() => window.open(`/bigdata/data-sync/script?id=${record.taskId}`, '_blank')}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              <Tooltip title="编辑">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => handleScriptOpenCronModal(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+              {record.is_enabled ? (
+                <Tooltip title="下线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PauseOutlined />}
+                    loading={scriptDisabling === record.id}
+                    onClick={() => handleScriptDisable(record)}
+                    style={{ color: '#faad14', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              ) : (
+                <Tooltip title="上线">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    onClick={() => handleScriptOpenCronModal(record)}
+                    style={{ color: '#52c41a', padding: '0 4px' }}
+                  />
+                </Tooltip>
+              )}
+              <Tooltip title={record.is_enabled ? '请先下线后删除' : '删除'}>
+                <Button
+                  type="link"
+                  size="small"
+                  danger={!record.is_enabled}
+                  disabled={record.is_enabled}
+                  icon={<DeleteOutlined />}
+                  loading={scriptDeleting === record.id}
+                  onClick={() => handleScriptUnschedule(record)}
+                  style={{ padding: '0 4px' }}
+                />
+              </Tooltip>
+            </>
           ) : (
             // ETL任务的操作
             <>
@@ -1384,6 +1539,11 @@ export default function Scheduler() {
     if (keyword.startsWith('sync_ids:')) {
       const ids = keyword.replace('sync_ids:', '').split(',').map(id => parseInt(id.trim()))
       return s.type === 'sync' && ids.includes(s.taskId)
+    }
+    // 支持 script_ids:1,2,3 格式
+    if (keyword.startsWith('script_ids:')) {
+      const ids = keyword.replace('script_ids:', '').split(',').map(id => parseInt(id.trim()))
+      return s.type === 'script' && ids.includes(s.taskId)
     }
     // 支持精准搜索 etl:id 格式
     if (keyword.startsWith('etl:')) {
@@ -1621,8 +1781,10 @@ export default function Scheduler() {
                 window.open(`/bigdata/etl-tasks?id=${record.taskId}`, '_blank')
               } else if (record.type === 'tag') {
                 window.open('/tags', '_blank')
+              } else if (record.type === 'script') {
+                window.open(`/bigdata/data-sync/script?id=${record.taskId}`, '_blank')
               } else {
-                window.open(`/bigdata/data-sync?id=${record.taskId}`, '_blank')
+                window.open(`/bigdata/data-sync/db?id=${record.taskId}`, '_blank')
               }
             },
             style: { cursor: 'pointer' },
@@ -2276,6 +2438,40 @@ export default function Scheduler() {
         <CronExpressionInput
           value={etlEditCron}
           onChange={(v) => setEtlEditCron(v)}
+        />
+      </Modal>
+
+      {/* 脚本任务上线/编辑调度弹框 */}
+      <Modal
+        title={
+          <Space>
+            <ScheduleOutlined />
+            <span>{scriptCronTask?.is_enabled ? '编辑调度' : '上线脚本任务'} - {scriptCronTask?.name}</span>
+          </Space>
+        }
+        open={scriptCronModalVisible}
+        onCancel={() => setScriptCronModalVisible(false)}
+        onOk={handleScriptSaveCron}
+        confirmLoading={scriptEnabling === scriptCronTask?.id}
+        okText="确定"
+        width={550}
+      >
+        <Alert
+          message="保存后将（重新）生成 Airflow DAG 并按 Cron 定时执行"
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+        <Space direction="vertical" style={{ marginBottom: 16, width: '100%' }}>
+          <Text>任务名称：<Tag color="geekblue">{scriptCronTask?.name}</Tag></Text>
+          <Text>脚本：<Text code style={{ fontSize: 11 }}>{scriptCronTask?.taskDetail}</Text></Text>
+        </Space>
+        <div style={{ marginBottom: 8 }}>
+          <Text strong>Cron 表达式：</Text>
+        </div>
+        <CronExpressionInput
+          value={scriptCron}
+          onChange={(v) => setScriptCron(v)}
         />
       </Modal>
 

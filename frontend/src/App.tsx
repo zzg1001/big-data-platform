@@ -9,6 +9,9 @@ import Scheduler from './pages/Scheduler'
 import Dashboard from './pages/Dashboard'
 import DataSources from './pages/DataSources'
 import DataSync from './pages/DataSync'
+import DataSyncHome from './pages/DataSyncHome'
+import DataSyncScript from './pages/DataSyncScript'
+import DataSyncDataX from './pages/DataSyncDataX'
 import FieldTemplates from './pages/FieldTemplates'
 import DataExplorer from './pages/DataExplorer'
 import EtlTasks from './pages/EtlTasks'
@@ -81,7 +84,10 @@ function App() {
       >
         <Route index element={<Dashboard />} />
         <Route path="datasources" element={<DataSources />} />
-        <Route path="data-sync" element={<DataSync />} />
+        <Route path="data-sync" element={<DataSyncHome />} />
+        <Route path="data-sync/db" element={<DataSync />} />
+        <Route path="data-sync/script" element={<DataSyncScript />} />
+        <Route path="data-sync/datax" element={<DataSyncDataX />} />
         <Route path="field-templates" element={<FieldTemplates />} />
         <Route path="data-explorer" element={<DataExplorer />} />
         <Route path="etl-tasks" element={<EtlTasks />} />
